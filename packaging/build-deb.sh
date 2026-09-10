@@ -21,11 +21,13 @@ echo "==> cargo build --release (metric helper)"
 ( cd "$ROOT/jamsys-helper" && cargo build --release )
 echo "==> cargo build --release (keyboard helper)"
 ( cd "$ROOT/jamsys-kbd" && cargo build --release )
+( cd "$ROOT/jamsys-power" && cargo build --release )
 
 TARGET="${CARGO_TARGET_DIR:-$ROOT/jamsys-daemon/target}"
 install -m 0755 "$TARGET/release/jamsysd"        "$STAGE/usr/bin/jamsysd"
 install -m 0755 "$TARGET/release/jamsys-helper"  "$STAGE/usr/libexec/jamsys-helper"
 install -m 0755 "$TARGET/release/jamsys-kbd"     "$STAGE/usr/libexec/jamsys-kbd"
+install -m 0755 "$TARGET/release/jamsys-power"   "$STAGE/usr/libexec/jamsys-power"
 
 # UI
 install -m 0644 "$ROOT"/jamsys-ui/jamsys_ui/*.py "$STAGE/usr/lib/python3/dist-packages/jamsys_ui/"
@@ -43,6 +45,7 @@ install -m 0644 "$ROOT/packaging/systemd/tmpfiles-jamsys.conf"     "$STAGE/usr/l
 install -m 0644 "$ROOT/packaging/desktop/org.jamsys.Monitor.desktop" "$STAGE/usr/share/applications/"
 install -m 0644 "$ROOT/packaging/desktop/org.jamsys.Cluster.desktop" "$STAGE/usr/share/applications/"
 install -m 0644 "$ROOT/packaging/polkit/org.jamsys.keyboard.policy" "$STAGE/usr/share/polkit-1/actions/"
+install -m 0644 "$ROOT/packaging/polkit/org.jamsys.power.policy"    "$STAGE/usr/share/polkit-1/actions/"
 # The udev rule is shipped as an example rather than installed: it is the alternative
 # to the helper, and installing both would be contradictory.
 install -m 0644 "$ROOT/packaging/udev/99-jamsys-keyboard.rules" "$STAGE/usr/share/doc/jamsys/examples/"
@@ -125,6 +128,7 @@ if [ "$1" = "configure" ]; then
     echo "  once a minute; see /usr/share/doc/jamsys/privilege-model.md):"
     echo "      sudo systemctl enable --now jamsys-helper.timer"
     echo ""
+    echo "  Battery charge limit is ready to use: Hardware -> Battery care."
     echo "  Keyboard RGB control is ready to use: /usr/libexec/jamsys-kbd is"
     echo "  installed with a Polkit action. No extra step needed."
     echo ""

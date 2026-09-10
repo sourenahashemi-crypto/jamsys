@@ -20,7 +20,8 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
 from .client import Client, DaemonError, run_async
-from .hardware import (MODES, PRESETS, SPEEDS, KeyboardControl, helper_path,
+from .hardware import (CHARGE_LIMITS, MODES, PRESETS, SPEEDS, ChargeLimitControl,
+                       KeyboardControl, helper_path,
                        ints_to_rgba, rgba_to_ints)
 from .format import (SEVERITY, clock_hm, human_ago, human_bps, human_bytes,
                      human_duration, pct, temp, watts)
@@ -925,6 +926,7 @@ class HardwarePage(Page):
     def __init__(self, win):
         super().__init__(win)
         self.kbd = KeyboardControl()
+        self.charge = ChargeLimitControl()
         # kbd_rgb_mode is write-only in the kernel, so there is nothing to read back.
         # These remember what we last sent; the page says as much rather than
         # presenting a remembered value as if it were measured.
@@ -937,6 +939,10 @@ class HardwarePage(Page):
         s = snap.get("snapshot", {})
         k = s.get("keyboard", {})
         self.clear()
+
+        # Battery care comes first: it is the control with a lasting effect, and it
+        # is useful even on a machine with no lit keyboard at all.
+        self._render_charge_limit(s.get("power", {}))
 
         if not k.get("present"):
             g = self.group("Keyboard lighting",
@@ -1052,6 +1058,69 @@ class HardwarePage(Page):
             self.body.append(self._how_to_enable())
 
     # -- descriptions -----------------------------------------------------
+
+    def _render_charge_limit(self, power):
+        """Battery charge limit: stop charging early so the pack ages more slowly."""
+        if not power.get("charge_limit_supported"):
+            if power.get("has_battery"):
+                g = self.group(
+                    "Battery care",
+                    "This battery does not expose charge_control_end_threshold, so "
+                    "the charge limit cannot be set from software.")
+                self.body.append(g)
+            return
+
+        current = power.get("charge_limit_pct")
+        installed = self.charge.available()
+        desc = ("Stop charging at a set percentage and run from the charger beyond "
+                "it. Keeping a lithium cell at 100% is what ages it fastest; 80% is "
+                "the usual compromise between longevity and usable runtime.")
+        if not installed:
+            desc += ("\n\nThe privileged helper is not installed, so this is "
+                     "read-only. Install it with:\n"
+                     "    sudo ./scripts/install-privileged.sh")
+        g = self.group("Battery care", desc)
+
+        row = Adw.ActionRow(
+            title="Charge limit",
+            subtitle=("charging stops at this level"
+                      if (current or 100) < 100 else "charging normally, to 100%"))
+        combo = Gtk.DropDown.new_from_strings([label for label, _ in CHARGE_LIMITS])
+        values = [v for _, v in CHARGE_LIMITS]
+        # Select the firmware's current value when it is one we offer; otherwise
+        # leave the list alone rather than silently misreporting it.
+        if current in values:
+            combo.set_selected(values.index(current))
+        combo.set_valign(Gtk.Align.CENTER)
+        combo.set_sensitive(installed)
+        combo.connect("notify::selected", self._on_charge_limit, values)
+        row.add_suffix(combo)
+        g.add(row)
+
+        g.add(self.row(
+            "Reported by the firmware",
+            f"{current}%" if current is not None else "—",
+            "read from charge_control_end_threshold; reading needs no privilege"))
+        if current is not None and current < 100:
+            g.add(self.row(
+                "While plugged in above this level", "runs from the charger",
+                "the battery neither charges nor discharges"))
+        self.body.append(g)
+
+    def _on_charge_limit(self, combo, _param, values):
+        idx = combo.get_selected()
+        if idx < 0 or idx >= len(values):
+            return
+        want = values[idx]
+        if not self.charge.set_limit(want):
+            self.win.toasts.add_toast(Adw.Toast(
+                title=f"Charge limit: {self.charge.last_error or 'could not set it'}",
+                timeout=6))
+            return
+        # The firmware is the source of truth, so say what was asked for and let the
+        # next snapshot report what actually took effect.
+        self.win.toasts.add_toast(Adw.Toast(title=f"Charge limit set to {want}%",
+                                            timeout=3))
 
     def _control_description(self, control):
         if control == "helper":

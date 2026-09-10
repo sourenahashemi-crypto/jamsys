@@ -23,6 +23,12 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, GLib, Gtk  # noqa: E402
 
 HELPER_PATHS = ["/usr/libexec/jamsys-kbd", "/usr/bin/jamsys-kbd"]
+POWER_HELPER_PATHS = ["/usr/libexec/jamsys-power", "/usr/bin/jamsys-power"]
+
+# Values the firmware is known to like, plus 100 to mean "charge normally".
+# An arbitrary slider would imply finer control than the EC actually honours.
+CHARGE_LIMITS = [("60%  (longest life)", 60), ("80%  (recommended)", 80),
+                 ("90%", 90), ("100%  (no limit)", 100)]
 
 # Order matches jamsys-kbd's own validation, which matches the kernel's
 # kbd_rgb_mode_index: "cmd mode red green blue speed".
@@ -42,6 +48,53 @@ def helper_path() -> Optional[str]:
         if shutil.which(p) or _is_file(p):
             return p
     return None
+
+
+def power_helper_path() -> Optional[str]:
+    for p in POWER_HELPER_PATHS:
+        if shutil.which(p) or _is_file(p):
+            return p
+    return None
+
+
+class ChargeLimitControl:
+    """Sets the battery charge-stop threshold through the privileged helper.
+
+    Reading the current value needs no privilege and is done by the daemon; only
+    the write comes through here, and only ever as `charge-limit <integer>`.
+    """
+
+    def __init__(self):
+        self.last_error: Optional[str] = None
+
+    def available(self) -> bool:
+        return power_helper_path() is not None
+
+    def set_limit(self, percent: int) -> bool:
+        self.last_error = None
+        if not isinstance(percent, int) or not 20 <= percent <= 100:
+            # The helper would refuse this too; failing here keeps the reason local.
+            self.last_error = f"limit must be 20-100, not {percent!r}"
+            return False
+        h = power_helper_path()
+        if not h:
+            self.last_error = (
+                "jamsys-power is not installed -- run scripts/install-privileged.sh"
+            )
+            return False
+        argv = ["pkexec", h, "charge-limit", str(percent)]
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            self.last_error = str(e)
+            return False
+        if r.returncode != 0:
+            if r.returncode in (126, 127):
+                self.last_error = "Authorisation was declined"
+            else:
+                self.last_error = (r.stderr or "").strip() or f"exit {r.returncode}"
+            return False
+        return True
 
 
 def _is_file(p: str) -> bool:

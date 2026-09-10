@@ -399,6 +399,23 @@ export function readings(s) {
         gpu:  {v: dgpuAsleep ? 0 : norm(s.gpu_pct, 0, 100),
                text: dgpuAsleep ? '\u2014' : `${Math.round(s.gpu_pct)}`,
                dim: dgpuAsleep},
+        // The two GPUs are genuinely different instruments and are drawn as such.
+        // iGPU busy is 100 - RC6 residency, which is a proxy rather than a hardware
+        // busy counter, so the dial says RC6 underneath it.
+        igpu: {v: norm(s.igpu_pct ?? 0, 0, 100),
+               text: `${Math.round(s.igpu_pct ?? 0)}`,
+               sub: s.igpu_freq_mhz ? `${Math.round(s.igpu_freq_mhz)}MHz` : '',
+               subColor: C.secondary},
+        // Never woken to be read: while the card is suspended the dial is dimmed and
+        // shows a dash, which is the truth, not a zero.
+        dgpu: {v: dgpuAsleep ? 0 : norm(s.dgpu_pct ?? 0, 0, 100),
+               text: dgpuAsleep ? '\u2014' : `${Math.round(s.dgpu_pct ?? 0)}`,
+               sub: dgpuAsleep ? 'asleep'
+                    : (s.dgpu_temp_c ? `${Math.round(s.dgpu_temp_c)}\u00b0C` : ''),
+               subColor: (s.dgpu_temp_c ?? 0) >= 85 ? C.red
+                         : (s.dgpu_temp_c ?? 0) >= 70 ? C.amber : C.secondary,
+               dim: dgpuAsleep},
+        net:  {rx: s.net_rx_bps ?? 0, tx: s.net_tx_bps ?? 0, ok: s.net_ok !== false},
         // 60 W full scale covers this class of laptop under load without leaving the
         // needle in the first eighth of the dial during ordinary use.
         // With no battery there is no whole-system power figure at all unless the
@@ -409,6 +426,23 @@ export function readings(s) {
                 charging: !s.on_battery && s.has_battery},
         battery: {v: norm(s.battery_pct, 0, 100), pct: Math.round(s.battery_pct)},
     };
+}
+
+/**
+ * A byte rate at a glance: three significant characters and a unit.
+ *
+ * Fixed decimals are wrong here -- "0.0" hides a trickle and "12.34" is noise -- so
+ * the precision follows the magnitude, and an idle link reads as a plain 0.
+ */
+export function rate(bps) {
+    if (!Number.isFinite(bps) || bps < 1) return {n: '0', u: 'B/s'};
+    const units = ['B/s', 'kB/s', 'MB/s', 'GB/s'];
+    let v = bps, i = 0;
+    while (v >= 1000 && i < units.length - 1) { v /= 1000; i++; }
+    const n = v >= 100 ? Math.round(v).toString()
+            : v >= 10 ? v.toFixed(0)
+            : v.toFixed(1);
+    return {n, u: units[i]};
 }
 
 const ZONES_LOAD = [
@@ -538,8 +572,31 @@ export function drawCluster(cr, w, h, s, {opacity = 0.92} = {}) {
  * works over a light wallpaper as well as a dark one.
  */
 
-export const BARE_W = 420;
+/** A small solid triangle. Font arrows render as tofu in this stack. */
+function markArrow(cr, x, y, sz, col, dir) {
+    const h = sz * 0.9;
+    cr.newPath();
+    if (dir === 'down') {
+        cr.moveTo(x, y - h / 2); cr.lineTo(x + sz, y - h / 2); cr.lineTo(x + sz / 2, y + h / 2);
+    } else {
+        cr.moveTo(x, y + h / 2); cr.lineTo(x + sz, y + h / 2); cr.lineTo(x + sz / 2, y - h / 2);
+    }
+    cr.closePath();
+    rgba(cr, col, 0.95);
+    cr.fill();
+}
+
+export const BARE_W = 470;
 export const BARE_H = 176;
+
+/* Dial geometry, shared by the renderer and the hit-region calculation so the two
+ * can never drift apart. cx/cy/r are in the 470x176 design space. */
+export const BARE_DIALS = [
+    {key: 'ram',  cx: 54,  cy: 92, r: 42},
+    {key: 'cpu',  cx: 180, cy: 88, r: 58},
+    {key: 'igpu', cx: 306, cy: 92, r: 42},
+    {key: 'dgpu', cx: 416, cy: 92, r: 42},
+];
 
 /** A soft dark halo, so a dial stays readable over any wallpaper. */
 function halo(cr, cx, cy, r, strength = 0.30) {
@@ -600,25 +657,37 @@ export function drawClusterBare(cr, w, h, s, {opacity = 0.92} = {}) {
     }
 
     // --- dials ---------------------------------------------------------------
-    const cy = 88;
-    halo(cr, 210, cy, 62, 0.34 * opacity);
-    halo(cr, 76, cy + 4, 46, 0.30 * opacity);
-    halo(cr, 344, cy + 4, 46, 0.30 * opacity);
+    // Four instruments: memory, CPU, and one for each GPU. The two graphics
+    // processors are genuinely separate hardware with separate power states, and
+    // averaging them into a single "GPU" number would hide the thing that matters
+    // most on a hybrid laptop -- which of them is actually doing the work.
+    for (const d of BARE_DIALS) halo(cr, d.cx, d.cy, d.r, 0.32 * opacity);
 
-    drawGauge(cr, 210, cy, 62, {
+    const dial = k => BARE_DIALS.find(d => d.key === k);
+    let g = dial('cpu');
+    drawGauge(cr, g.cx, g.cy, g.r, {
         value: r.cpu.v, min: 0, max: 100, majors: 4, minorsPer: 5,
         zones: ZONES_LOAD, caption: 'CPU', readout: r.cpu.text, unit: '%',
         sub: r.cpu.sub, subColor: r.cpu.subColor,
         needleColor: critical ? C.red : C.needle,
     });
-    drawGauge(cr, 76, cy + 4, 46, {
+    g = dial('ram');
+    drawGauge(cr, g.cx, g.cy, g.r, {
         value: r.ram.v, min: 0, max: 100, majors: 4, minorsPer: 5,
         zones: ZONES_LOAD, caption: 'RAM', readout: r.ram.text, unit: '%',
     });
-    drawGauge(cr, 344, cy + 4, 46, {
-        value: r.gpu.v, min: 0, max: 100, majors: 4, minorsPer: 5,
-        zones: ZONES_LOAD, caption: 'GPU', readout: r.gpu.text,
-        unit: r.gpu.dim ? '' : '%', dim: r.gpu.dim,
+    g = dial('igpu');
+    drawGauge(cr, g.cx, g.cy, g.r, {
+        value: r.igpu.v, min: 0, max: 100, majors: 4, minorsPer: 5,
+        zones: ZONES_LOAD, caption: 'iGPU', readout: r.igpu.text, unit: '%',
+        sub: r.igpu.sub, subColor: r.igpu.subColor,
+    });
+    g = dial('dgpu');
+    drawGauge(cr, g.cx, g.cy, g.r, {
+        value: r.dgpu.v, min: 0, max: 100, majors: 4, minorsPer: 5,
+        zones: ZONES_LOAD, caption: 'dGPU', readout: r.dgpu.text,
+        unit: r.dgpu.dim ? '' : '%', dim: r.dgpu.dim,
+        sub: r.dgpu.sub, subColor: r.dgpu.subColor,
     });
 
     // --- one slim capsule for everything that is not a dial ------------------
@@ -635,30 +704,31 @@ export function drawClusterBare(cr, w, h, s, {opacity = 0.92} = {}) {
     const lampBlock = lampCount * lampW + (lampCount - 1) * lampGap;
     const lampX = sx + sw - 10 - lampBlock;
 
+    // The power segment bar is gone: throughput is the reading being asked for,
+    // and the numeric watts already carry the same information in less space.
     const X = {
-        pwrLabel: sx + 10,
-        bar: sx + 36,
-        barW: 66,
-        pwrValue: sx + 152,   // right edge of the power number
-        batLabel: sx + 158,
-        batBar: sx + 182,
-        batBarW: 30,
-        batPct: sx + 216,
+        down: sx + 10,
+        downVal: sx + 84,     // right edge of the download number
+        up: sx + 96,
+        upVal: sx + 170,
+        pwrValue: sx + 232,
+        batLabel: sx + 238,
+        batBar: sx + 262,
+        batBarW: 28,
+        batPct: sx + 294,
     };
 
-    text(cr, r.power.charging ? 'CHG' : 'PWR', X.pwrLabel, mid, 8, C.label,
-         {align: 'left', bold: true, alpha: r.power.known ? 1 : 0.5});
-    drawBar(cr, X.bar, sy + 5, X.barW, 12, {
-        segments: 9,
-        value: r.power.known ? r.power.v : 0,
-        zones: r.power.charging
-            ? [{from: 0, to: 1, color: C.secondary}]
-            : [{from: 0.00, to: 0.55, color: C.green},
-               {from: 0.55, to: 0.80, color: C.amber},
-               {from: 0.80, to: 1.00, color: C.red}],
-    });
+    const rx = rate(r.net.rx);
+    const tx = rate(r.net.tx);
+    const netCol = r.net.ok ? C.readout : C.readoutDim;
+    // Arrows drawn as glyphs would be tofu in this font, as the warning marks were.
+    markArrow(cr, X.down, mid - 3.5, 7, r.net.ok ? C.secondary : C.readoutDim, 'down');
+    textPairRight(cr, X.downVal, mid, rx.n, rx.u, 12, netCol, C.readoutDim);
+    markArrow(cr, X.up, mid - 3.5, 7, r.net.ok ? C.green : C.readoutDim, 'up');
+    textPairRight(cr, X.upVal, mid, tx.n, tx.u, 12, netCol, C.readoutDim);
+
     textPairRight(cr, X.pwrValue, mid, r.power.text, r.power.known ? 'W' : '',
-                  13, r.power.known ? C.readout : C.readoutDim, C.readoutDim);
+                  12, r.power.known ? C.readout : C.readoutDim, C.readoutDim);
 
     if (s.has_battery) {
         const low = r.battery.v < 0.15;
@@ -705,9 +775,7 @@ export function bareHitRegions(w, h) {
         h: Math.ceil(2 * r * k),
     });
     return [
-        circle(210, 88, 66),
-        circle(76, 92, 50),
-        circle(344, 92, 50),
+        ...BARE_DIALS.map(d => circle(d.cx, d.cy, d.r + 4)),
         // the readout capsule
         {x: Math.floor(ox + 30 * k), y: Math.floor(oy + 150 * k),
          w: Math.ceil((BARE_W - 60) * k), h: Math.ceil(22 * k)},

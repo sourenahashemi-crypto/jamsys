@@ -30,6 +30,12 @@ pub struct PowerState {
     pub runtime_s: Option<i64>,
     /// CPU package watts from the privileged helper, when installed.
     pub cpu_package_w: Option<f64>,
+    /// Percentage at which the firmware stops charging, when the battery exposes
+    /// `charge_control_end_threshold`. 100 means normal charging. Reading this needs
+    /// no privilege; only changing it does.
+    pub charge_limit_pct: Option<u8>,
+    /// True when the firmware supports a charge limit at all.
+    pub charge_limit_supported: bool,
 }
 
 pub struct PowerCollector {
@@ -121,6 +127,11 @@ impl Collector for PowerCollector {
             st.status = read_str(b.join("status")).unwrap_or_else(|| "Unknown".into());
             st.percent = read_checked(b.join("capacity"), 0.0, 100.0).unwrap_or(0.0);
             st.cycle_count = read_i64(b.join("cycle_count")).unwrap_or(0);
+            let thr = b.join("charge_control_end_threshold");
+            st.charge_limit_supported = exists(&thr);
+            st.charge_limit_pct = read_i64(&thr)
+                .filter(|v| (0..=100).contains(v))
+                .map(|v| v as u8);
             st.voltage_v = read_scaled(b.join("voltage_now"), 1e6, 0.0, 100.0).unwrap_or(0.0);
 
             // Energy domain (this machine) or charge domain (converted via voltage).

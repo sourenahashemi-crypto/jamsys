@@ -7,8 +7,8 @@
  *
  *   gjs -m gnome-extension/tests/gauges-test.js
  */
-import {norm, readings, A0, SWEEP, CLUSTER_W, CLUSTER_H,
-        BARE_W, BARE_H, bareHitRegions}
+import {norm, readings, rate, A0, SWEEP, CLUSTER_W, CLUSTER_H,
+        BARE_W, BARE_H, BARE_DIALS, bareHitRegions}
     from '../jamsys@jamsys.org/gauges.js';
 
 let failures = 0;
@@ -96,15 +96,23 @@ ok(BARE_H < CLUSTER_H, 'dropping the housing costs height, not width');
 // The input region is what makes the gaps click-through. If it ever collapses to
 // one rectangle the gadget silently starts swallowing clicks again.
 let regions = bareHitRegions(546, 229);
-eq(regions.length, 4, 'three dials and one readout capsule are hit-testable');
+eq(regions.length, BARE_DIALS.length + 1,
+   'every dial plus the readout capsule is hit-testable');
+eq(BARE_DIALS.length, 4, 'RAM, CPU and one dial per GPU');
+ok(BARE_DIALS.some(d => d.key === 'igpu') && BARE_DIALS.some(d => d.key === 'dgpu'),
+   'the two GPUs are separate instruments, not one averaged dial');
 ok(regions.every(r => r.w > 0 && r.h > 0), 'every region has real extent');
 ok(regions.every(r => r.x >= 0 && r.y >= 0), 'no region starts off-widget');
 ok(regions.every(r => r.x + r.w <= 546 && r.y + r.h <= 229),
    'no region runs past the widget bounds');
 
-// The gaps are the point: two dials must not touch.
-let [cpu, ram] = [regions[0], regions[1]];
-ok(ram.x + ram.w < cpu.x, 'there is a real gap between the side dial and the centre one');
+// The gaps are the point: with no housing, clicks fall between the dials. Regions
+// come back in BARE_DIALS order, so consecutive ones are left-to-right neighbours.
+let dialRegions = regions.slice(0, BARE_DIALS.length);
+let touching = dialRegions.slice(1).filter((r, i) => r.x <= dialRegions[i].x + dialRegions[i].w);
+eq(touching.length, 0, 'no two dials overlap, so every gap passes clicks through');
+ok(dialRegions.every((r, i) => i === 0 || r.x > dialRegions[i - 1].x),
+   'dial regions are ordered left to right');
 
 // Regions must track the widget, including when the aspect is wrong.
 regions = bareHitRegions(1092, 458);
@@ -113,6 +121,19 @@ let tall = bareHitRegions(546, 600);
 ok(tall.every(r => r.y >= 0 && r.y + r.h <= 600),
    'letterboxed vertically, the regions stay inside');
 ok(tall[0].y > 100, 'and are pushed down by the letterbox rather than pinned to the top');
+
+print('\nthroughput formatting');
+eq(rate(0).n, '0', 'an idle link reads as a plain zero');
+eq(rate(0).u, 'B/s', 'and still carries a unit');
+eq(rate(999).u, 'B/s', 'stays in bytes below a thousand');
+eq(rate(1000).u, 'kB/s', 'and steps up at a thousand');
+eq(rate(1000).n, '1.0', 'one decimal while the number is small');
+eq(rate(45678901).n, '46', 'no false precision once it is large');
+eq(rate(45678901).u, 'MB/s', 'megabytes, not kilobytes');
+eq(rate(1.5e9).u, 'GB/s', 'and gigabytes above that');
+ok(rate(NaN).n === '0' && rate(-5).n === '0',
+   'nonsense reads as zero rather than NaN on the gadget');
+ok(rate(12345).n.length <= 3, 'never more than three digits, so the strip cannot grow');
 
 print(`\n${failures === 0 ? 'ALL PASS' : failures + ' FAILURE(S)'}`);
 imports.system.exit(failures === 0 ? 0 : 1);
