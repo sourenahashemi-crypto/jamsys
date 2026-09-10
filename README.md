@@ -163,10 +163,25 @@ gnome-extensions prefs  jamsys@jamsys.org   # corner, size, opacity, style
 
 Any of the four corners, plus top-centre, with an adjustable edge margin, size
 (0.55×–1.8×) and housing opacity. The cluster floats above the desktop as a Shell
-chrome actor — the same mechanism OSD popups use — because Wayland has no such thing as
-an always-on-top application window and faking one is not attempted. It can overlap a
-dock and is hidden by fullscreen windows; that limitation is documented rather than
-hacked around.
+chrome actor — the same mechanism OSD popups use — rather than an ordinary window
+pretending to be chrome. It can overlap a dock and is hidden by fullscreen windows;
+that limitation is documented rather than hacked around.
+
+A new extension is not loaded until the session restarts, so until you next log out,
+run the same cluster as a window:
+
+```bash
+jamsys-cluster
+```
+
+Scroll it to resize, drag it anywhere, right-click for size presets, opacity, **Always
+on top** and **On all workspaces**. Size and stacking are remembered in
+`~/.config/jamsys/cluster.json`.
+
+Always-on-top works by asking the window manager over EWMH, which Mutter honours for
+X11 clients, so the launcher runs the window on XWayland. Wayland itself gives an
+application no way to raise itself — under `jamsys-cluster --wayland` the two stacking
+toggles are greyed out and say so.
 
 ### Keyboard lighting
 

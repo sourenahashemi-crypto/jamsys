@@ -31,6 +31,7 @@ install -m 0755 "$TARGET/release/jamsys-kbd"     "$STAGE/usr/libexec/jamsys-kbd"
 install -m 0644 "$ROOT"/jamsys-ui/jamsys_ui/*.py "$STAGE/usr/lib/python3/dist-packages/jamsys_ui/"
 install -m 0755 "$ROOT/jamsys-ui/bin/jamsys"     "$STAGE/usr/bin/jamsys"
 install -m 0755 "$ROOT/jamsys-ui/bin/jamsys-cluster" "$STAGE/usr/bin/jamsys-cluster"
+install -m 0755 "$ROOT/jamsys-ui/bin/jamsys-xabove" "$STAGE/usr/bin/jamsys-xabove"
 # The launcher's dev-tree sys.path insert is harmless but pointless once installed.
 sed -i 's|^sys.path.insert.*$|# installed under dist-packages; no path juggling needed|' \
     "$STAGE/usr/bin/jamsys"
@@ -68,7 +69,7 @@ Priority: optional
 Architecture: ${ARCH}
 Maintainer: JamSys <jamsys@localhost>
 Installed-Size: ${SIZE}
-Depends: libc6, python3 (>= 3.10), python3-gi, gir1.2-gtk-4.0, gir1.2-adw-1, systemd, policykit-1 | polkitd
+Depends: libc6, python3 (>= 3.10), python3-gi, gir1.2-gtk-4.0, gir1.2-adw-1, systemd, policykit-1 | polkitd, libx11-6
 Recommends: libnotify-bin, gnome-shell (>= 48), gjs
 Suggests: nvidia-utils-535 | libnvidia-ml1
 Description: Lightweight local system-health monitor

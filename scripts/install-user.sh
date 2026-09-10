@@ -17,6 +17,7 @@ sed "s|^sys.path.insert.*|sys.path.insert(0, '$PREFIX/lib')|" \
     "$ROOT/jamsys-ui/bin/jamsys" > "$PREFIX/bin/jamsys"
 chmod 0755 "$PREFIX/bin/jamsys"
 install -m 0755 "$ROOT/jamsys-ui/bin/jamsys-cluster" "$PREFIX/bin/jamsys-cluster"
+install -m 0755 "$ROOT/jamsys-ui/bin/jamsys-xabove" "$PREFIX/bin/jamsys-xabove"
 
 sed "s|/usr/bin/jamsysd|$PREFIX/bin/jamsysd|" \
     "$ROOT/packaging/systemd/jamsysd.service" > "$HOME/.config/systemd/user/jamsysd.service"

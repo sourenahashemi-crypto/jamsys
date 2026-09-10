@@ -12,10 +12,18 @@ possible, and what does run as root should have no input channel at all.**
 | `jamsysd` | you (`systemd --user`) | UI over a `0700` socket dir; the extension over a session-bus name | `~/.local/share/jamsys/` |
 | `jamsys-helper` | root, `oneshot` on a timer, **optional** | **nobody** | `/run/jamsys/privileged.json` |
 | `jamsys-kbd` | root, via Polkit, **optional** | you, through pkexec | three ASUS LED attributes |
+| `jamsys-xabove` | you (no privilege at all) | you, from the cluster window | nothing — one X11 `ClientMessage` |
 
 **The UI never runs as root. The daemon never runs as root. The Shell extension holds no
 privilege and contains no monitoring logic.** 97 % of all metrics need no privileges at
 all — verified during discovery, not assumed.
+
+`jamsys-xabove` is a third helper but not a privileged one. It exists only because
+GJS cannot call `XSendEvent`, not because anything needs elevation: it runs as you,
+opens no files, spawns no shell, and its whole vocabulary is two window-manager states,
+a numeric window id, and `on`/`off`, all validated before the X display is opened
+(`jamsys-ui/tests/xabove-test.py`, 34 tests). It is listed here so the table stays a
+complete account of what JamSys executes, not because it widens the trust boundary.
 
 Note the asymmetry between the two root components, which is deliberate:
 `jamsys-helper` **reads** and therefore has no input channel at all;

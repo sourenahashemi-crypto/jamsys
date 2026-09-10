@@ -4,7 +4,8 @@
  *
  *  1. GNOME Shell caches a loaded extension module. A newly installed or newly fixed
  *     extension does not take effect until the Shell restarts, which under Wayland
- *     means logging out. This window shows the cluster immediately.
+ *     means logging out — verified: the Shell does not even discover a new extension
+ *     directory until then. This window shows the cluster immediately.
  *  2. The Shell extension only works on GNOME. This works on any desktop that can run
  *     a GTK4 window.
  *  3. It is the fastest way to iterate on the drawing, because it is live rather than
@@ -13,9 +14,15 @@
  * It lives beside the extension because it shares `gauges.js` verbatim — one copy of
  * the rendering, three consumers (Shell widget, this window, the PNG harness).
  *
- * Undecorated and sized to its contents, with the whole surface acting as a drag
- * handle, so it behaves like a desktop gadget rather than an application window.
- * Right-click the panel for "Always on Top" if your compositor offers it.
+ * Resizing: an undecorated window on Wayland has no resize edges, so the gadget is
+ * resized by scrolling over it, by keyboard, or from its own menu, and the chosen size
+ * is remembered.
+ *
+ * Staying on top: an ordinary Wayland window cannot raise itself above others — that
+ * is a deliberate compositor decision, not an oversight here. On GNOME, `Alt+Space`
+ * opens the window menu, which has "Always on Top", and that works even undecorated.
+ * The Shell extension has no such limitation, which is why it remains the primary
+ * surface.
  */
 
 import Gtk from 'gi://Gtk?version=4.0';
@@ -24,6 +31,15 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 
 import {drawCluster, CLUSTER_W, CLUSTER_H} from './gauges.js';
+
+// Only present when GTK has an X11 backend. Its absence is not an error; it just
+// means the stacking toggles cannot work in this session.
+let GdkX11 = null;
+try {
+    GdkX11 = (await import('gi://GdkX11?version=4.0')).default;
+} catch {
+    GdkX11 = null;
+}
 
 const BUS_NAME = 'org.jamsys.Daemon';
 const OBJECT_PATH = '/org/jamsys/Daemon';
@@ -37,18 +53,66 @@ const Iface = `
 </node>`;
 const Proxy = Gio.DBusProxy.makeProxyWrapper(Iface);
 
-/* -------------------------------------------------------------- arguments */
+const MIN_SCALE = 0.6;
+const MAX_SCALE = 4.0;
+const PRESETS = [
+    ['Small',      0.85],
+    ['Medium',     1.30],
+    ['Large',      1.90],
+    ['Very large', 2.60],
+];
+
+/* ------------------------------------------------------- persisted settings */
+
+const CONF_DIR = GLib.build_filenamev([GLib.get_user_config_dir(), 'jamsys']);
+const CONF = GLib.build_filenamev([CONF_DIR, 'cluster.json']);
+
+function loadConf() {
+    try {
+        const [ok, bytes] = GLib.file_get_contents(CONF);
+        if (ok) return JSON.parse(new TextDecoder().decode(bytes));
+    } catch { /* first run, or unreadable — defaults are fine */ }
+    return {};
+}
+
+function saveConf(c) {
+    try {
+        GLib.mkdir_with_parents(CONF_DIR, 0o700);
+        GLib.file_set_contents(CONF, JSON.stringify(c, null, 2));
+    } catch (e) {
+        printerr(`jamsys-cluster: could not save settings: ${e.message}`);
+    }
+}
+
+/* ---------------------------------------------------------------- arguments */
 
 function parseArgs(argv) {
-    const o = {scale: 1.0, opacity: 0.92, decorated: false};
+    const saved = loadConf();
+    // A default of 1.3 rather than 1.0: at 1.0 the auxiliary dials are legible but
+    // the secondary readings are not, on a high-density laptop panel.
+    const o = {
+        scale: saved.scale ?? 1.3,
+        opacity: saved.opacity ?? 0.92,
+        decorated: saved.decorated ?? false,
+        ontop: saved.ontop ?? false,
+        sticky: saved.sticky ?? false,
+    };
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
-        if (a === '--scale') o.scale = parseFloat(argv[++i]) || 1.0;
-        else if (a === '--opacity') o.opacity = parseFloat(argv[++i]) || 0.92;
+        if (a === '--scale') o.scale = parseFloat(argv[++i]) || o.scale;
+        else if (a === '--opacity') o.opacity = parseFloat(argv[++i]) || o.opacity;
         else if (a === '--decorated') o.decorated = true;
+        else if (a === '--undecorated') o.decorated = false;
+        else if (a === '--on-top') o.ontop = true;
+        else if (a === '--no-on-top') o.ontop = false;
+        else if (a === '--all-workspaces') o.sticky = true;
+        else if (a === '--reset') {
+            o.scale = 1.3; o.opacity = 0.92; o.decorated = false;
+            o.ontop = false; o.sticky = false;
+        }
         else if (a === '--help' || a === '-h') o.help = true;
     }
-    o.scale = Math.max(0.55, Math.min(2.5, o.scale));
+    o.scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, o.scale));
     o.opacity = Math.max(0.2, Math.min(1.0, o.opacity));
     return o;
 }
@@ -58,19 +122,35 @@ if (opts.help) {
     print(`jamsys-cluster — the JamSys instrument cluster in its own window
 
 USAGE:
-  jamsys-cluster [--scale N] [--opacity N] [--decorated]
+  jamsys-cluster [--scale N] [--opacity N] [--decorated] [--on-top]
+                 [--all-workspaces] [--reset]
 
-  --scale N      0.55 to 2.5, default 1.0 (${CLUSTER_W} x ${CLUSTER_H} px)
-  --opacity N    0.2 to 1.0, default 0.92
-  --decorated    keep the title bar; by default the window is a bare panel you
-                 drag by its face
+  --scale N       ${MIN_SCALE} to ${MAX_SCALE}; 1.0 is ${CLUSTER_W}x${CLUSTER_H} px. Default 1.3.
+  --opacity N     0.2 to 1.0 of the housing. The instruments stay opaque.
+  --decorated     keep a title bar
+  --on-top        keep the cluster above other windows (needs XWayland)
+  --all-workspaces  show it on every workspace
+  --reset         forget the remembered size, opacity and stacking
 
-  Click the cluster to open the full JamSys window.
-  Escape or Ctrl+Q closes it.`);
+WHILE IT IS OPEN
+  scroll              resize
+  + / -               resize
+  0                   reset to the default size
+  right-click         menu: sizes, opacity, title bar, always-on-top
+  left-click          open the full JamSys window
+  Escape, Ctrl+Q      close
+
+KEEPING IT ABOVE OTHER WINDOWS
+  Right-click and tick "Always on top". This asks the window manager over X11, so
+  the cluster runs on XWayland by default; the launcher handles that. Wayland
+  itself gives an application no way to raise itself, so under a native Wayland
+  surface the toggle is greyed out.
+
+Size, opacity and stacking are remembered in ${CONF}`);
     imports.system.exit(0);
 }
 
-/* ------------------------------------------------------------------- app */
+/* --------------------------------------------------------------------- app */
 
 const app = new Gtk.Application({
     application_id: 'org.jamsys.Cluster',
@@ -79,18 +159,54 @@ const app = new Gtk.Application({
 
 let state = null;
 let area = null;
+let win = null;
 let proxy = null;
-let signalId = 0;
+let scale = opts.scale;
+let opacity = opts.opacity;
+let decorated = opts.decorated;
+let ontop = opts.ontop;
+let sticky = opts.sticky;
+let saveTimer = 0;
+
+const sizeFor = s => [Math.round(CLUSTER_W * s), Math.round(CLUSTER_H * s)];
+
+function applySize() {
+    const [w, h] = sizeFor(scale);
+    area.set_content_width(w);
+    area.set_content_height(h);
+    // A resizable window keeps whatever the user dragged it to, so shrink it back to
+    // the requested size explicitly rather than only setting the content hint.
+    win.set_default_size(w, h);
+    if (!decorated)
+        win.set_size_request(-1, -1);
+    area.queue_draw();
+    scheduleSave();
+}
+
+function setScale(s) {
+    scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, s));
+    applySize();
+}
+
+/** Debounced, so a scroll gesture does not write the file on every tick. */
+function scheduleSave() {
+    if (saveTimer) GLib.Source.remove(saveTimer);
+    saveTimer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
+        saveTimer = 0;
+        saveConf({scale, opacity, decorated, ontop, sticky});
+        return false;
+    });
+}
 
 app.connect('activate', () => {
-    const win = new Gtk.ApplicationWindow({
+    win = new Gtk.ApplicationWindow({
         application: app,
         title: 'JamSys',
-        decorated: opts.decorated,
-        resizable: false,
+        decorated,
+        // Resizable so the window manager offers edges when decorated, and so the
+        // drawing can fill whatever the user drags it to.
+        resizable: true,
     });
-    win.set_default_size(Math.round(CLUSTER_W * opts.scale),
-                         Math.round(CLUSTER_H * opts.scale));
 
     // The cluster paints its own rounded housing, so everything behind it must be
     // transparent or the corners sit on a grey square.
@@ -100,10 +216,7 @@ app.connect('activate', () => {
     Gtk.StyleContext.add_provider_for_display(
         Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION);
 
-    area = new Gtk.DrawingArea({
-        content_width: Math.round(CLUSTER_W * opts.scale),
-        content_height: Math.round(CLUSTER_H * opts.scale),
-    });
+    area = new Gtk.DrawingArea({hexpand: true, vexpand: true});
     area.set_draw_func((_a, cr, w, h) => {
         try {
             if (!state) {
@@ -119,43 +232,256 @@ app.connect('activate', () => {
                 cr.newPath();
                 return;
             }
-            drawCluster(cr, w, h, state, {opacity: opts.opacity});
+            drawCluster(cr, w, h, state, {opacity});
         } catch (e) {
             printerr(`jamsys-cluster: draw failed: ${e.message}`);
         }
     });
 
-    // The whole face is the drag handle, since there is no title bar to grab.
+    buildMenu();
+
+    // The whole face drags the window, since there is usually no title bar to grab.
     const handle = new Gtk.WindowHandle({child: area});
     win.set_child(handle);
 
-    // Click opens the full window, on the page for whatever is wrong.
+    // Left click opens the full window on whatever is wrong.
     const click = new Gtk.GestureClick({button: 1});
-    click.connect('released', () => {
-        const page = state?.alert_subsystem;
-        const argv = page ? ['jamsys', '--page', page] : ['jamsys'];
-        try {
-            Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE);
-        } catch (e) {
-            printerr(`jamsys-cluster: could not launch jamsys: ${e.message}`);
-        }
-    });
+    click.connect('released', () => openApp());
     area.add_controller(click);
+
+    // Right click opens the gadget's own menu.
+    const rclick = new Gtk.GestureClick({button: 3});
+    rclick.connect('pressed', (_g, _n, x, y) => {
+        popover.set_pointing_to(new Gdk.Rectangle({x, y, width: 1, height: 1}));
+        popover.popup();
+    });
+    area.add_controller(rclick);
+
+    // Scroll resizes. This is how the gadget is resized without decorations, and it
+    // is the gesture people already try on a desktop widget.
+    const scroll = new Gtk.EventControllerScroll({
+        flags: Gtk.EventControllerScrollFlags.VERTICAL,
+    });
+    scroll.connect('scroll', (_c, _dx, dy) => {
+        setScale(scale * (dy < 0 ? 1.08 : 1 / 1.08));
+        return true;
+    });
+    area.add_controller(scroll);
 
     const keys = new Gtk.EventControllerKey();
     keys.connect('key-pressed', (_c, keyval, _code, mods) => {
-        if (keyval === Gdk.KEY_Escape ||
-            (keyval === Gdk.KEY_q && (mods & Gdk.ModifierType.CONTROL_MASK))) {
-            win.close();
-            return true;
+        const ctrl = (mods & Gdk.ModifierType.CONTROL_MASK) !== 0;
+        switch (keyval) {
+        case Gdk.KEY_Escape:                       win.close(); return true;
+        case Gdk.KEY_q: case Gdk.KEY_Q:            if (ctrl) { win.close(); return true; } break;
+        case Gdk.KEY_plus: case Gdk.KEY_equal:
+        case Gdk.KEY_KP_Add:                       setScale(scale * 1.12); return true;
+        case Gdk.KEY_minus: case Gdk.KEY_KP_Subtract:
+                                                   setScale(scale / 1.12); return true;
+        case Gdk.KEY_0: case Gdk.KEY_KP_0:         setScale(1.3); return true;
         }
         return false;
     });
     win.add_controller(keys);
 
+    applySize();
+
+    win.connect('map', () => {
+        const ok = stackingAvailable();
+        for (const a of [ontopAction, stickyAction]) a?.set_enabled(ok);
+        ontopAction?.set_state(GLib.Variant.new_boolean(ontop && ok));
+        stickyAction?.set_state(GLib.Variant.new_boolean(sticky && ok));
+        // Mutter can ignore state set at the instant of mapping, so ask once the
+        // window is actually on screen.
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 120, () => {
+            applyStacking();
+            return false;
+        });
+    });
+
     win.present();
     connectDaemon();
 });
+
+
+/* ---------------------------------------------------------------- stacking */
+/* Wayland has no protocol for a client to raise itself, and GTK4 dropped
+ * set_keep_above. The one route that works on GNOME is EWMH on an XWayland
+ * window: Mutter honours _NET_WM_STATE_ABOVE and _NET_WM_STATE_STICKY for X11
+ * clients. Measured on GNOME Shell 50.1: with ABOVE set, the cluster stays on
+ * top even when another window is raised afterwards.
+ *
+ * Changing the state needs a ClientMessage to the root window, which nothing
+ * introspectable exposes, so it goes through the jamsys-xabove sidecar. */
+
+/** The X window id, or null when this is a native Wayland surface. */
+function xid() {
+    if (!GdkX11) return null;
+    const surface = win?.get_surface();
+    if (!surface || !(surface instanceof GdkX11.X11Surface)) return null;
+    try {
+        return surface.get_xid();
+    } catch {
+        return null;
+    }
+}
+
+/** True when the stacking toggles can do anything in this session. */
+function stackingAvailable() {
+    return xid() !== null;
+}
+
+function helperPath() {
+    const here = GLib.path_get_dirname(import.meta.url.replace('file://', ''));
+    const candidates = [
+        GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'jamsys-xabove']),
+        '/usr/bin/jamsys-xabove',
+        GLib.build_filenamev([here, '..', '..', 'jamsys-ui', 'bin', 'jamsys-xabove']),
+    ];
+    for (const c of candidates) {
+        if (GLib.file_test(c, GLib.FileTest.IS_EXECUTABLE)) return c;
+    }
+    return GLib.find_program_in_path('jamsys-xabove');
+}
+
+/** Ask the window manager to add or remove one stacking state. */
+function setWmState(name, on) {
+    const id = xid();
+    if (id === null) return false;
+    const helper = helperPath();
+    if (!helper) {
+        printerr('jamsys-cluster: jamsys-xabove not found; cannot change stacking');
+        return false;
+    }
+    try {
+        const proc = Gio.Subprocess.new(
+            [helper, name, String(id), on ? 'on' : 'off'],
+            Gio.SubprocessFlags.STDERR_PIPE);
+        proc.communicate_utf8_async(null, null, (pr, res) => {
+            try {
+                const [, , err] = pr.communicate_utf8_finish(res);
+                if (!pr.get_successful())
+                    printerr(`jamsys-cluster: ${name}: ${(err ?? '').trim()}`);
+            } catch { /* the process is gone; nothing useful to report */ }
+        });
+        return true;
+    } catch (e) {
+        printerr(`jamsys-cluster: could not run jamsys-xabove: ${e.message}`);
+        return false;
+    }
+}
+
+/** Push the remembered stacking preferences at the window manager. */
+function applyStacking() {
+    if (!stackingAvailable()) return;
+    setWmState('above', ontop);
+    setWmState('sticky', sticky);
+}
+
+/* -------------------------------------------------------------------- menu */
+
+let popover = null;
+let ontopAction = null;
+let stickyAction = null;
+
+function buildMenu() {
+    const menu = new Gio.Menu();
+
+    const sizes = new Gio.Menu();
+    PRESETS.forEach(([name, s]) => sizes.append(`${name}  (${sizeFor(s)[0]}px)`, `win.size::${s}`));
+    menu.append_section('Size', sizes);
+
+    const look = new Gio.Menu();
+    look.append('More opaque', 'win.opacity::up');
+    look.append('More transparent', 'win.opacity::down');
+    look.append('Title bar (lets you right-click for Always on Top)', 'win.decorations');
+    menu.append_section('Appearance', look);
+
+    const stack = new Gio.Menu();
+    stack.append('Always on top', 'win.ontop');
+    stack.append('On all workspaces', 'win.sticky');
+    menu.append_section('Stacking', stack);
+
+    const act = new Gio.Menu();
+    act.append('Open JamSys', 'win.open');
+    act.append('Close', 'win.quit');
+    menu.append_section(null, act);
+
+    const add = (name, paramType, fn) => {
+        const a = new Gio.SimpleAction({name, parameter_type: paramType});
+        a.connect('activate', (_a, p) => fn(p));
+        win.add_action(a);
+    };
+    add('size', GLib.VariantType.new('s'), p => setScale(parseFloat(p.get_string()[0])));
+    add('opacity', GLib.VariantType.new('s'), p => {
+        opacity = Math.max(0.2, Math.min(1.0,
+            opacity + (p.get_string()[0] === 'up' ? 0.06 : -0.06)));
+        area.queue_draw();
+        scheduleSave();
+    });
+    add('decorations', null, () => {
+        decorated = !decorated;
+        win.set_decorated(decorated);
+        scheduleSave();
+    });
+    add('open', null, () => openApp());
+    add('quit', null, () => win.close());
+
+    // Stateful, so they draw as checkboxes and show what is currently in force.
+    const toggle = (name, get, set) => {
+        const a = Gio.SimpleAction.new_stateful(
+            name, null, GLib.Variant.new_boolean(get()));
+        a.connect('activate', () => {
+            const next = !get();
+            if (!stackingAvailable()) {
+                showStackingUnavailable();
+                return;
+            }
+            set(next);
+            a.set_state(GLib.Variant.new_boolean(get()));
+            scheduleSave();
+        });
+        // Greyed out rather than silently doing nothing on a native Wayland surface.
+        a.set_enabled(stackingAvailable());
+        win.add_action(a);
+        return a;
+    };
+    ontopAction = toggle('ontop', () => ontop, v => { ontop = v; setWmState('above', v); });
+    stickyAction = toggle('sticky', () => sticky, v => { sticky = v; setWmState('sticky', v); });
+
+    popover = new Gtk.PopoverMenu({menu_model: menu, has_arrow: false});
+    popover.set_parent(area);
+}
+
+function showStackingUnavailable() {
+    const d = new Gtk.MessageDialog({
+        transient_for: win,
+        modal: true,
+        text: 'Cannot change stacking in this session',
+        secondary_text:
+            'Always-on-top works by asking the window manager through X11, which ' +
+            'needs the cluster to run on XWayland. This window is a native Wayland ' +
+            'surface, and Wayland gives an application no way to raise itself.\n\n' +
+            'Start it with the launcher, which uses XWayland by default:\n\n' +
+            '    jamsys-cluster\n\n' +
+            'Or, for this window only, press Alt+Space and choose “Always on Top”.',
+        buttons: Gtk.ButtonsType.CLOSE,
+    });
+    d.connect('response', () => d.destroy());
+    d.present();
+}
+
+function openApp() {
+    const page = state?.alert_subsystem;
+    const argv = page ? ['jamsys', '--page', page] : ['jamsys'];
+    try {
+        Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE);
+    } catch (e) {
+        printerr(`jamsys-cluster: could not launch jamsys: ${e.message}`);
+    }
+}
+
+/* ------------------------------------------------------------------ daemon */
 
 function connectDaemon() {
     try {
@@ -163,14 +489,13 @@ function connectDaemon() {
     } catch (e) {
         printerr(`jamsys-cluster: cannot reach ${BUS_NAME}: ${e.message}`);
         printerr('  is the daemon running?  systemctl --user status jamsysd');
-        // Keep trying: the daemon may simply not be up yet.
         GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 3, () => {
             connectDaemon();
             return false;
         });
         return;
     }
-    signalId = proxy.connectSignal('StateChanged', (_p, _s, [json]) => apply(json));
+    proxy.connectSignal('StateChanged', (_p, _s, [json]) => apply(json));
     proxy.GetStateRemote(([json], err) => {
         if (err) {
             printerr(`jamsys-cluster: GetState failed: ${err.message ?? err}`);

@@ -311,6 +311,37 @@ jamsys-cluster
 The same drawing in a plain GTK4 window. Wayland will not let it place itself, so drag
 it to the corner you want. This is also the answer on any desktop that is not GNOME.
 
+### It is too small to read
+
+Scroll on it, or press `+` / `-`; `0` returns to the default. Right-click for four size
+presets. The size is remembered.
+
+### Keeping it above other windows
+
+Right-click and tick **Always on top** (and **On all workspaces** if you want it on
+every desktop). Both are remembered.
+
+If those two entries are greyed out, the window is running as a native Wayland surface,
+where an application has no way to raise itself. Always-on-top is an EWMH request that
+Mutter honours only for X11 clients, so `jamsys-cluster` runs on XWayland by default.
+You get a native Wayland surface if you passed `--wayland`, or if you launched
+`standalone.js` directly instead of through the launcher. Use:
+
+```bash
+jamsys-cluster
+```
+
+If they are *not* greyed out but nothing happens, check that the helper is installed and
+that the window really is on X:
+
+```bash
+command -v jamsys-xabove
+xprop -id "$(xwininfo -root -children | grep -m1 '"JamSys"' | awk '{print $1}')" _NET_WM_STATE
+```
+
+With the toggle on, `_NET_WM_STATE` should list `_NET_WM_STATE_ABOVE`. That property is
+owned by the window manager, so if it appears there, Mutter accepted the request.
+
 ## The corner readout does not appear
 
 ### After installing, GNOME does not list the extension

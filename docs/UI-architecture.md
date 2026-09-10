@@ -81,8 +81,10 @@ restraint has to come from behaviour rather than from hiding:
 ### Placement, and an honest limitation
 
 The cluster is always a `Main.layoutManager` chrome actor — the same mechanism OSD
-popups use, not a fake always-on-top window, which cannot work under Wayland at all.
-All four corners plus top-centre are available, with an adjustable edge margin.
+popups use, rather than an ordinary window pretending to be chrome. All four corners
+plus top-centre are available, with an adjustable edge margin. (A *window* can be kept
+above others, but only over XWayland and only by asking the window manager; that is
+how `jamsys-cluster` does it, described below. An in-Shell actor needs none of that.)
 
 It floats above the desktop. It can overlap a dock, and it is hidden by fullscreen
 windows. That is inherent to being a desktop gadget on GNOME, and it is stated in the
@@ -105,16 +107,65 @@ handle (`Gtk.WindowHandle`), so it behaves like a gadget rather than an applicat
 Clicking it opens the full window on the relevant page; Escape closes it.
 
 ```bash
-jamsys-cluster                          # default size
-jamsys-cluster --scale 1.4 --opacity 0.8
+jamsys-cluster                          # remembered size, or 546x250 on first run
+jamsys-cluster --scale 1.9 --opacity 0.8
+jamsys-cluster --on-top --all-workspaces
 jamsys-cluster --decorated              # keep a title bar
+jamsys-cluster --reset                  # forget remembered settings
 ```
 
-Its honest limitation against the Shell extension: **Wayland gives an ordinary window
-no control over its own position**, so the compositor decides where it first appears
-and you drag it to the corner you want. It also cannot pin itself above other windows
-— use the compositor's own "Always on Top" if it offers one. The Shell extension has
-neither problem, which is why it remains the primary surface.
+#### Size
+
+The default is scale 1.3 (546x250 px), not 1.0. At 1.0 the main dials are readable but
+the secondary numerals are not, on a 1920x1200 laptop panel at a normal viewing
+distance — which is the whole point of a gadget you glance at.
+
+It resizes by **scroll wheel**, by `+` / `-`, and from the right-click menu's four
+presets; `0` returns to the default. Scale is clamped to 0.6-4.0. The window is freely
+resizable, so its aspect will rarely match the instruments exactly; `drawCluster`
+scales to fit and **centres**, letterboxing inside the housing, because anchoring the
+instruments to a corner of their own housing looks like a bug.
+
+Size, opacity, decoration and stacking are remembered in
+`~/.config/jamsys/cluster.json`, written debounced one second after the last change so
+a scroll gesture does not write the file on every tick.
+
+#### Always on top, and how it actually works
+
+Wayland has no protocol for a client to raise itself, and GTK4 dropped
+`gtk_window_set_keep_above` with the rest of the X11-only API. The route that does work
+on GNOME is EWMH applied to an **XWayland** window: Mutter honours
+`_NET_WM_STATE_ABOVE` and `_NET_WM_STATE_STICKY` for X11 clients.
+
+So `jamsys-cluster` runs on XWayland by default (`GDK_BACKEND=x11`; `--wayland` opts
+out). The window is a 32-bit ARGB visual either way, so the rounded transparent housing
+is unchanged. The right-click menu then offers two real toggles:
+
+| Menu item | Atom | Effect |
+|---|---|---|
+| Always on top | `_NET_WM_STATE_ABOVE` | stays above ordinary windows |
+| On all workspaces | `_NET_WM_STATE_STICKY` | visible on every workspace |
+
+Changing that state requires a `ClientMessage` to the root window — writing the
+property directly, as `xprop -set` does, is ignored by the window manager for mapped
+windows. Nothing introspectable exposes `XSendEvent`, so GJS cannot do it, and the
+call goes through `jamsys-xabove`, a ~40-line Python sidecar using `ctypes` and
+`libX11`. It is **unprivileged**: no root, no Polkit, a closed vocabulary of two
+states, a numeric window id, and `on`/`off` — validated before the display is opened.
+See `jamsys-ui/tests/xabove-test.py`.
+
+Under a native Wayland surface (`--wayland`) both toggles are greyed out and explain
+why, rather than silently doing nothing.
+
+Measured on GNOME Shell 50.1 / Mutter, Ubuntu 26.04: with `ABOVE` set, the cluster
+remained topmost across three explicit raises of a competing window; with it cleared,
+the competing window went back on top. The stacking order was read with `XQueryTree`,
+which is bottom-to-top by protocol, rather than from `xwininfo`'s printed order.
+
+The one limitation that remains: **Wayland gives an ordinary window no control over its
+own position**, so the compositor decides where it first appears and you drag it to the
+corner you want. The Shell extension does not have that problem, which is why it
+remains the primary surface.
 
 One copy of the rendering, three consumers: the Shell widget, this window, and the PNG
 harness. That is why `standalone.js` lives beside the extension rather than in its own
