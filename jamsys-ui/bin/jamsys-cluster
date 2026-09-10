@@ -7,6 +7,23 @@
 # than GNOME where the extension cannot run at all.
 set -euo pipefail
 
+# Run on XWayland by default. Always-on-top is an EWMH request, which Mutter
+# honours for X11 clients only — Wayland has no protocol for a client to raise
+# itself. The window is a 32-bit ARGB visual either way, so the rounded
+# transparent housing looks identical. --wayland opts out; the stacking toggles
+# are then greyed out.
+if [ "${1:-}" = "--wayland" ]; then
+    shift
+    unset GDK_BACKEND
+elif [ -n "${DISPLAY:-}" ]; then
+    # Set, not defaulted: an inherited GDK_BACKEND=wayland would silently disable
+    # always-on-top, which is the reason for running on XWayland in the first place.
+    # Gated on DISPLAY, because forcing x11 with no X server would stop the window
+    # opening at all -- and a gadget that will not start is worse than one that
+    # cannot raise itself.
+    export GDK_BACKEND=x11
+fi
+
 for d in "$HOME/.local/share/gnome-shell/extensions/jamsys@jamsys.org" \
          "/usr/share/gnome-shell/extensions/jamsys@jamsys.org" \
          "$(dirname "$(readlink -f "$0")")/../../gnome-extension/jamsys@jamsys.org"; do

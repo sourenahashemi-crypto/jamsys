@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""Set window-manager stacking hints on a JamSys window (EWMH, unprivileged).
+
+Why this exists as a separate program
+-------------------------------------
+Wayland has no protocol for a client to place itself above other windows, and
+GTK4 dropped gtk_window_set_keep_above along with the X11-only APIs. The only
+route that works on GNOME is EWMH, which applies to XWayland windows: Mutter
+honours _NET_WM_STATE_ABOVE and _NET_WM_STATE_STICKY for X11 clients. Verified
+on GNOME Shell 50.1 / Mutter, Ubuntu 26.04: with ABOVE set, the cluster stays
+on top even when another window is explicitly raised afterwards.
+
+Changing that state requires a ClientMessage to the root window (writing the
+property directly, as xprop -set does, is ignored by the WM for mapped
+windows). No introspectable library exposes XSendEvent, so this reaches libX11
+through ctypes. GJS cannot do that, hence a tiny Python sidecar rather than
+code inside standalone.js.
+
+Security
+--------
+Unprivileged: it never runs as root and needs no Polkit. It accepts only a
+fixed set of verbs and a numeric window id, executes no shell, opens no files,
+and touches nothing outside the X connection. An invalid argument is refused
+before the display is opened.
+"""
+
+import ctypes
+import ctypes.util
+import sys
+
+# The only states this program is allowed to change. Anything else is refused.
+ATOMS = {
+    "above": b"_NET_WM_STATE_ABOVE",
+    "sticky": b"_NET_WM_STATE_STICKY",
+}
+REMOVE, ADD = 0, 1
+SUBSTRUCTURE_NOTIFY = 1 << 19
+SUBSTRUCTURE_REDIRECT = 1 << 20
+CLIENT_MESSAGE = 33
+SOURCE_APPLICATION = 1
+
+
+class XClientMessageEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("window", ctypes.c_ulong),
+        ("message_type", ctypes.c_ulong),
+        ("format", ctypes.c_int),
+        ("l", ctypes.c_long * 5),
+    ]
+
+
+class XEvent(ctypes.Union):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("xclient", XClientMessageEvent),
+        ("pad", ctypes.c_long * 24),
+    ]
+
+
+def parse_xid(text):
+    """Accept only a plain window id, decimal or 0x-hex, in X's 32-bit range."""
+    t = text.strip()
+    try:
+        xid = int(t, 16) if t.lower().startswith("0x") else int(t, 10)
+    except ValueError:
+        raise ValueError(f"not a window id: {text!r}")
+    if not 0 < xid <= 0xFFFFFFFF:
+        raise ValueError(f"window id out of range: {text!r}")
+    return xid
+
+
+def parse_state(text):
+    """Accept only 'on' or 'off'."""
+    if text not in ("on", "off"):
+        raise ValueError(f"state must be 'on' or 'off', not {text!r}")
+    return text == "on"
+
+
+def set_state(xid, name, on):
+    lib = ctypes.util.find_library("X11")
+    if lib is None:
+        raise RuntimeError("libX11 not found")
+    X = ctypes.CDLL(lib)
+    X.XOpenDisplay.restype = ctypes.c_void_p
+    X.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    X.XInternAtom.restype = ctypes.c_ulong
+    X.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    X.XDefaultRootWindow.restype = ctypes.c_ulong
+    X.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+    X.XSendEvent.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
+        ctypes.c_long, ctypes.POINTER(XEvent),
+    ]
+    X.XFlush.argtypes = [ctypes.c_void_p]
+    X.XCloseDisplay.argtypes = [ctypes.c_void_p]
+
+    dpy = X.XOpenDisplay(None)
+    if not dpy:
+        raise RuntimeError("cannot open X display (not running under X or XWayland)")
+    try:
+        ev = XEvent()
+        ev.type = CLIENT_MESSAGE
+        ev.xclient.send_event = 1
+        ev.xclient.display = dpy
+        ev.xclient.window = xid
+        ev.xclient.message_type = X.XInternAtom(dpy, b"_NET_WM_STATE", False)
+        ev.xclient.format = 32
+        ev.xclient.l[0] = ADD if on else REMOVE
+        ev.xclient.l[1] = X.XInternAtom(dpy, ATOMS[name], False)
+        ev.xclient.l[2] = 0
+        ev.xclient.l[3] = SOURCE_APPLICATION
+        ev.xclient.l[4] = 0
+        sent = X.XSendEvent(
+            dpy, X.XDefaultRootWindow(dpy), False,
+            SUBSTRUCTURE_NOTIFY | SUBSTRUCTURE_REDIRECT, ctypes.byref(ev),
+        )
+        X.XFlush(dpy)
+        if not sent:
+            raise RuntimeError("XSendEvent failed")
+    finally:
+        X.XCloseDisplay(dpy)
+
+
+def main(argv):
+    if len(argv) != 4:
+        print(f"usage: {argv[0]} {{{'|'.join(ATOMS)}}} WINDOW_ID {{on|off}}",
+              file=sys.stderr)
+        return 2
+    name = argv[1]
+    if name not in ATOMS:
+        print(f"jamsys-xabove: unknown state {name!r}; "
+              f"allowed: {', '.join(sorted(ATOMS))}", file=sys.stderr)
+        return 2
+    # Validate everything before opening a connection to anything.
+    try:
+        xid = parse_xid(argv[2])
+        on = parse_state(argv[3])
+    except ValueError as e:
+        print(f"jamsys-xabove: {e}", file=sys.stderr)
+        return 2
+    try:
+        set_state(xid, name, on)
+    except (RuntimeError, OSError) as e:
+        print(f"jamsys-xabove: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

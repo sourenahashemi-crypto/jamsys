@@ -419,9 +419,13 @@ const ZONES_LOAD = [
 
 /** Compose the whole instrument cluster into a `w` x `h` context. */
 export function drawCluster(cr, w, h, s, {opacity = 0.92} = {}) {
+    // Scale to fit and centre. The window is freely resizable, so the aspect will
+    // rarely match exactly; letterboxing the instruments inside the housing looks
+    // deliberate, anchoring them to a corner does not.
     const k = Math.min(w / CLUSTER_W, h / CLUSTER_H);
-    drawPanel(cr, w, h, {opacity});
+    drawPanel(cr, w, h, {opacity, radius: Math.max(8, 14 * k)});
     cr.save();
+    cr.translate((w - CLUSTER_W * k) / 2, (h - CLUSTER_H * k) / 2);
     cr.scale(k, k);
 
     const r = readings(s);
