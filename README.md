@@ -183,6 +183,24 @@ X11 clients, so the launcher runs the window on XWayland. Wayland itself gives a
 application no way to raise itself — under `jamsys-cluster --wayland` the two stacking
 toggles are greyed out and say so.
 
+### The report
+
+**Report** in the window gathers everything worth acting on into one page, in
+the order to act on it: the verdict, each open problem with what was measured,
+what was expected, the evidence and what to try, then configuration known to
+cause trouble, then what is *not* being watched — because an absent sensor
+explains a missing alert as much as a present one explains a firing alert.
+
+Copy or save it as Markdown, or produce the same thing without a display:
+
+```bash
+jamsys --report              # readable in a terminal
+jamsys --report --markdown   # for pasting into a message or an issue
+```
+
+It is assembled locally and sent nowhere. It does contain hostnames, device
+names and process names, and says so at the bottom.
+
 ### Battery care
 
 If the firmware supports it -- this ASUS does -- **Hardware -> Battery care** stops

@@ -99,6 +99,8 @@ Wired, running, and observed producing correct values on this machine.
 | Both GPUs, separately | Intel iGPU and NVIDIA dGPU are distinct dials. Measured live: iGPU 80% at 900 MHz while the dGPU sat suspended and was never woken to be read. |
 | Network throughput | download and upload on the active interface, on the gadget. Measured live at 43 MB/s down / 731 kB/s up during a real transfer. |
 | Battery charge limit | `charge_control_end_threshold` read unprivileged by the daemon and reported on the Hardware page; writes go through `jamsys-power` (7 helper tests + 22 UI-side tests) |
+| Report page and `jamsys --report` | one summary of alerts, risk notes, coverage gaps and recent events, as widgets or Markdown; 37 tests covering reply-shape handling, ordering, and missing data |
+| Interaction-safe refresh | the two-second rebuild no longer destroys an open dropdown or resets scroll; 8 GTK tests drive real popovers and a real scrolled window |
 | `jamsys --json <op>` CLI | reference client |
 | `jamsysd --discover` | hardware and coverage report |
 | .deb packaging | 37 files, valid control, maintainer scripts syntax-checked |
