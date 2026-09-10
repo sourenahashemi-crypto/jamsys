@@ -337,6 +337,22 @@ name, GApplication found the daemon already there, assumed it was another copy o
 window, and refused to start with
 `org.freedesktop.DBus.Error.UnknownMethod: org.gtk.Actions.DescribeAll`.
 
+### It says State: ERROR
+
+```bash
+gdbus call --session --dest org.gnome.Shell.Extensions \
+  --object-path /org/gnome/Shell/Extensions \
+  --method org.gnome.Shell.Extensions.GetExtensionErrors "jamsys@jamsys.org"
+```
+
+`Unrecognized parameter "..."` means a Shell API was called with a key that GNOME's
+`Params.parse` rejects. `gnome-extension/tests/shell-api-test.js` exists to catch
+exactly that before it reaches the Shell; run it.
+
+**A fix on disk does not take effect until the Shell restarts.** GJS caches the loaded
+module, `disable`/`enable` reuses it, and `ReloadExtension` is a stub in GNOME 50. On
+Wayland that means logging out — there is no way around it.
+
 ### It is enabled but nothing is drawn
 
 ```bash

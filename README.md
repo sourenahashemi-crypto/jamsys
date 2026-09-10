@@ -305,6 +305,7 @@ cd jamsys-helper && cargo test           #   5 tests
 cd jamsys-kbd    && cargo test           #  10 tests, all the injection attempts
 gjs -m gnome-extension/tests/format-test.js      # panel-line rendering
 gjs -m gnome-extension/tests/gauges-test.js      # needle mapping and geometry
+gjs -m gnome-extension/tests/shell-api-test.js   # GNOME 50 API contract
 gjs -m gnome-extension/tests/live-dbus-test.js   # end-to-end against the live daemon
 gjs -m gnome-extension/tests/render-cluster.js /tmp   # draw every state to PNG
 ./scripts/fault-injection.sh list                # controlled fault injection
