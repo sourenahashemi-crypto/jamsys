@@ -297,3 +297,17 @@ In order of precedence:
 
 Coexistence is the one hypothesis offered, and it is worded as one, because it cannot
 be confirmed from userspace.
+
+
+## Failed units that no longer exist
+
+`service.failed` fires at Warning for a unit systemd reports as failed. But systemd
+keeps a unit's last failed result until it is explicitly reset, so uninstalling a
+package while its unit is failed leaves the failure in the list permanently. Reported
+as a failure, that is misleading in the worst way: the user removes the thing, the
+warning stays, and nothing they can do to the (absent) service changes it.
+
+So a unit with `LoadState=not-found` gets its own rule, `service.orphaned`, at
+**Notice** rather than Warning, saying what it actually is and giving the single
+command that clears it -- with `--user` when the unit is a user unit, because without
+it the command silently does nothing.

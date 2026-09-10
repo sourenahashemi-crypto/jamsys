@@ -95,9 +95,10 @@ ok(BARE_H < CLUSTER_H, 'dropping the housing costs height, not width');
 
 // The input region is what makes the gaps click-through. If it ever collapses to
 // one rectangle the gadget silently starts swallowing clicks again.
+// Layout contract: [close control, ...dials in order, readout capsule].
 let regions = bareHitRegions(546, 229);
-eq(regions.length, BARE_DIALS.length + 1,
-   'every dial plus the readout capsule is hit-testable');
+eq(regions.length, BARE_DIALS.length + 2,
+   'the close control, every dial, and the readout capsule are hit-testable');
 eq(BARE_DIALS.length, 4, 'RAM, CPU and one dial per GPU');
 ok(BARE_DIALS.some(d => d.key === 'igpu') && BARE_DIALS.some(d => d.key === 'dgpu'),
    'the two GPUs are separate instruments, not one averaged dial');
@@ -106,9 +107,17 @@ ok(regions.every(r => r.x >= 0 && r.y >= 0), 'no region starts off-widget');
 ok(regions.every(r => r.x + r.w <= 546 && r.y + r.h <= 229),
    'no region runs past the widget bounds');
 
+// The close control must be reachable: top right, and never under a dial.
+let dialRegions = regions.slice(1, 1 + BARE_DIALS.length);
+let closeR = regions[0];
+ok(closeR.x + closeR.w > 546 * 0.85, 'the close control sits at the right edge');
+ok(closeR.y < 229 * 0.25, 'and near the top');
+ok(dialRegions.every(d => closeR.y + closeR.h <= d.y || closeR.x >= d.x + d.w),
+   'the close control does not sit on top of a dial');
+ok(closeR.w >= 18 && closeR.h >= 18, 'and is big enough to hit');
+
 // The gaps are the point: with no housing, clicks fall between the dials. Regions
 // come back in BARE_DIALS order, so consecutive ones are left-to-right neighbours.
-let dialRegions = regions.slice(0, BARE_DIALS.length);
 let touching = dialRegions.slice(1).filter((r, i) => r.x <= dialRegions[i].x + dialRegions[i].w);
 eq(touching.length, 0, 'no two dials overlap, so every gap passes clicks through');
 ok(dialRegions.every((r, i) => i === 0 || r.x > dialRegions[i - 1].x),

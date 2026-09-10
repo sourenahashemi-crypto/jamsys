@@ -598,6 +598,17 @@ export const BARE_DIALS = [
     {key: 'dgpu', cx: 416, cy: 92, r: 42},
 ];
 
+/* The close control, in design-space coordinates. A gadget with no title bar and
+ * no taskbar entry needs one visible way out that does not depend on keyboard
+ * focus, on remembering a shortcut, or on finding a menu that is only reachable by
+ * right-clicking a dial. */
+/* Deliberately inset from the corner. A resizable undecorated GTK window reserves
+ * an invisible resize border, and the corner handle is the largest of them: a
+ * control placed at the very corner is never clicked, because the press starts a
+ * resize instead. Measured, not guessed -- at BARE_W-13,13 the button was inside
+ * both the drawn image and the input region and still received no click. */
+export const BARE_CLOSE = {cx: BARE_W - 26, cy: 22, r: 9};
+
 /** A soft dark halo, so a dial stays readable over any wallpaper. */
 function halo(cr, cx, cy, r, strength = 0.30) {
     // Cairo has no blur, so a few concentric rings approximate one. Six is enough
@@ -608,6 +619,26 @@ function halo(cr, cx, cy, r, strength = 0.30) {
         rgba(cr, C.panel0, (strength / 6) * (1 - (i - 1) / 7));
         cr.fill();
     }
+}
+
+/** The close control: a dim ring with a cross, top right. */
+function drawClose(cr, opacity) {
+    const {cx, cy, r} = BARE_CLOSE;
+    cr.arc(cx, cy, r, 0, Math.PI * 2);
+    rgba(cr, C.panel0, 0.72 * opacity);
+    cr.fill();
+    cr.arc(cx, cy, r - 0.5, 0, Math.PI * 2);
+    rgba(cr, C.panelEdge, 0.55 * opacity);
+    cr.setLineWidth(1);
+    cr.stroke();
+    const a = r * 0.42;
+    cr.setLineWidth(1.6);
+    cr.setLineCap(1);   // round
+    rgba(cr, C.label, 0.85);
+    cr.moveTo(cx - a, cy - a); cr.lineTo(cx + a, cy + a);
+    cr.moveTo(cx + a, cy - a); cr.lineTo(cx - a, cy + a);
+    cr.stroke();
+    cr.setLineCap(0);
 }
 
 /** A rounded capsule used for the readout strip and the alert pill. */
@@ -648,7 +679,8 @@ export function drawClusterBare(cr, w, h, s, {opacity = 0.92} = {}) {
         cr.selectFontFace('Ubuntu Sans Mono', 0, 1);
         cr.setFontSize(9);
         const tw = cr.textExtents(msg).width;
-        const pw = tw + 30;
+        // Leave the close control its own space, whatever the alert says.
+        const pw = Math.min(tw + 30, BARE_W - 2 * (BARE_W - BARE_CLOSE.cx + BARE_CLOSE.r + 6));
         const px = BARE_W / 2 - pw / 2;
         capsule(cr, px, 2, pw, 18, {fill: C.panel0, alpha: 0.88 * opacity, edge: col});
         if (critical) markCross(cr, px + 12, 11, 9, col);
@@ -758,6 +790,28 @@ export function drawClusterBare(cr, w, h, s, {opacity = 0.92} = {}) {
 }
 
 /**
+ * Where the close control is, in widget pixels.
+ *
+ * The window uses this both to include the control in its input region and to
+ * decide whether a click landed on it.
+ */
+export function bareCloseRect(w, h) {
+    const k = Math.min(w / BARE_W, h / BARE_H);
+    const ox = (w - BARE_W * k) / 2;
+    const oy = (h - BARE_H * k) / 2;
+    const {cx, cy, r} = BARE_CLOSE;
+    // Padded: at the smallest sizes the drawn ring is only a few pixels across, and
+    // a target that small is not a target.
+    const pad = Math.max(r, 11 / Math.max(k, 0.0001));
+    return {
+        x: Math.floor(ox + (cx - pad) * k),
+        y: Math.floor(oy + (cy - pad) * k),
+        w: Math.ceil(2 * pad * k),
+        h: Math.ceil(2 * pad * k),
+    };
+}
+
+/**
  * The circles the cut-out cluster actually paints, in widget pixels.
  *
  * The window uses this to shape its input region, so clicks in the gaps between the
@@ -775,6 +829,9 @@ export function bareHitRegions(w, h) {
         h: Math.ceil(2 * r * k),
     });
     return [
+        // The close button is a real widget in an overlay, so the window's own input
+        // region must include its corner even though nothing is painted there.
+        bareCloseRect(w, h),
         ...BARE_DIALS.map(d => circle(d.cx, d.cy, d.r + 4)),
         // the readout capsule
         {x: Math.floor(ox + 30 * k), y: Math.floor(oy + 150 * k),

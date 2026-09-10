@@ -424,6 +424,41 @@ jamsys --json stats | grep dbus_signals
 
 ---
 
+## I cannot close the gadget
+
+```bash
+jamsys-cluster --quit
+```
+
+That works without keyboard focus and without a working pointer. Otherwise: the
+close button is at the top right and brightens when you point at it, and Escape or
+Ctrl+Q work when the gadget has focus.
+
+If it stopped responding to clicks entirely, **click-through** is on. On GNOME a
+shaped input region also stops the window being focused or clicked at all, which is
+why it is off by default. `--quit` then relaunching clears it, or:
+
+```bash
+jamsys-cluster --no-click-through
+```
+
+## An alert will not clear even though I fixed the problem
+
+Alerts resolve on hysteresis, not instantly: the condition has to stop being true for
+about two minutes before the alert closes, so a flapping metric does not fill the
+timeline. Wait a couple of minutes before concluding it is stuck.
+
+The specific case of **a failed service you have uninstalled** is different, and used
+to be a genuine bug. systemd keeps a unit's failed result until someone clears it, so
+removing the package leaves the failure behind forever and nothing you do to the
+absent service helps. JamSys now recognises this -- a unit whose file is gone
+(`LoadState=not-found`) is reported as leftover bookkeeping at Notice rather than as
+a failure at Warning, and it tells you the one command that clears it:
+
+```bash
+sudo systemctl reset-failed <unit>
+```
+
 ## The gadget jumped to full screen
 
 Fixed. The whole face is a drag handle, which also behaves like a title bar, and

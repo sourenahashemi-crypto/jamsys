@@ -66,6 +66,66 @@ const DEFAULT_SCALE = 1.30;
 const CONF_DIR = GLib.build_filenamev([GLib.get_user_config_dir(), 'jamsys']);
 const CONF = GLib.build_filenamev([CONF_DIR, 'cluster.json']);
 
+/* A gadget with no title bar, no taskbar entry and no close button was, in
+ * practice, impossible to get rid of. There is a close control now; this is the
+ * belt-and-braces version for when the window is off-screen or unresponsive. */
+const PIDFILE = GLib.build_filenamev([
+    GLib.get_user_runtime_dir() || GLib.get_tmp_dir(), 'jamsys-cluster.pid']);
+
+function writePidFile() {
+    try {
+        GLib.file_set_contents(PIDFILE, String(new Gio.Credentials().get_unix_pid()));
+    } catch {
+        // Not fatal: --quit falls back to matching the process list.
+    }
+}
+
+function removePidFile() {
+    try {
+        GLib.unlink(PIDFILE);
+    } catch { /* already gone */ }
+}
+
+/** Terminate a running cluster. Returns true if one was signalled. */
+function quitRunning() {
+    let pid = 0;
+    try {
+        const [ok, bytes] = GLib.file_get_contents(PIDFILE);
+        if (ok) pid = parseInt(new TextDecoder().decode(bytes).trim(), 10);
+    } catch { /* no pid file */ }
+    if (!Number.isInteger(pid) || pid <= 1) {
+        printerr('jamsys-cluster: no running cluster found');
+        return false;
+    }
+    try {
+        // Signal 0 first: never send a real signal to a pid that has been recycled
+        // into somebody else's process.
+        if (GLib.spawn_check_wait_status === undefined) { /* older glib, ignore */ }
+        const alive = GLib.file_test(`/proc/${pid}/cmdline`, GLib.FileTest.EXISTS);
+        if (!alive) {
+            printerr('jamsys-cluster: no running cluster found');
+            removePidFile();
+            return false;
+        }
+        const [okc, bytes] = GLib.file_get_contents(`/proc/${pid}/cmdline`);
+        const cmd = okc ? new TextDecoder().decode(bytes) : '';
+        if (!cmd.includes('standalone.js')) {
+            printerr('jamsys-cluster: stale pid file; not signalling an unrelated process');
+            removePidFile();
+            return false;
+        }
+        GLib.spawn_command_line_sync(`kill ${pid}`);
+        // SIGTERM does not run the window's close handler, so tidy up from here
+        // rather than leaving a pid file that outlives the process.
+        removePidFile();
+        print(`closed the cluster (pid ${pid})`);
+        return true;
+    } catch (e) {
+        printerr(`jamsys-cluster: could not close it: ${e.message}`);
+        return false;
+    }
+}
+
 function loadConf() {
     try {
         const [ok, bytes] = GLib.file_get_contents(CONF);
@@ -94,6 +154,7 @@ function parseArgs(argv) {
         opacity: saved.opacity ?? 0.92,
         decorated: saved.decorated ?? false,
         bare: saved.bare ?? true,
+        clickthrough: saved.clickthrough ?? false,
         ontop: saved.ontop ?? false,
         sticky: saved.sticky ?? false,
     };
@@ -105,13 +166,17 @@ function parseArgs(argv) {
         else if (a === '--undecorated') o.decorated = false;
         else if (a === '--bare') o.bare = true;
         else if (a === '--housing') o.bare = false;
+        else if (a === '--click-through') o.clickthrough = true;
+        else if (a === '--no-click-through') o.clickthrough = false;
         else if (a === '--on-top') o.ontop = true;
         else if (a === '--no-on-top') o.ontop = false;
         else if (a === '--all-workspaces') o.sticky = true;
         else if (a === '--reset') {
             o.scale = DEFAULT_SCALE; o.opacity = 0.92; o.decorated = false;
-            o.bare = true; o.ontop = false; o.sticky = false;
+            o.bare = true; o.clickthrough = false;
+            o.ontop = false; o.sticky = false;
         }
+        else if (a === '--quit' || a === '--stop') o.quit = true;
         else if (a === '--help' || a === '-h') o.help = true;
     }
     o.scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, o.scale));
@@ -120,6 +185,9 @@ function parseArgs(argv) {
 }
 
 const opts = parseArgs(ARGV ?? []);
+if (opts.quit) {
+    imports.system.exit(quitRunning() ? 0 : 1);
+}
 if (opts.help) {
     print(`jamsys-cluster — the JamSys instrument cluster in its own window
 
@@ -133,6 +201,10 @@ USAGE:
   --on-top        keep the cluster above other windows (needs XWayland)
   --all-workspaces  show it on every workspace
   --reset         forget the remembered size, opacity and stacking
+  --quit          close a running cluster and exit
+  --click-through let clicks fall through the gaps between the dials. Off by
+                  default: on GNOME it also stops the gadget being focused or
+                  clicked, which makes it very hard to close.
 
 WHILE IT IS OPEN
   scroll              resize
@@ -140,7 +212,8 @@ WHILE IT IS OPEN
   0                   reset to the default size
   right-click         menu: sizes, opacity, title bar, always-on-top
   left-click          open the full JamSys window
-  Escape, Ctrl+Q      close
+  click the x         close it (top right; it brightens when you point at it)
+  Escape, Ctrl+Q      close, when the gadget has keyboard focus
 
 KEEPING IT ABOVE OTHER WINDOWS
   Right-click and tick "Always on top". This asks the window manager over X11, so
@@ -167,6 +240,7 @@ let scale = opts.scale;
 let opacity = opts.opacity;
 let decorated = opts.decorated;
 let bare = opts.bare;
+let clickthrough = opts.clickthrough;
 let ontop = opts.ontop;
 let sticky = opts.sticky;
 let saveTimer = 0;
@@ -210,7 +284,7 @@ function scheduleSave() {
     if (saveTimer) GLib.Source.remove(saveTimer);
     saveTimer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
         saveTimer = 0;
-        saveConf({scale, opacity, decorated, bare, ontop, sticky});
+        saveConf({scale, opacity, decorated, bare, clickthrough, ontop, sticky});
         return false;
     });
 }
@@ -229,7 +303,13 @@ app.connect('activate', () => {
     // transparent or the corners sit on a grey square.
     const css = new Gtk.CssProvider();
     css.load_from_data(
-        'window, window.background { background: transparent; box-shadow: none; }', -1);
+        'window, window.background { background: transparent; box-shadow: none; }'
+        // Dim until pointed at, so the gadget stays an instrument rather than a
+        // window with furniture, but is never actually hidden.
+        + '.jamsys-close { opacity: 0.35; min-width: 20px; min-height: 20px;'
+        + '  padding: 2px; border-radius: 999px; color: #c8d0d8;'
+        + '  background: rgba(10,12,14,0.55); }'
+        + '.jamsys-close:hover { opacity: 1; background: rgba(190,60,60,0.85); }', -1);
     Gtk.StyleContext.add_provider_for_display(
         Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION);
 
@@ -260,7 +340,30 @@ app.connect('activate', () => {
 
     // The whole face drags the window, since there is usually no title bar to grab.
     const handle = new Gtk.WindowHandle({child: area});
-    win.set_child(handle);
+
+    // The close control is a real button stacked *above* the drag handle, not a
+    // shape painted into the canvas and hit-tested by hand. That was tried first
+    // and does not work: a press anywhere inside a Gtk.WindowHandle is a candidate
+    // window drag, so the handle claims the gesture and the child never sees a
+    // click. A button in an overlay is outside the handle's subtree and gets the
+    // press directly -- and it comes with hover feedback and keyboard focus for
+    // free.
+    closeBtn = new Gtk.Button({
+        icon_name: 'window-close-symbolic',
+        halign: Gtk.Align.END,
+        valign: Gtk.Align.START,
+        margin_top: 4,
+        margin_end: 4,
+        tooltip_text: 'Close the cluster',
+        has_frame: false,
+    });
+    closeBtn.add_css_class('jamsys-close');
+    closeBtn.connect('clicked', () => win.close());
+
+    const overlay = new Gtk.Overlay();
+    overlay.set_child(handle);
+    overlay.add_overlay(closeBtn);
+    win.set_child(overlay);
 
     // Left click opens the full window on whatever is wrong.
     const click = new Gtk.GestureClick({button: 1});
@@ -341,6 +444,11 @@ app.connect('activate', () => {
     });
 
     win.present();
+    writePidFile();
+    win.connect('close-request', () => {
+        removePidFile();
+        return false;   // let the close proceed
+    });
     connectDaemon();
 });
 
@@ -478,17 +586,26 @@ function installFreeTransform(widget) {
 }
 
 /* -------------------------------------------------------- input shaping */
-/* With no housing there is no rectangle to click: the gaps between the dials
- * belong to whatever is behind the gadget. Without this, an invisible box would
- * swallow clicks meant for the window underneath, which is exactly the complaint
- * people have about desktop widgets. */
+/* With no housing there is no rectangle to click, so in principle the gaps between
+ * the dials belong to whatever is behind the gadget.
+ *
+ * It is OFF by default, because on this compositor it costs far more than it buys.
+ * Measured on GNOME Shell 50.1 / Mutter with an XWayland surface: once the input
+ * region is shaped, the window can no longer be activated (_NET_ACTIVE_WINDOW is
+ * ignored, focus stays where it was) and pointer clicks stop reaching the widget
+ * even at coordinates inside the region -- verified against the region Mutter
+ * itself reports through XShapeGetRectangles. The result was a gadget that could
+ * not be focused, could not be clicked, and therefore could not be closed.
+ *
+ * A gadget you cannot close is a worse bug than a gadget that occupies a rectangle,
+ * so click-through is now something you turn on knowing the trade. */
 
 function applyInputShape() {
     const surface = win?.get_surface();
     if (!surface || typeof surface.set_input_region !== 'function') return;
     try {
-        if (!bare || decorated) {
-            // Rectangular again: hand back a null region so the whole window is live.
+        if (!bare || decorated || !clickthrough) {
+            // Hand back a null region so the whole window is live again.
             surface.set_input_region(null);
             return;
         }
@@ -509,6 +626,8 @@ function applyInputShape() {
 let popover = null;
 let ontopAction = null;
 let bareAction = null;
+let clickthroughAction = null;
+let closeBtn = null;
 let stickyAction = null;
 
 function buildMenu() {
@@ -524,6 +643,7 @@ function buildMenu() {
     look.append('More opaque', 'win.opacity::up');
     look.append('More transparent', 'win.opacity::down');
     look.append('Cut-out dials (no panel)', 'win.bare');
+    look.append('Click through the gaps (makes it unfocusable)', 'win.clickthrough');
     look.append('Title bar', 'win.decorations');
     menu.append_section('Appearance', look);
 
@@ -563,6 +683,17 @@ function buildMenu() {
     add('open', null, () => openApp());
     add('quit', null, () => win.close());
 
+    clickthroughAction = Gio.SimpleAction.new_stateful(
+        'clickthrough', null, GLib.Variant.new_boolean(clickthrough));
+    clickthroughAction.connect('activate', () => {
+        clickthrough = !clickthrough;
+        clickthroughAction.set_state(GLib.Variant.new_boolean(clickthrough));
+        applyInputShape();
+        if (clickthrough) warnClickThrough();
+        scheduleSave();
+    });
+    win.add_action(clickthroughAction);
+
     bareAction = Gio.SimpleAction.new_stateful('bare', null, GLib.Variant.new_boolean(bare));
     bareAction.connect('activate', () => {
         bare = !bare;
@@ -598,6 +729,23 @@ function buildMenu() {
 
     popover = new Gtk.PopoverMenu({menu_model: menu, has_arrow: false});
     popover.set_parent(area);
+}
+
+function warnClickThrough() {
+    const d = new Gtk.MessageDialog({
+        transient_for: win,
+        modal: true,
+        text: 'Clicks will now pass through the gaps',
+        secondary_text:
+            'On GNOME this also stops the gadget taking keyboard focus, and can stop '
+            + 'it receiving clicks at all — including the one that closes it.\n\n'
+            + 'If that happens, close it from a terminal:\n\n'
+            + '    jamsys-cluster --quit\n\n'
+            + 'and it will come back with click-through off.',
+        buttons: Gtk.ButtonsType.CLOSE,
+    });
+    d.connect('response', () => d.destroy());
+    d.present();
 }
 
 function showStackingUnavailable() {
