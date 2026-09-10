@@ -210,8 +210,9 @@ WHILE IT IS OPEN
   scroll              resize
   + / -               resize
   0                   reset to the default size
-  right-click         menu: sizes, opacity, title bar, always-on-top
-  left-click          open the full JamSys window
+  right-click         menu: sizes, opacity, stacking, open, hide
+  left-click          nothing — so dragging it never launches anything
+  double-click        open the full JamSys window
   click the x         close it (top right; it brightens when you point at it)
   Escape, Ctrl+Q      close, when the gadget has keyboard focus
 
@@ -366,8 +367,15 @@ app.connect('activate', () => {
     win.set_child(overlay);
 
     // Left click opens the full window on whatever is wrong.
+    // A single click must not launch anything. The gadget is dragged from
+    // anywhere on its face, so "click" and "start to move it" are the same
+    // gesture as far as the user is concerned, and having that open a window is
+    // the single most irritating thing a desktop widget can do. Opening is
+    // deliberate: double click, or the right-click menu.
     const click = new Gtk.GestureClick({button: 1});
-    click.connect('released', () => openApp());
+    click.connect('released', (_g, nPress) => {
+        if (nPress >= 2) openApp();
+    });
     area.add_controller(click);
 
     // Right click opens the gadget's own menu.
@@ -653,8 +661,8 @@ function buildMenu() {
     menu.append_section('Stacking', stack);
 
     const act = new Gio.Menu();
-    act.append('Open JamSys', 'win.open');
-    act.append('Close', 'win.quit');
+    act.append('Open JamSys…', 'win.open');
+    act.append('Hide the cluster', 'win.quit');
     menu.append_section(null, act);
 
     const add = (name, paramType, fn) => {

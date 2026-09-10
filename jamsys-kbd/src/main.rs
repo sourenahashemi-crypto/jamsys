@@ -76,13 +76,32 @@ fn arg_u8(s: &str, lo: u8, hi: u8, name: &str) -> Result<u8, String> {
 
 /// Open one of the constant paths and write a line. `O_WRONLY` only — this program
 /// has no code path that reads a sysfs attribute.
+/// The exact bytes handed to sysfs, as one buffer.
+///
+/// Separated out so the "one write, one line" rule is testable without a device.
+fn attr_line(value: &str) -> String {
+    let mut line = String::with_capacity(value.len() + 1);
+    line.push_str(value);
+    line.push('\n');
+    line
+}
+
 fn write_attr(path: &'static str, value: &str) -> Result<(), String> {
+    // One write() call, and only one.
+    //
+    // A sysfs attribute parses each write independently: it is not a stream. This
+    // used to write the value and then a bare "\n" as a second call, and the
+    // kernel duly handed that lone newline to its own sscanf, matched none of the
+    // six fields it wanted, and returned EINVAL. The colour had already been set
+    // by the first write, so the helper reported failure for something that had
+    // in fact worked -- which is the worst kind of wrong.
+    let line = attr_line(value);
+
     let mut f = OpenOptions::new()
         .write(true)
         .open(path)
         .map_err(|e| format!("{path}: {e}"))?;
-    f.write_all(value.as_bytes()).map_err(|e| format!("{path}: {e}"))?;
-    f.write_all(b"\n").map_err(|e| format!("{path}: {e}"))?;
+    f.write_all(line.as_bytes()).map_err(|e| format!("{path}: {e}"))?;
     Ok(())
 }
 
@@ -272,6 +291,33 @@ mod tests {
             );
             assert!(p.starts_with(LED_DIR), "write target escaped the LED directory");
             assert!(!p.contains(".."), "path contains a traversal component");
+        }
+    }
+
+    #[test]
+    fn an_attribute_write_is_one_line_and_one_newline() {
+        // Regression. This was written as two write() calls -- the value, then a
+        // bare "\n" -- and because a sysfs attribute parses each write on its own,
+        // the kernel got a lone newline, matched none of its six fields and
+        // returned EINVAL. The colour had already been applied by the first write,
+        // so the helper reported failure for an operation that had succeeded.
+        let line = attr_line("1 0 255 255 255 1");
+        assert_eq!(line, "1 0 255 255 255 1\n");
+        assert_eq!(line.matches('\n').count(), 1, "exactly one newline");
+        assert!(line.ends_with('\n'), "and it is at the end");
+        assert!(!line.trim_end().contains('\n'), "nothing splits the value");
+    }
+
+    #[test]
+    fn every_operation_renders_to_a_single_writable_line() {
+        for op in [
+            Op::Brightness(2),
+            Op::Rgb { mode: 1, r: 10, g: 20, b: 30, speed: 2 },
+            Op::State { boot: 1, awake: 1, sleep: 0, keyboard: 1 },
+        ] {
+            let (_, v) = render(&op);
+            let line = attr_line(&v);
+            assert_eq!(line.matches('\n').count(), 1, "{op:?} produced {line:?}");
         }
     }
 

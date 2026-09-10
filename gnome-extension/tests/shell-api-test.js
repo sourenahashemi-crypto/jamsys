@@ -272,6 +272,36 @@ withCluster(fakeSettings(), c => {
     ok(middle === false, 'and is left alone');
 });
 
+print('\nhiding, and the way back');
+withCluster(fakeSettings({mode: 'cluster'}), (c, st) => {
+    c._ext = {openApp: () => {}, openPreferences: () => {}};
+    c._showMenu();
+    const labels = c._menu.items.map(i => i.label && i.label.text).filter(Boolean);
+    ok(labels.includes('Hide the cluster'), 'the cluster can be hidden from its menu',
+       labels.join(', '));
+
+    // Hiding must not be a one-way door.
+    c._menu.items.find(i => i.label && i.label.text === 'Hide the cluster');
+    st.set_string('mode', 'minimal');
+    ok(st._values.mode === 'minimal', 'hiding leaves the panel line behind');
+});
+
+// ...and the panel line must offer the way back, or the corner gadget is lost.
+{
+    Main.layoutManager.chrome.length = 0;
+    Main.panel.statusArea = {};
+    const st = fakeSettings({mode: 'minimal'});
+    const e = Object.create(Ext.prototype);
+    e.uuid = 'jamsys@jamsys.org';
+    e.getSettings = () => st;
+    e.enable();
+    const ind = e._widget;
+    const labels = (ind.menu?.items ?? []).map(i => i.label && i.label.text).filter(Boolean);
+    ok(labels.some(l => l.includes('Show the corner cluster')),
+       'the panel menu can bring the cluster back', labels.join(', '));
+    e.disable();
+}
+
 print('\ndragging places it freely');
 withCluster(fakeSettings({position: 'top-right'}), (c, st) => {
     c.set_position(640, 400);

@@ -146,6 +146,15 @@ class JamSysCluster extends St.Widget {
 
             this._menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
+            const hide = new PopupMenu.PopupMenuItem('Hide the cluster');
+            hide.connect('activate', () => {
+                // Not a 'hidden' flag with no way back: switch to the panel line,
+                // which keeps one small thing on screen whose own menu can bring
+                // the cluster back. A gadget you cannot un-hide is a lost gadget.
+                this._settings.set_string('mode', 'minimal');
+            });
+            this._menu.addMenuItem(hide);
+
             const prefs = new PopupMenu.PopupMenuItem('Preferences');
             prefs.connect('activate', () => this._ext.openPreferences());
             this._menu.addMenuItem(prefs);
@@ -281,6 +290,15 @@ class JamSysIndicator extends PanelMenu.Button {
         this._ackItem = new PopupMenu.PopupMenuItem('Acknowledge this alert');
         this._ackItem.connect('activate', () => this._ext.ackTopAlert());
         this.menu.addMenuItem(this._ackItem);
+
+        // The way back from "Hide the cluster". Without this the panel line would
+        // be a one-way door and the corner gadget could only be restored from the
+        // preferences dialog.
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        const showCluster = new PopupMenu.PopupMenuItem('Show the corner cluster');
+        showCluster.connect('activate', () =>
+            this._settings.set_string('mode', 'cluster'));
+        this.menu.addMenuItem(showCluster);
     }
 
     setState(state) {
