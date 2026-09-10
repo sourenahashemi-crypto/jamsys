@@ -7,7 +7,8 @@
  *
  *   gjs -m gnome-extension/tests/gauges-test.js
  */
-import {norm, readings, A0, SWEEP, CLUSTER_W, CLUSTER_H}
+import {norm, readings, A0, SWEEP, CLUSTER_W, CLUSTER_H,
+        BARE_W, BARE_H, bareHitRegions}
     from '../jamsys@jamsys.org/gauges.js';
 
 let failures = 0;
@@ -87,6 +88,31 @@ ok(r.power.v > 0.1 && r.power.v < 0.3,
 
 print('\ncluster proportions');
 ok(CLUSTER_W > CLUSTER_H * 1.8, 'wide and low, like an instrument binnacle');
+
+print('\ncut-out cluster');
+ok(BARE_W > BARE_H * 2, 'the cut-out layout is wider still, having lost the header');
+ok(BARE_H < CLUSTER_H, 'dropping the housing costs height, not width');
+
+// The input region is what makes the gaps click-through. If it ever collapses to
+// one rectangle the gadget silently starts swallowing clicks again.
+let regions = bareHitRegions(546, 229);
+eq(regions.length, 4, 'three dials and one readout capsule are hit-testable');
+ok(regions.every(r => r.w > 0 && r.h > 0), 'every region has real extent');
+ok(regions.every(r => r.x >= 0 && r.y >= 0), 'no region starts off-widget');
+ok(regions.every(r => r.x + r.w <= 546 && r.y + r.h <= 229),
+   'no region runs past the widget bounds');
+
+// The gaps are the point: two dials must not touch.
+let [cpu, ram] = [regions[0], regions[1]];
+ok(ram.x + ram.w < cpu.x, 'there is a real gap between the side dial and the centre one');
+
+// Regions must track the widget, including when the aspect is wrong.
+regions = bareHitRegions(1092, 458);
+ok(regions.every(r => r.x + r.w <= 1092 && r.y + r.h <= 458), 'regions scale with the widget');
+let tall = bareHitRegions(546, 600);
+ok(tall.every(r => r.y >= 0 && r.y + r.h <= 600),
+   'letterboxed vertically, the regions stay inside');
+ok(tall[0].y > 100, 'and are pushed down by the letterbox rather than pinned to the top');
 
 print(`\n${failures === 0 ? 'ALL PASS' : failures + ' FAILURE(S)'}`);
 imports.system.exit(failures === 0 ? 0 : 1);

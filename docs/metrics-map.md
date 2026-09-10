@@ -214,3 +214,25 @@ that collector and nothing else.
 | `adm` group | journal-derived | Already satisfied on the target; degrades to `Partial` without it |
 | Root (read-only helper) | 2 | CPU package power, NVMe SMART |
 | Root (write helper) | keyboard RGB and brightness | Separate binary, validated argv, Polkit-gated |
+
+
+## Bluetooth
+
+| What | Source | Notes |
+|---|---|---|
+| Adapter present, rfkill soft/hard | `/sys/class/bluetooth`, `/sys/class/rfkill/*` | Works with BlueZ stopped; this is the fallback view in `devices`. |
+| Device name, address, icon, paired, connected | `org.bluez` `GetManagedObjects` on the system bus | `Alias` preferred over `Name`, because it is what the user renamed the device to. |
+| Battery percentage | `org.bluez.Battery1` `Percentage` on the same object path | Absent on devices that do not publish it. |
+| Connect / disconnect transitions | BlueZ `PropertiesChanged`, `InterfacesAdded`, `InterfacesRemoved` | Event-driven: the signal is only a wake-up, and the state is always re-read authoritatively, so a missed signal cannot desynchronise anything. |
+| Radio USB power state | `/sys/bus/usb/devices/*/power/{control,runtime_status,runtime_suspended_time}` | The node whose `product` contains "bluetooth". Autosuspend is a common dropout cause and is reported as a standing risk note. |
+| bluetoothd restart | `GetNameOwner("org.bluez")` | The unique bus name changes if and only if the service restarted — exact, and free. |
+| Stack errors | journal lines from bluetoothd | Translated to plain language. BlueZ logs **nothing** for a clean disconnect — verified on this machine — but does log connect failures, which carry the useful part. |
+
+### What is deliberately not claimed
+
+The HCI disconnect reason is not readable without `CAP_NET_RAW` (a monitor socket), so
+JamSys does not pretend to know it. It records what was observably true at the instant
+of the drop — radio power state, rfkill, adapter power, whether the machine had just
+resumed, whether bluetoothd restarted — and names a cause only when one of those
+preconditions actually held. Otherwise it says the reason is not observable, which is
+more useful than a confident guess that is wrong.

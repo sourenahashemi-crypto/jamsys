@@ -527,3 +527,189 @@ export function drawCluster(cr, w, h, s, {opacity = 0.92} = {}) {
 
     cr.restore();
 }
+
+/* ------------------------------------------------------- cut-out cluster */
+/* The same instruments with the housing removed: three dials sitting directly on
+ * the wallpaper, plus one slim capsule for the readings that are not dials.
+ *
+ * The rectangular panel was doing two jobs — grouping the instruments, and giving
+ * them a legible ground. Grouping is unnecessary for three objects in a row. Legible
+ * ground is not, so each dial gets a soft halo instead: cheaper than a panel, and it
+ * works over a light wallpaper as well as a dark one.
+ */
+
+export const BARE_W = 420;
+export const BARE_H = 176;
+
+/** A soft dark halo, so a dial stays readable over any wallpaper. */
+function halo(cr, cx, cy, r, strength = 0.30) {
+    // Cairo has no blur, so a few concentric rings approximate one. Six is enough
+    // that the banding is invisible at any size the gadget is actually used at.
+    for (let i = 6; i >= 1; i--) {
+        const rr = r + i * 2.2;
+        cr.arc(cx, cy, rr, 0, Math.PI * 2);
+        rgba(cr, C.panel0, (strength / 6) * (1 - (i - 1) / 7));
+        cr.fill();
+    }
+}
+
+/** A rounded capsule used for the readout strip and the alert pill. */
+function capsule(cr, x, y, w, h, {fill = C.panel0, alpha = 0.80, edge = C.panelEdge} = {}) {
+    roundRect(cr, x, y, w, h, h / 2);
+    rgba(cr, fill, alpha);
+    cr.fill();
+    roundRect(cr, x + 0.5, y + 0.5, w - 1, h - 1, (h - 1) / 2);
+    rgba(cr, edge, 0.45 * alpha);
+    cr.setLineWidth(1);
+    cr.stroke();
+}
+
+/**
+ * Draw the cut-out cluster.
+ *
+ * `opacity` fades the halos and the capsule only. The instruments themselves stay
+ * fully opaque: a translucent needle is a decoration, not an instrument.
+ */
+export function drawClusterBare(cr, w, h, s, {opacity = 0.92} = {}) {
+    const k = Math.min(w / BARE_W, h / BARE_H);
+    cr.save();
+    cr.translate((w - BARE_W * k) / 2, (h - BARE_H * k) / 2);
+    cr.scale(k, k);
+
+    const r = readings(s);
+    const critical = s.health === 'critical';
+    const attention = s.health === 'attention';
+
+    // --- alert pill, only when there is something to say --------------------
+    // No permanent header: with the housing gone there is nothing to label, and a
+    // gadget that shows its own name at all times is wasting the space.
+    if ((critical || attention) && s.alert_title) {
+        const col = critical ? C.red : C.amber;
+        const msg = (s.alert_title.length > 34
+            ? s.alert_title.slice(0, 33) + '…'
+            : s.alert_title).toUpperCase();
+        cr.selectFontFace('Ubuntu Sans Mono', 0, 1);
+        cr.setFontSize(9);
+        const tw = cr.textExtents(msg).width;
+        const pw = tw + 30;
+        const px = BARE_W / 2 - pw / 2;
+        capsule(cr, px, 2, pw, 18, {fill: C.panel0, alpha: 0.88 * opacity, edge: col});
+        if (critical) markCross(cr, px + 12, 11, 9, col);
+        else markWarn(cr, px + 12, 11.5, 10, col);
+        text(cr, msg, px + 20, 14.5, 9, col, {align: 'left', bold: true});
+    }
+
+    // --- dials ---------------------------------------------------------------
+    const cy = 88;
+    halo(cr, 210, cy, 62, 0.34 * opacity);
+    halo(cr, 76, cy + 4, 46, 0.30 * opacity);
+    halo(cr, 344, cy + 4, 46, 0.30 * opacity);
+
+    drawGauge(cr, 210, cy, 62, {
+        value: r.cpu.v, min: 0, max: 100, majors: 4, minorsPer: 5,
+        zones: ZONES_LOAD, caption: 'CPU', readout: r.cpu.text, unit: '%',
+        sub: r.cpu.sub, subColor: r.cpu.subColor,
+        needleColor: critical ? C.red : C.needle,
+    });
+    drawGauge(cr, 76, cy + 4, 46, {
+        value: r.ram.v, min: 0, max: 100, majors: 4, minorsPer: 5,
+        zones: ZONES_LOAD, caption: 'RAM', readout: r.ram.text, unit: '%',
+    });
+    drawGauge(cr, 344, cy + 4, 46, {
+        value: r.gpu.v, min: 0, max: 100, majors: 4, minorsPer: 5,
+        zones: ZONES_LOAD, caption: 'GPU', readout: r.gpu.text,
+        unit: r.gpu.dim ? '' : '%', dim: r.gpu.dim,
+    });
+
+    // --- one slim capsule for everything that is not a dial ------------------
+    // Laid out on explicit stops with the telltale block reserved first, so no
+    // field can grow into another as values change width.
+    const sy = 150;
+    const sh = 22;
+    const sx = 30;
+    const sw = BARE_W - sx * 2;
+    capsule(cr, sx, sy, sw, sh, {alpha: 0.82 * opacity});
+
+    const mid = sy + sh / 2 + 3.5;
+    const lampW = 24, lampGap = 4, lampCount = 3;
+    const lampBlock = lampCount * lampW + (lampCount - 1) * lampGap;
+    const lampX = sx + sw - 10 - lampBlock;
+
+    const X = {
+        pwrLabel: sx + 10,
+        bar: sx + 36,
+        barW: 66,
+        pwrValue: sx + 152,   // right edge of the power number
+        batLabel: sx + 158,
+        batBar: sx + 182,
+        batBarW: 30,
+        batPct: sx + 216,
+    };
+
+    text(cr, r.power.charging ? 'CHG' : 'PWR', X.pwrLabel, mid, 8, C.label,
+         {align: 'left', bold: true, alpha: r.power.known ? 1 : 0.5});
+    drawBar(cr, X.bar, sy + 5, X.barW, 12, {
+        segments: 9,
+        value: r.power.known ? r.power.v : 0,
+        zones: r.power.charging
+            ? [{from: 0, to: 1, color: C.secondary}]
+            : [{from: 0.00, to: 0.55, color: C.green},
+               {from: 0.55, to: 0.80, color: C.amber},
+               {from: 0.80, to: 1.00, color: C.red}],
+    });
+    textPairRight(cr, X.pwrValue, mid, r.power.text, r.power.known ? 'W' : '',
+                  13, r.power.known ? C.readout : C.readoutDim, C.readoutDim);
+
+    if (s.has_battery) {
+        const low = r.battery.v < 0.15;
+        const bcol = low ? C.red : r.battery.v < 0.30 ? C.amber : C.secondary;
+        text(cr, 'BAT', X.batLabel, mid, 8, C.label, {align: 'left', bold: true});
+        roundRect(cr, X.batBar, sy + 7, X.batBarW, 8, 2);
+        rgba(cr, C.face1, 0.95);
+        cr.fill();
+        roundRect(cr, X.batBar, sy + 7, Math.max(2, X.batBarW * r.battery.v), 8, 2);
+        rgba(cr, bcol, 0.9);
+        cr.fill();
+        text(cr, `${r.battery.pct}%`, X.batPct, mid, 9, bcol, {align: 'left', bold: true});
+    } else if (!r.power.known) {
+        text(cr, 'no battery', X.batLabel, mid, 7.5, C.label, {align: 'left', alpha: 0.55});
+    }
+
+    const lamps = [
+        ['NET', s.net_ok ? 'off' : 'critical'],
+        ['SVC', s.alert_subsystem === 'Services' ? (critical ? 'critical' : 'warn') : 'off'],
+        ['SYS', critical ? 'critical' : attention ? 'warn' : 'off'],
+    ];
+    lamps.forEach(([label, state], i) => {
+        drawTelltale(cr, lampX + i * (lampW + lampGap), sy + 5, lampW, 12, label, state);
+    });
+
+    cr.restore();
+}
+
+/**
+ * The circles the cut-out cluster actually paints, in widget pixels.
+ *
+ * The window uses this to shape its input region, so clicks in the gaps between the
+ * dials land on whatever is behind the gadget rather than being swallowed by an
+ * invisible rectangle.
+ */
+export function bareHitRegions(w, h) {
+    const k = Math.min(w / BARE_W, h / BARE_H);
+    const ox = (w - BARE_W * k) / 2;
+    const oy = (h - BARE_H * k) / 2;
+    const circle = (cx, cy, r) => ({
+        x: Math.floor(ox + (cx - r) * k),
+        y: Math.floor(oy + (cy - r) * k),
+        w: Math.ceil(2 * r * k),
+        h: Math.ceil(2 * r * k),
+    });
+    return [
+        circle(210, 88, 66),
+        circle(76, 92, 50),
+        circle(344, 92, 50),
+        // the readout capsule
+        {x: Math.floor(ox + 30 * k), y: Math.floor(oy + 150 * k),
+         w: Math.ceil((BARE_W - 60) * k), h: Math.ceil(22 * k)},
+    ];
+}

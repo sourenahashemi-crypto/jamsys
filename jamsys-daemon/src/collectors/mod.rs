@@ -6,6 +6,7 @@
 //! A monitoring tool that dies because one sensor returned nonsense is worse than no
 //! monitoring tool, because the user believes they are covered.
 
+pub mod bluetooth;
 pub mod cpu;
 pub mod devices;
 pub mod gpu;
@@ -40,6 +41,7 @@ pub struct Snapshot {
     pub storage: storage::StorageState,
     pub network: network::NetState,
     pub devices: devices::DeviceState,
+    pub bluetooth: bluetooth::BtState,
     pub services: services::ServiceState,
     pub process: process::ProcState,
     pub keyboard: keyboard::KeyboardState,
@@ -117,6 +119,12 @@ pub trait Collector: Send {
     fn on_event(&mut self, _ev: &ExternalEvent, _ctx: &mut Ctx) -> CResult<()> {
         Ok(())
     }
+    /// A file descriptor the daemon should watch on the collector's behalf, so it can
+    /// react the moment something happens instead of waiting for its tier. The
+    /// daemon dispatches `ExternalEvent::CollectorReadable` when it becomes readable.
+    fn event_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        None
+    }
 }
 
 /// Something that happened outside the sampling schedule.
@@ -128,6 +136,9 @@ pub enum ExternalEvent {
     NetlinkLink,
     /// A device was added or removed.
     Uevent { action: String, subsystem: String, devpath: String },
+    /// A collector's own event fd became readable. Carries the collector name so
+    /// only the owner reacts; every other collector ignores it.
+    CollectorReadable { name: &'static str },
     /// The machine woke up; payload is how long it slept.
     Resumed { slept_ms: i64 },
 }
@@ -289,6 +300,18 @@ impl Registry {
     }
 
     /// Coverage report: what works, what does not, and why.
+    /// Event fds collectors want watched, with the owning collector's name.
+    ///
+    /// Called once after registration. A collector that opens its fd later simply
+    /// does not get one, and falls back to its tier.
+    pub fn event_fds(&self) -> Vec<(&'static str, std::os::unix::io::RawFd)> {
+        self.entries
+            .iter()
+            .filter(|e| !matches!(e.support, Support::Disabled | Support::Unsupported { .. }))
+            .filter_map(|e| e.c.event_fd().map(|fd| (e.c.name(), fd)))
+            .collect()
+    }
+
     pub fn coverage(&self) -> Vec<serde_json::Value> {
         self.entries
             .iter()

@@ -30,7 +30,10 @@ import Gdk from 'gi://Gdk?version=4.0';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 
-import {drawCluster, CLUSTER_W, CLUSTER_H} from './gauges.js';
+import {drawCluster, drawClusterBare, bareHitRegions,
+        CLUSTER_W, CLUSTER_H, BARE_W, BARE_H} from './gauges.js';
+
+const Cairo = imports.cairo;
 
 // Only present when GTK has an X11 backend. Its absence is not an error; it just
 // means the stacking toggles cannot work in this session.
@@ -55,12 +58,8 @@ const Proxy = Gio.DBusProxy.makeProxyWrapper(Iface);
 
 const MIN_SCALE = 0.6;
 const MAX_SCALE = 4.0;
-const PRESETS = [
-    ['Small',      0.85],
-    ['Medium',     1.30],
-    ['Large',      1.90],
-    ['Very large', 2.60],
-];
+/** The size the gadget returns to with `0` or "Reset size". */
+const DEFAULT_SCALE = 1.30;
 
 /* ------------------------------------------------------- persisted settings */
 
@@ -91,9 +90,10 @@ function parseArgs(argv) {
     // A default of 1.3 rather than 1.0: at 1.0 the auxiliary dials are legible but
     // the secondary readings are not, on a high-density laptop panel.
     const o = {
-        scale: saved.scale ?? 1.3,
+        scale: saved.scale ?? DEFAULT_SCALE,
         opacity: saved.opacity ?? 0.92,
         decorated: saved.decorated ?? false,
+        bare: saved.bare ?? true,
         ontop: saved.ontop ?? false,
         sticky: saved.sticky ?? false,
     };
@@ -103,12 +103,14 @@ function parseArgs(argv) {
         else if (a === '--opacity') o.opacity = parseFloat(argv[++i]) || o.opacity;
         else if (a === '--decorated') o.decorated = true;
         else if (a === '--undecorated') o.decorated = false;
+        else if (a === '--bare') o.bare = true;
+        else if (a === '--housing') o.bare = false;
         else if (a === '--on-top') o.ontop = true;
         else if (a === '--no-on-top') o.ontop = false;
         else if (a === '--all-workspaces') o.sticky = true;
         else if (a === '--reset') {
-            o.scale = 1.3; o.opacity = 0.92; o.decorated = false;
-            o.ontop = false; o.sticky = false;
+            o.scale = DEFAULT_SCALE; o.opacity = 0.92; o.decorated = false;
+            o.bare = true; o.ontop = false; o.sticky = false;
         }
         else if (a === '--help' || a === '-h') o.help = true;
     }
@@ -164,11 +166,14 @@ let proxy = null;
 let scale = opts.scale;
 let opacity = opts.opacity;
 let decorated = opts.decorated;
+let bare = opts.bare;
 let ontop = opts.ontop;
 let sticky = opts.sticky;
 let saveTimer = 0;
 
-const sizeFor = s => [Math.round(CLUSTER_W * s), Math.round(CLUSTER_H * s)];
+const natW = () => (bare ? BARE_W : CLUSTER_W);
+const natH = () => (bare ? BARE_H : CLUSTER_H);
+const sizeFor = s => [Math.round(natW() * s), Math.round(natH() * s)];
 
 function applySize() {
     const [w, h] = sizeFor(scale);
@@ -180,6 +185,11 @@ function applySize() {
     if (!decorated)
         win.set_size_request(-1, -1);
     area.queue_draw();
+    // The shape follows the size, so re-cut it once the new size has been applied.
+    GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+        applyInputShape();
+        return false;
+    });
     scheduleSave();
 }
 
@@ -193,7 +203,7 @@ function scheduleSave() {
     if (saveTimer) GLib.Source.remove(saveTimer);
     saveTimer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
         saveTimer = 0;
-        saveConf({scale, opacity, decorated, ontop, sticky});
+        saveConf({scale, opacity, decorated, bare, ontop, sticky});
         return false;
     });
 }
@@ -232,7 +242,8 @@ app.connect('activate', () => {
                 cr.newPath();
                 return;
             }
-            drawCluster(cr, w, h, state, {opacity});
+            if (bare) drawClusterBare(cr, w, h, state, {opacity});
+            else drawCluster(cr, w, h, state, {opacity});
         } catch (e) {
             printerr(`jamsys-cluster: draw failed: ${e.message}`);
         }
@@ -259,6 +270,8 @@ app.connect('activate', () => {
 
     // Scroll resizes. This is how the gadget is resized without decorations, and it
     // is the gesture people already try on a desktop widget.
+    installFreeTransform(area);
+
     const scroll = new Gtk.EventControllerScroll({
         flags: Gtk.EventControllerScrollFlags.VERTICAL,
     });
@@ -278,7 +291,7 @@ app.connect('activate', () => {
         case Gdk.KEY_KP_Add:                       setScale(scale * 1.12); return true;
         case Gdk.KEY_minus: case Gdk.KEY_KP_Subtract:
                                                    setScale(scale / 1.12); return true;
-        case Gdk.KEY_0: case Gdk.KEY_KP_0:         setScale(1.3); return true;
+        case Gdk.KEY_0: case Gdk.KEY_KP_0:         setScale(DEFAULT_SCALE); return true;
         }
         return false;
     });
@@ -295,6 +308,7 @@ app.connect('activate', () => {
         // window is actually on screen.
         GLib.timeout_add(GLib.PRIORITY_DEFAULT, 120, () => {
             applyStacking();
+            applyInputShape();
             return false;
         });
     });
@@ -378,23 +392,88 @@ function applyStacking() {
     setWmState('sticky', sticky);
 }
 
+/* ---------------------------------------------------------- free transform */
+/* Ctrl+drag anywhere on the gadget scales it continuously. This is the "free
+ * transform" the presets were standing in for: no ladder of fixed sizes, just drag
+ * until it looks right.
+ *
+ * It runs in the capture phase because the whole face is a Gtk.WindowHandle, which
+ * would otherwise claim the drag for moving the window before it is seen here. */
+
+let dragStartScale = 1;
+
+function installFreeTransform(widget) {
+    const drag = new Gtk.GestureDrag();
+    drag.set_propagation_phase(Gtk.PropagationPhase.CAPTURE);
+    drag.connect('drag-begin', g => {
+        const ctrl = (g.get_current_event_state() & Gdk.ModifierType.CONTROL_MASK) !== 0;
+        if (!ctrl) {
+            // Not ours: let the window handle move the window instead.
+            g.set_state(Gtk.EventSequenceState.DENIED);
+            return;
+        }
+        dragStartScale = scale;
+        g.set_state(Gtk.EventSequenceState.CLAIMED);
+    });
+    drag.connect('drag-update', (g, dx, dy) => {
+        if (g.get_sequence_state(g.get_current_sequence()) !== Gtk.EventSequenceState.CLAIMED)
+            return;
+        // Diagonal distance, signed: right/down grows, left/up shrinks. Divided by
+        // the natural width so the gesture feels the same at every size.
+        const delta = (dx + dy) / 2 / natW();
+        setScale(dragStartScale * (1 + delta * 2.4));
+    });
+    widget.add_controller(drag);
+}
+
+/* -------------------------------------------------------- input shaping */
+/* With no housing there is no rectangle to click: the gaps between the dials
+ * belong to whatever is behind the gadget. Without this, an invisible box would
+ * swallow clicks meant for the window underneath, which is exactly the complaint
+ * people have about desktop widgets. */
+
+function applyInputShape() {
+    const surface = win?.get_surface();
+    if (!surface || typeof surface.set_input_region !== 'function') return;
+    try {
+        if (!bare || decorated) {
+            // Rectangular again: hand back a null region so the whole window is live.
+            surface.set_input_region(null);
+            return;
+        }
+        const w = area.get_width(), h = area.get_height();
+        if (w <= 0 || h <= 0) return;
+        const region = new Cairo.Region();
+        for (const r of bareHitRegions(w, h))
+            region.unionRectangle({x: r.x, y: r.y, width: r.w, height: r.h});
+        surface.set_input_region(region);
+    } catch (e) {
+        // Shaping is a refinement, never a requirement.
+        printerr(`jamsys-cluster: could not shape the input region: ${e.message}`);
+    }
+}
+
 /* -------------------------------------------------------------------- menu */
 
 let popover = null;
 let ontopAction = null;
+let bareAction = null;
 let stickyAction = null;
 
 function buildMenu() {
     const menu = new Gio.Menu();
 
     const sizes = new Gio.Menu();
-    PRESETS.forEach(([name, s]) => sizes.append(`${name}  (${sizeFor(s)[0]}px)`, `win.size::${s}`));
-    menu.append_section('Size', sizes);
+    sizes.append('Bigger', 'win.size::up');
+    sizes.append('Smaller', 'win.size::down');
+    sizes.append('Reset size', 'win.size::reset');
+    menu.append_section('Size  (scroll, or Ctrl+drag)', sizes);
 
     const look = new Gio.Menu();
     look.append('More opaque', 'win.opacity::up');
     look.append('More transparent', 'win.opacity::down');
-    look.append('Title bar (lets you right-click for Always on Top)', 'win.decorations');
+    look.append('Cut-out dials (no panel)', 'win.bare');
+    look.append('Title bar', 'win.decorations');
     menu.append_section('Appearance', look);
 
     const stack = new Gio.Menu();
@@ -412,7 +491,12 @@ function buildMenu() {
         a.connect('activate', (_a, p) => fn(p));
         win.add_action(a);
     };
-    add('size', GLib.VariantType.new('s'), p => setScale(parseFloat(p.get_string()[0])));
+    add('size', GLib.VariantType.new('s'), p => {
+        const which = p.get_string()[0];
+        if (which === 'up') setScale(scale * 1.15);
+        else if (which === 'down') setScale(scale / 1.15);
+        else setScale(DEFAULT_SCALE);
+    });
     add('opacity', GLib.VariantType.new('s'), p => {
         opacity = Math.max(0.2, Math.min(1.0,
             opacity + (p.get_string()[0] === 'up' ? 0.06 : -0.06)));
@@ -422,10 +506,22 @@ function buildMenu() {
     add('decorations', null, () => {
         decorated = !decorated;
         win.set_decorated(decorated);
+        applyInputShape();
         scheduleSave();
     });
     add('open', null, () => openApp());
     add('quit', null, () => win.close());
+
+    bareAction = Gio.SimpleAction.new_stateful('bare', null, GLib.Variant.new_boolean(bare));
+    bareAction.connect('activate', () => {
+        bare = !bare;
+        bareAction.set_state(GLib.Variant.new_boolean(bare));
+        // The two modes have different natural aspects, so resize as well as redraw.
+        applySize();
+        applyInputShape();
+        scheduleSave();
+    });
+    win.add_action(bareAction);
 
     // Stateful, so they draw as checkboxes and show what is currently in force.
     const toggle = (name, get, set) => {
