@@ -182,7 +182,7 @@ impl AlertManager {
         }
         self.open.remove(fingerprint);
         self.clearing.remove(fingerprint);
-        self.notified.remove(fingerprint);
+        self.withdraw(fingerprint);
         let _ = store.resolve_alert(fingerprint);
     }
 
@@ -191,7 +191,7 @@ impl AlertManager {
     pub fn clear_now(&mut self, fingerprint: &str, store: &Store) {
         if self.open.remove(fingerprint).is_some() {
             self.clearing.remove(fingerprint);
-            self.notified.remove(fingerprint);
+            self.withdraw(fingerprint);
             let _ = store.resolve_alert(fingerprint);
         }
     }
@@ -202,6 +202,27 @@ impl AlertManager {
 
     pub fn suppressed_counts(&self) -> u64 {
         self.buckets.values().map(|b| b.suppressed).sum::<u64>() + self.total_suppressed
+    }
+
+    /// Forget an alert's notification *and* take it off the screen.
+    ///
+    /// Dropping the id on its own was the bug: the daemon stopped tracking the
+    /// notification while the shell went on showing it, so a resolved problem left
+    /// a warning behind that nothing would ever clear.
+    fn withdraw(&mut self, fingerprint: &str) {
+        let Some((_, id, _)) = self.notified.remove(fingerprint) else { return };
+        if id == 0 {
+            return;
+        }
+        if self.notifier.is_none() {
+            self.notifier = crate::dbus::Connection::session().ok();
+        }
+        if let Some(conn) = self.notifier.as_mut() {
+            if let Err(e) = crate::dbus::close_notification(conn, id) {
+                crate::log_warn!("could not withdraw notification {id}: {e}");
+                self.notifier = None;
+            }
+        }
     }
 
     fn send_notification(&mut self, a: &Alert, replaces: u32) -> u32 {

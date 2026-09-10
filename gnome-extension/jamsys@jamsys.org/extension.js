@@ -34,6 +34,11 @@ import {labelFor, normalLine, styleFor} from './format.js';
 import {drawCluster, drawClusterBare,
         CLUSTER_W, CLUSTER_H, BARE_W, BARE_H} from './gauges.js';
 
+/* Must match the range in the gschema, or set_double() is silently clamped by
+ * GSettings and the widget stops responding at the edges with no explanation. */
+const SCALE_MIN = 0.55;
+const SCALE_MAX = 3.0;
+
 const BUS_NAME = 'org.jamsys.Daemon';
 const OBJECT_PATH = '/org/jamsys/Daemon';
 
@@ -75,7 +80,41 @@ class JamSysCluster extends St.Widget {
         // Hover lifts the housing slightly, so it reads as a clickable object.
         this.connect('notify::hover', () => this._area.queue_repaint());
 
+        // Scroll resizes, exactly as it does on the standalone window. Without
+        // this the corner widget could only be resized from the preferences
+        // dialog, which is not where anyone looks when a gadget is the wrong size.
+        this.connect('scroll-event', (_a, event) => this._onScroll(event));
+
         this._resize();
+    }
+
+    /** Scroll up grows, scroll down shrinks; the setting is the single source. */
+    _onScroll(event) {
+        const dir = event.get_scroll_direction();
+        let up;
+        if (dir === Clutter.ScrollDirection.UP) {
+            up = true;
+        } else if (dir === Clutter.ScrollDirection.DOWN) {
+            up = false;
+        } else if (dir === Clutter.ScrollDirection.SMOOTH) {
+            // Wayland delivers smooth scroll, so handling only UP/DOWN would mean
+            // handling nothing at all on the compositor this targets.
+            const [, dy] = event.get_scroll_delta();
+            if (!Number.isFinite(dy) || Math.abs(dy) < 0.01)
+                return Clutter.EVENT_PROPAGATE;
+            up = dy < 0;
+        } else {
+            return Clutter.EVENT_PROPAGATE;
+        }
+
+        const cur = this._settings.get_double('scale');
+        const next = Math.max(SCALE_MIN, Math.min(SCALE_MAX, cur * (up ? 1.08 : 1 / 1.08)));
+        // Writing the setting is what resizes: 'scale' is already wired to
+        // _restyle(), which resizes and repositions. Rounded so that repeated
+        // scrolling cannot accumulate floating-point drift in a stored value.
+        if (Math.abs(next - cur) > 1e-4)
+            this._settings.set_double('scale', Math.round(next * 1000) / 1000);
+        return Clutter.EVENT_STOP;
     }
 
     /** 'cutout' by default: the same face the standalone window draws. */

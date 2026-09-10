@@ -90,6 +90,23 @@ It floats above the desktop. It can overlap a dock, and it is hidden by fullscre
 windows. That is inherent to being a desktop gadget on GNOME, and it is stated in the
 preferences dialog rather than left to be discovered.
 
+### Resizing, on both surfaces
+
+Scroll resizes the cluster wherever it is drawn. The window has always had that; the
+Shell widget had nothing, and could only be resized through its preferences dialog.
+
+The Shell handler writes the `scale` GSetting rather than resizing the actor
+directly, because `scale` is already wired to `_restyle()`, which resizes *and*
+repositions -- a corner-anchored widget that changes size has to move too. Its clamp
+duplicates the gschema range on purpose: GSettings silently clamps an out-of-range
+write, so a handler that let the value drift past the limit would look like a widget
+that had stopped responding for no visible reason.
+
+It handles `SMOOTH` as well as `UP`/`DOWN`, which is not optional: Wayland only ever
+sends smooth scroll, so a handler written against the discrete directions alone does
+nothing at all on the compositor this targets. The test drives the smooth path
+explicitly for that reason.
+
 ### One face, two surfaces
 
 `gauges.js` has always been shared, but for a while only the *window* used the new

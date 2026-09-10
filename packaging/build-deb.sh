@@ -49,6 +49,7 @@ install -m 0644 "$ROOT/packaging/polkit/org.jamsys.power.policy"    "$STAGE/usr/
 # The udev rule is shipped as an example rather than installed: it is the alternative
 # to the helper, and installing both would be contradictory.
 install -m 0644 "$ROOT/packaging/udev/99-jamsys-keyboard.rules" "$STAGE/usr/share/doc/jamsys/examples/"
+install -m 0644 "$ROOT/packaging/systemd/jamsys-charge-limit.service" "$STAGE/usr/share/doc/jamsys/examples/"
 
 # GNOME Shell extension
 EXTDIR="$STAGE/usr/share/gnome-shell/extensions/jamsys@jamsys.org"
