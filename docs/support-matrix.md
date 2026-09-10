@@ -7,8 +7,12 @@ The rule applied throughout: **a capability is only claimed as working if it is 
 a real data source and that path has been executed on this hardware.** Where code exists
 but the path could not be exercised, it is listed as unverified — not as working.
 
-Audited 2026-09-09 on ASUS TUF F16 FX608JMR, Ubuntu 26.04.1, kernel 7.0.0-31,
-GNOME Shell 50.1, Wayland.
+Historical hardware evidence below was recorded by the 2026-09-09 audit on ASUS
+TUF F16 FX608JMR, Ubuntu 26.04.1, kernel 7.0.0-31, GNOME Shell 50.1, Wayland.
+It was not independently repeated in the 2026-09-10 repository review. That review
+ran the automated suites, read the already-running daemon over D-Bus, rendered the
+new offline face, and built the package. It did not install changes or exercise
+hardware controls. See [the verification report](verification-2026-09-10.md).
 
 ---
 
@@ -95,7 +99,6 @@ Wired, running, and observed producing correct values on this machine.
 | Both GPUs, separately | Intel iGPU and NVIDIA dGPU are distinct dials. Measured live: iGPU 80% at 900 MHz while the dGPU sat suspended and was never woken to be read. |
 | Network throughput | download and upload on the active interface, on the gadget. Measured live at 43 MB/s down / 731 kB/s up during a real transfer. |
 | Battery charge limit | `charge_control_end_threshold` read unprivileged by the daemon and reported on the Hardware page; writes go through `jamsys-power` (7 helper tests + 22 UI-side tests) |
-| Click-through gaps | input region verified with `XShapeGetRectangles(ShapeInput)`: 6 rectangles, so the gaps between dials pass clicks to the window underneath |
 | `jamsys --json <op>` CLI | reference client |
 | `jamsysd --discover` | hardware and coverage report |
 | .deb packaging | 37 files, valid control, maintainer scripts syntax-checked |
@@ -107,6 +110,8 @@ Wired, running, and observed producing correct values on this machine.
 | **GNOME Shell cluster** | Everything short of being on screen: the full Cairo drawing (rendered to PNG in seven states and reviewed, including live against the running daemon), value mapping (22 tests), D-Bus proxy, live `StateChanged`, JSON parse, placement arithmetic, preferences, and `enable()`/`disable()` run for real against strict stubs of GNOME 50's own API contracts in every mode and corner. | **It has never been displayed on the desktop.** GNOME Shell was, however, made to *load* it, which surfaced a genuine defect — `addChrome({affectsInputRegion})`, a key GNOME 50 rejects outright. That is fixed, and `tests/shell-api-test.js` now enforces the real parameter sets. The fix itself cannot be confirmed live: GJS caches the module, `ReloadExtension` is a stub, so it needs a logout. |
 | **Floating placement (Shell extension)** | `Main.layoutManager.addChrome()`, the same mechanism as OSD popups — an in-Shell actor, not a window pretending to be one. | Inherently a desktop gadget: floats above the wallpaper, can overlap a dock, hidden by fullscreen windows. Stated in the preferences dialog rather than left to be discovered. |
 | **Window placement (`jamsys-cluster`)** | Stacking is solved: always-on-top and all-workspaces work over XWayland (see §1). Drag from anywhere on the face. | **Position cannot be set by the application.** Wayland gives a window no control over where it opens, and that is true on XWayland here too — the compositor places it and you drag it to the corner you want. The Shell extension has no such limit, which is why it stays the primary surface. |
+| **Click-through gaps** | The earlier audit observed six input-region rectangles with `XShapeGetRectangles`. | The handover and UI architecture document lost focus and missing clicks on Mutter even inside those rectangles. Region geometry does **not** prove usable pointer behaviour. Opt-in and off by default; not retested in this review. |
+| **Daemon loss/reconnect on both UI surfaces** | Callback regressions cover subscription cleanup, stale replies, restart and close/disable. The shared offline face has 24 real-Cairo checks and was inspected on light/dark grounds. | Live Shell and standalone restart behaviour with these changes is not yet manually verified. No service was stopped or restarted in this review. |
 | **Bluetooth** | Per-device state from BlueZ over the system bus: name, address, type, paired, connected, and battery where the device publishes `org.bluez.Battery1`. Connect/disconnect transitions are **event-driven** — BlueZ signals wake the collector, so a flap shorter than the sampling interval is still caught. Disconnects raise a notice naming the device; three in fifteen minutes escalate to a flapping warning. | No device battery on hardware that does not publish it (this machine's headset does not). **Disconnect *reason* is not available**: the kernel exposes no HCI reason to an unprivileged process, so the app reports the observable context and names a cause only when a precondition held, otherwise says the reason is not observable. 802.11 power save is behind nl80211 and is not read; only the wireless device's runtime-PM setting is. |
 | **Audio** | Service state, sound cards, restart detection via PID change. | No default sink/source names, no per-stream detail. `libpipewire-0.3` headers are not installed, so the native API cannot be linked; the alternative is spawning `pw-dump` on a timer, which the specification rules out. |
 | **NVMe SMART** | Temperature, unprivileged, via hwmon. | Wear, spare blocks, media errors need the helper. See §3. |
@@ -125,7 +130,7 @@ never executed.
 |---|---|---|
 | **NVMe SMART ioctl** (log page 0x02) | `/dev/nvme0` is `0600 root`. The 512-byte parser is tested against synthetic buffers including a failing-drive case. | Follows NVMe 1.4. Medium-high, unproven. |
 | **RAPL energy reading** | `energy_uj` is `0400 root`. Wrap arithmetic is unit-tested. | High — a file read and a delta. |
-| **Polkit action** | Cannot install to `/usr/share/polkit-1/actions` without root. | The policy is standard and small; `allow_active=yes` matches how desktop brightness is handled. |
+| **Keyboard modes beyond the recorded static colours** | The historical audit records static red/green/white and brightness 1/3, not every firmware mode or power-state combination. | Parser tests pass; other modes remain hardware-unverified. Keyboard and battery Polkit writes themselves have historical evidence in §1. |
 | **udev alternative** | Cannot install to `/etc/udev/rules.d`. | The daemon's `direct` detection path is code-complete and the UI honours it. |
 | **A real suspend/resume** | Suspending ends the session running the tests. `BOOTTIME − MONOTONIC` was 0 throughout, as expected for a machine that never slept. | Detection is arithmetic over two clocks, unit-tested with an 8-hour synthetic sleep. High. |
 | **Suspend battery drain** | Needs a real suspend. | Rate arithmetic tested. |
@@ -133,7 +138,8 @@ never executed.
 | **A real OOM kill** | None occurred, and provoking one would kill the user's applications. | Counter-delta and journal-pattern paths unit-tested. |
 | **Disk-full and SMART-failure alerts** | Would require damaging the machine. | Rules unit-tested with synthetic snapshots. |
 | **Memory-leak rule end to end** | Nothing leaked during the session. | Theil–Sen estimator tested against a synthetic 1 GB/h leak with an injected outlier. |
-| **Wi-Fi / Bluetooth disconnect** | Would interrupt a live network and disconnect paired devices while the machine is unattended. | `./scripts/fault-injection.sh wifi` and `bluetooth` run them on request. |
+| **Wi-Fi disconnect; repeat Bluetooth fault injection** | Neither was triggered in this review. Bluetooth has historical disconnect/reconnect evidence in §1; Wi-Fi fault injection remains unverified here. | `./scripts/fault-injection.sh wifi` and `bluetooth` require explicit user approval before execution. |
+| **Collector loss and recovery after a driver reload** | No real driver was unloaded. | Synthetic tests verify stale thermal removal and a bounded retry after `Gone`; actual unload/reload recovery remains unverified. |
 | **Ethernet under load** | No cable attached. | Correctly detected and reported as down. |
 
 ## 4. Unsupported
@@ -143,7 +149,7 @@ never executed.
 | **Thunderbolt / USB4** | No controller (`/sys/bus/thunderbolt` empty). Not implemented rather than implemented-and-untestable. |
 | **AMD GPUs** | Only `i915`, `xe` and `nvidia` are detected. An AMD machine reports the GPU collector unsupported rather than showing wrong numbers. |
 | **SATA/SCSI SMART** | NVMe only. SATA would mean spawning `smartctl`; the helper is ioctl-only by design. |
-| **Fan control, platform profile, charge limit, GPU MUX** | The interfaces exist here (`platform_profile`, `throttle_thermal_policy`, `charge_control_end_threshold`, `asus-armoury`) and are deliberately **not** wired. Monitoring has priority over tweaking, and each needs its own validation and hardware testing before going near a root binary. |
+| **Fan control, platform profile, GPU MUX** | These controls remain unwired. Battery charge limit is separately implemented through `jamsys-power` and has historical write/readback evidence in §1. |
 | **Per-process network bandwidth** | Needs cgroup accounting or eBPF. |
 | **Packet inspection of any kind** | Explicitly excluded. No `AF_PACKET` socket exists in the codebase. |
 | **Remote or multi-machine monitoring** | Local only, by design. |
@@ -156,8 +162,8 @@ never executed.
    three layout defects were found — and the Shell has been made to load the extension,
    which is how a fourth defect (`affectsInputRegion`) was found. But a PNG is not a
    live actor and a load is not a paint. It is the first thing to check after a logout.
-2. **Keyboard writes are unproven.** The most likely failure is a firmware that accepts
-   mode 0 but not 1–3; try static first.
+2. **Not every keyboard mode is proven.** Static colours and brightness have historical
+   evidence in §1; modes and power-state combinations beyond those remain unverified.
 3. **The window is heavy.** 110 MB PSS, dominated by the Python interpreter, PyGObject
    and Mesa. A `gtk4-rs` front-end against the same socket would fix it; the protocol
    exists partly to make that substitution cheap. The daemon stays at 26.8 MB.
@@ -167,8 +173,8 @@ never executed.
    rarely on battery will take days to learn a battery-idle baseline. Correct, but a
    user expecting instant anomaly detection will be disappointed for the first hour.
 6. **No AMD support**, which is a large share of Linux laptops.
-7. **On AC there is no whole-system power figure** without the RAPL helper, so idle-power
-   anomaly detection effectively only works on battery.
+7. **On AC there is no whole-system power figure.** RAPL would provide CPU-package
+   energy, not total laptop draw; whole-system idle-power comparisons rely on battery data.
 8. **`db_bytes ÷ uptime` overstates growth**, because the database predates the current
    run. Measure a delta instead; the acceptance script does.
 
@@ -199,27 +205,39 @@ matters: the dGPU draws 6.8 W awake, and the gate keeps JamSys from causing that
 
 | To do this | You need |
 |---|---|
-| Everything in §1 except SMART and RAPL | **Nothing.** No root, no capabilities, no setuid. |
+| Read-only monitoring in §1 except SMART and RAPL | **Nothing.** No root, no capabilities, no setuid; journal and other-user process restrictions are listed below. Hardware control uses the separate helpers. |
 | Read the system journal | `adm` or `systemd-journal` membership. Already satisfied here. |
 | Per-process I/O and GPU for *other users'* processes | Root. Not requested. |
 | NVMe SMART, CPU package power | The optional read-only helper (`CAP_SYS_ADMIN` for the NVMe ioctl). |
 | Keyboard lighting | Either the Polkit-gated write helper, or the udev rule and no privileged code at all. |
+| Battery charge-limit writes | `jamsys-power` via Polkit (`auth_admin_keep`); unprivileged reads remain available. |
 | Install the .deb, enable the Shell extension | Root for the package; a logout for the extension. |
 | Run the window or the readout | Never root. |
 
 ## 8. Tests
 
-**328 assertions, all passing.**
+Repository review on 2026-09-10: all suites below passed. Rust counts are tests;
+Python/GJS counts are the harnesses' checks, not equivalent unit-test totals.
 
 ```
-jamsys-daemon   231 unit + 16 integration
+jamsys-daemon   267 unit + 17 integration (baseline: 263 + 16)
 jamsys-helper     5 unit
-jamsys-kbd       10 unit   (every injection attempt is a named test)
-extension          23 panel-line + 22 gauge + 21 Shell-API contract
-                   +  live end-to-end against the running daemon
-cluster            7 states rendered to PNG and visually reviewed
-fault injection     5 safe scenarios executed on real hardware
+jamsys-kbd       12 unit
+jamsys-power      7 unit
+Python           34 xabove + 19 charge-limit checks
+extension        23 panel-line + 60 gauge + 69 Shell-API checks
+cluster          10 standalone lifecycle + 24 offline Cairo checks
+live D-Bus       26 checks; received 2 StateChanged signals
 ```
+
+Baseline Shell-API count was 53; the other pre-existing suites retained their counts.
+The charge-limit harness explicitly skipped its absent-helper branch because a helper
+is installed; this is not a new helper-write verification. Two pre-existing Rust
+warnings in `collectors/keyboard.rs` remain. The first sandboxed daemon run had
+17 local-socket failures; the unrestricted baseline and final runs passed unchanged
+tests. The sandbox also blocked the initial live D-Bus connection; the permitted rerun
+passed. No fault-injection or privileged hardware scenario was run in this review.
+The live D-Bus check used the already-installed daemon, not the newly built binary.
 
 Covering the threshold engine and every rule's explanation contract; baseline
 mathematics including the degenerate-MAD, absolute-delta, warm-up, context-separation
