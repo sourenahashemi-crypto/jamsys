@@ -9,6 +9,7 @@ one without touching the backend.
 
 from __future__ import annotations
 
+import sys
 import time
 from typing import Optional
 
@@ -1824,4 +1825,22 @@ def Gdk_display():
 
 def main(start_page: Optional[str] = None) -> int:
     Adw.init()
-    return JamSysApp(start_page).run(None)
+    app = JamSysApp(start_page)
+
+    # Registering the application id is a D-Bus round trip, and it fails if a previous
+    # instance is still releasing the name — launching twice in quick succession, or
+    # relaunching right after closing, is enough. GApplication treats that as fatal
+    # ("Message recipient disconnected from message bus without replying"), which
+    # presents to the user as the window simply not opening. Retry briefly instead.
+    for attempt in range(4):
+        try:
+            app.register(None)
+            break
+        except GLib.Error as e:
+            if attempt == 3:
+                print(f"jamsys: could not register on the session bus: {e.message}",
+                      file=sys.stderr)
+                return 1
+            time.sleep(0.35 * (attempt + 1))
+
+    return app.run(None)
