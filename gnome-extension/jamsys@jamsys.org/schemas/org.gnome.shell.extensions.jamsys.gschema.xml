@@ -10,6 +10,7 @@
   <enum id="org.gnome.shell.extensions.jamsys.mode">
     <value nick="compact" value="0"/>
     <value nick="minimal" value="1"/>
+    <value nick="cluster" value="2"/>
   </enum>
   <schema id="org.gnome.shell.extensions.jamsys"
           path="/org/gnome/shell/extensions/jamsys/">
@@ -18,8 +19,23 @@
       <summary>Where the readout sits</summary>
     </key>
     <key name="mode" enum="org.gnome.shell.extensions.jamsys.mode">
-      <default>'compact'</default>
-      <summary>Compact single line, or minimal multi-line</summary>
+      <default>'cluster'</default>
+      <summary>Instrument cluster, compact single line, or minimal multi-line</summary>
+    </key>
+    <key name="scale" type="d">
+      <default>1.0</default>
+      <range min="0.55" max="1.8"/>
+      <summary>Size of the instrument cluster</summary>
+    </key>
+    <key name="opacity" type="d">
+      <default>0.92</default>
+      <range min="0.35" max="1.0"/>
+      <summary>Opacity of the cluster housing</summary>
+    </key>
+    <key name="margin" type="i">
+      <default>14</default>
+      <range min="0" max="120"/>
+      <summary>Distance from the screen edge, in pixels</summary>
     </key>
     <key name="show-cpu" type="b"><default>true</default><summary>Show CPU</summary></key>
     <key name="show-temp" type="b"><default>true</default><summary>Show CPU temperature</summary></key>

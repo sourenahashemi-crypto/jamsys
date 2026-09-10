@@ -201,6 +201,7 @@ that collector and nothing else.
 | Epoll wakeups, ticks, idle ticks | internal counters | — | — | on request |
 | Events processed / dropped | internal counters | — | — | on request |
 | Database size and row counts | `PRAGMA page_count × page_size` | SQLite | — | on request |
+| Widget repaints pushed | internal counter | — | — | on request |
 | Per-collector runs and mean cost | internal timing | — | — | on request |
 
 ---

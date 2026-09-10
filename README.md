@@ -32,24 +32,28 @@ Never "anomaly detected".
 
 ## Three surfaces
 
-**The glance** — a GNOME Shell corner readout that recedes into the panel while
-everything is fine:
+**The glance** — a desktop instrument cluster in a corner of your screen. Swept
+tachometer dials, a redline, machined bezels, a segmented power strip and dashboard
+telltales that stay dark until they have something to say.
+
+![Instrument cluster, idle](docs/screenshots/cluster-idle.png)
+
+When something is wrong it says so, in the header and on the instruments:
+
+![Instrument cluster, critical](docs/screenshots/cluster-critical.png)
+
+It does not poll. The daemon pushes an update only when a displayed value has changed
+enough for a human to notice, so nothing repaints for sensor noise and nothing animates.
+
+Prefer a line of text in the top panel instead? That is still there:
 
 ```
 CPU 7% · 52° | RAM 18% | GPU — | 11.2W | NET ✓
+⚠ POWER 29.8W                                   ← abnormal replaces the readings
 ```
-
-and replaces itself with the one thing that is wrong when something is:
-
-```
-⚠ POWER 29.8W
-```
-
-It does not poll. The daemon pushes an update only when a displayed value has changed
-enough for a human to notice, so the panel does not repaint for noise.
 
 **The investigation** — a GTK4 window with a page per subsystem, opened by clicking the
-warning.
+cluster.
 
 **The controls** — keyboard backlight and RGB, the one thing JamSys can change.
 
@@ -136,19 +140,21 @@ Then launch **JamSys** from your applications, or run `jamsys`.
 
 Installs into `~/.local`, writes a user unit, starts it. No root anywhere.
 
-### The corner readout
+### The corner cluster
 
 ```bash
 # Installed by the .deb. GNOME Shell will not load a *new* extension on Wayland
 # without a session restart, so log out and back in first, then:
 gnome-extensions enable jamsys@jamsys.org
-gnome-extensions prefs  jamsys@jamsys.org   # position, layout, what to show
+gnome-extensions prefs  jamsys@jamsys.org   # corner, size, opacity, style
 ```
 
-Top-left, top-centre and top-right sit in the panel and are completely solid. Bottom
-positions float above the desktop, because GNOME Shell has no bottom panel — they work,
-but they can overlap a dock and are hidden by fullscreen windows. That limitation is
-documented rather than hacked around.
+Any of the four corners, plus top-centre, with an adjustable edge margin, size
+(0.55×–1.8×) and housing opacity. The cluster floats above the desktop as a Shell
+chrome actor — the same mechanism OSD popups use — because Wayland has no such thing as
+an always-on-top application window and faking one is not attempted. It can overlap a
+dock and is hidden by fullscreen windows; that limitation is documented rather than
+hacked around.
 
 ### Keyboard lighting
 
@@ -297,10 +303,17 @@ jamsys  --json stats      # the daemon's own resource usage
 cd jamsys-daemon && cargo test           # 247 tests
 cd jamsys-helper && cargo test           #   5 tests
 cd jamsys-kbd    && cargo test           #  10 tests, all the injection attempts
-gjs -m gnome-extension/tests/format-test.js      # 23 rendering tests
+gjs -m gnome-extension/tests/format-test.js      # panel-line rendering
+gjs -m gnome-extension/tests/gauges-test.js      # needle mapping and geometry
 gjs -m gnome-extension/tests/live-dbus-test.js   # end-to-end against the live daemon
+gjs -m gnome-extension/tests/render-cluster.js /tmp   # draw every state to PNG
 ./scripts/fault-injection.sh list                # controlled fault injection
 ```
+
+`render-cluster.js` is how the cluster was designed at all: GNOME will not load a new
+extension without a session restart, so the drawing code takes a plain Cairo context and
+the harness feeds it an image surface instead of a widget. `--live` renders your actual
+machine.
 
 Covering the threshold engine, baseline mathematics, alert deduplication and rate
 limiting, retention and rollups, every parser, missing sensors, invalid sysfs data,
