@@ -5,6 +5,7 @@ Three surfaces, in descending order of how often you look at them.
 | Surface | Technology | Purpose | Runs where |
 |---|---|---|---|
 | **Corner cluster** | GNOME Shell extension, Cairo (GJS) | The glance. An instrument binnacle in a screen corner. | inside `gnome-shell` |
+| **Cluster window** | GTK4 + Cairo (GJS) — *the same drawing* | The same cluster as an ordinary window. Works with no session restart, and on desktops that are not GNOME. | its own process |
 | **Full window** | GTK4 + libadwaita (PyGObject) | The investigation. Opened when something needs looking at. | its own process |
 | **CLI** | `jamsys --json <op>` | Scripting and support. | its own process |
 
@@ -86,6 +87,38 @@ All four corners plus top-centre are available, with an adjustable edge margin.
 It floats above the desktop. It can overlap a dock, and it is hidden by fullscreen
 windows. That is inherent to being a desktop gadget on GNOME, and it is stated in the
 preferences dialog rather than left to be discovered.
+
+### The same cluster, as a window
+
+`jamsys-cluster` puts the identical drawing in a plain GTK4 window. It exists because
+of three real constraints:
+
+1. **GNOME Shell caches a loaded extension module.** Installing or fixing an extension
+   has no effect until the Shell restarts, which under Wayland means logging out.
+   `disable`/`enable` reuses the cached module and `ReloadExtension` is a stub in
+   GNOME 50. This window shows the cluster immediately.
+2. **The Shell extension only runs on GNOME.** This runs anywhere GTK4 does.
+3. It is the fastest way to iterate on the drawing, because it is live rather than a PNG.
+
+It is undecorated and sized to its contents, with the whole face acting as a drag
+handle (`Gtk.WindowHandle`), so it behaves like a gadget rather than an application.
+Clicking it opens the full window on the relevant page; Escape closes it.
+
+```bash
+jamsys-cluster                          # default size
+jamsys-cluster --scale 1.4 --opacity 0.8
+jamsys-cluster --decorated              # keep a title bar
+```
+
+Its honest limitation against the Shell extension: **Wayland gives an ordinary window
+no control over its own position**, so the compositor decides where it first appears
+and you drag it to the corner you want. It also cannot pin itself above other windows
+— use the compositor's own "Always on Top" if it offers one. The Shell extension has
+neither problem, which is why it remains the primary surface.
+
+One copy of the rendering, three consumers: the Shell widget, this window, and the PNG
+harness. That is why `standalone.js` lives beside the extension rather than in its own
+directory — `gauges.js` is not duplicated.
 
 ### How it was designed without being able to see it
 

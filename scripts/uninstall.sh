@@ -9,9 +9,10 @@ rm -f "$HOME/.config/systemd/user/jamsysd.service"
 systemctl --user daemon-reload 2>/dev/null || true
 
 echo "==> removing user-installed files"
-rm -f  "$PREFIX/bin/jamsysd" "$PREFIX/bin/jamsys"
+rm -f  "$PREFIX/bin/jamsysd" "$PREFIX/bin/jamsys" "$PREFIX/bin/jamsys-cluster"
 rm -rf "$PREFIX/lib/jamsys_ui"
 rm -f  "$PREFIX/share/applications/org.jamsys.Monitor.desktop"
+rm -f  "$PREFIX/share/applications/org.jamsys.Cluster.desktop"
 rm -rf "$HOME/.local/share/gnome-shell/extensions/jamsys@jamsys.org"
 
 if command -v dpkg >/dev/null && dpkg -s jamsys >/dev/null 2>&1; then

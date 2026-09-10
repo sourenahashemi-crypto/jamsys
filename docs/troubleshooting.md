@@ -302,6 +302,15 @@ not something JamSys can change.
 
 ---
 
+## I want to see the cluster without logging out
+
+```bash
+jamsys-cluster
+```
+
+The same drawing in a plain GTK4 window. Wayland will not let it place itself, so drag
+it to the corner you want. This is also the answer on any desktop that is not GNOME.
+
 ## The corner readout does not appear
 
 ### After installing, GNOME does not list the extension
