@@ -240,6 +240,7 @@ let proxy = null;
 let daemonWatch = 0;
 let daemonSignal = 0;
 let daemonGeneration = 0;
+let daemonRetry = 0;
 let scale = opts.scale;
 let opacity = opts.opacity;
 let decorated = opts.decorated;
@@ -781,25 +782,63 @@ function openApp() {
 
 /* ------------------------------------------------------------------ daemon */
 
+/* How often to re-arm the name watch while nothing is connected.
+ *
+ * The watch alone is not enough. Measured: with no session bus reachable,
+ * Gio.bus_watch_name returns an id, fires `vanished` exactly once, and then
+ * never fires again -- so a window started before the bus was ready waited for
+ * ever. The watch gives an instant response when the daemon comes and goes;
+ * this gives eventual recovery when the bus itself was the problem. */
+const RECONNECT_S = 10;
+
 function connectDaemon() {
     stopDaemon();
     daemonWatch = Gio.bus_watch_name(
         Gio.BusType.SESSION, BUS_NAME, Gio.BusNameWatcherFlags.NONE,
         () => daemonAppeared(), () => disconnectDaemon());
+    armRetry();
+}
+
+/** Keep re-arming the watch until something actually connects. */
+function armRetry() {
+    if (daemonRetry) return;
+    daemonRetry = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, RECONNECT_S, () => {
+        if (proxy) {                 // connected: nothing to do
+            daemonRetry = 0;
+            return false;
+        }
+        // Tear the watch down and put a fresh one up. If the bus was missing
+        // when the first one was created, this is the only thing that recovers.
+        if (daemonWatch) Gio.bus_unwatch_name(daemonWatch);
+        daemonWatch = Gio.bus_watch_name(
+            Gio.BusType.SESSION, BUS_NAME, Gio.BusNameWatcherFlags.NONE,
+            () => daemonAppeared(), () => disconnectDaemon());
+        return true;                 // keep trying
+    });
 }
 
 function disconnectDaemon() {
+    const wasConnected = proxy !== null;
     daemonGeneration++;
     if (proxy && daemonSignal) proxy.disconnectSignal(daemonSignal);
     daemonSignal = 0;
     proxy = null;
     state = null;
     area?.queue_draw();
+    if (wasConnected) {
+        // Say it on stderr too. The on-screen face is invisible to anyone
+        // running this from a terminal or reading a log, and this used to be
+        // the only place the systemctl hint appeared.
+        printerr('jamsys-cluster: jamsysd went away; waiting for it to come back');
+    }
+    if (daemonWatch) armRetry();
 }
 
 function stopDaemon() {
     if (daemonWatch) Gio.bus_unwatch_name(daemonWatch);
     daemonWatch = 0;
+    if (daemonRetry) GLib.Source.remove(daemonRetry);
+    daemonRetry = 0;
     disconnectDaemon();
 }
 
@@ -809,8 +848,13 @@ function daemonAppeared() {
     try {
         proxy = new Proxy(Gio.DBus.session, BUS_NAME, OBJECT_PATH);
     } catch (e) {
+        // name_appeared fires once per ownership change, so returning here used
+        // to strand the window against a perfectly healthy daemon. Let the
+        // retry timer try again.
         printerr(`jamsys-cluster: cannot reach ${BUS_NAME}: ${e.message}`);
-        printerr('  is the daemon running?  systemctl --user status jamsysd');
+        printerr(`  retrying in ${RECONNECT_S}s; is the daemon running?  systemctl --user status jamsysd`);
+        proxy = null;
+        armRetry();
         return;
     }
     let pushed = false;

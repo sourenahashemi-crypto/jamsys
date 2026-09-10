@@ -44,6 +44,23 @@ def _self_rss() -> int:
 REFRESH_MS = 2000
 
 
+def _has_open_popover(widget) -> bool:
+    """Is any popover under this widget currently on screen?
+
+    A GtkDropDown's list, a menu, and a colour picker are all popovers, and in
+    GTK4 they are children of the widget that owns them, so an ordinary
+    depth-first walk finds them.
+    """
+    child = widget.get_first_child()
+    while child is not None:
+        if isinstance(child, Gtk.Popover) and child.is_visible():
+            return True
+        if _has_open_popover(child):
+            return True
+        child = child.get_next_sibling()
+    return False
+
+
 class Page(Gtk.Box):
     """Base for every detail page. Subclasses implement `render`."""
 
@@ -64,9 +81,54 @@ class Page(Gtk.Box):
         scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, vexpand=True)
         scroller.set_child(self.clamp)
         self.append(scroller)
+        self._scroller = scroller
 
     def render(self, snap: dict) -> None:
         raise NotImplementedError
+
+    # -- refresh, without fighting the user ------------------------------
+
+    def update(self, snap: dict) -> None:
+        """Re-render for new data, unless that would interrupt the user.
+
+        Every page rebuilds its whole body from scratch. That is fine for text
+        and hostile for anything you can interact with: on each two-second
+        refresh an open dropdown is destroyed underneath the pointer, and the
+        scroll position snaps back to the top. The symptom is a page that
+        jumps and a list you cannot scroll or pick from.
+
+        So: never rebuild while a popup is open or a control has focus, and
+        put the scroll position back afterwards. Data is at most one tick
+        stale while a menu is open, which nobody can perceive and everybody
+        prefers to a list that moves as they reach for it.
+        """
+        if self.is_interacting():
+            return
+        adj = self._scroller.get_vadjustment() if self._scroller else None
+        pos = adj.get_value() if adj else 0.0
+        self.render(snap)
+        if adj and pos > 0.0:
+            # After the rebuild the new children have not been allocated yet,
+            # so upper/page_size are still stale; restoring on idle waits for
+            # the layout that makes the clamp meaningful.
+            GLib.idle_add(self._restore_scroll, pos, priority=GLib.PRIORITY_LOW)
+
+    def _restore_scroll(self, pos: float) -> bool:
+        adj = self._scroller.get_vadjustment() if self._scroller else None
+        if adj:
+            adj.set_value(min(pos, max(0.0, adj.get_upper() - adj.get_page_size())))
+        return False
+
+    def is_interacting(self) -> bool:
+        """True when rebuilding now would yank something out from under the user."""
+        if _has_open_popover(self):
+            return True
+        root = self.get_root()
+        focus = root.get_focus() if root else None
+        # A text entry keeps focus while being typed into; a rebuild would drop
+        # the caret and the partially-typed value with it.
+        return bool(focus and focus.is_ancestor(self)
+                    and isinstance(focus, (Gtk.Entry, Gtk.SearchEntry, Gtk.Text)))
 
     # -- small helpers used by every page --------------------------------
 
@@ -1445,7 +1507,7 @@ class MainWindow(Adw.ApplicationWindow):
             page = self.current_page()
             if page:
                 try:
-                    page.render(res)
+                    page.update(res)
                 except Exception as e:  # noqa: BLE001 — a render bug must not kill the UI
                     print(f"[jamsys-ui] render error on {page.title}: {e}")
             if isinstance(page, OverviewPage):
@@ -1810,7 +1872,7 @@ class MainWindow(Adw.ApplicationWindow):
             self.toasts.add_toast(Adw.Toast(title="Suppression removed" if not err else f"Failed: {err}"))
             page = self.current_page()
             if page:
-                page.render(self.last_snapshot or {})
+                page.update(self.last_snapshot or {})
         run_async(work, done)
 
     def ignore_service(self, name: str):

@@ -164,6 +164,19 @@ const scrollEvent = (direction, dy = 0) => ({
     get_scroll_delta: () => [0, dy],
 });
 
+// The headline of the offline work, and previously deletable without any test
+// noticing: every assertion checked the extension's own bookkeeping rather than
+// the widget the user looks at.
+print('\ndaemon loss clears the cluster itself, not just the bookkeeping');
+run('cluster clears', fakeSettings({mode: 'cluster'}), e => {
+    e._widget.setState({health: 'healthy', cpu_pct: 42});
+    ok(e._widget._state !== null, 'the cluster is showing a reading to begin with');
+    e._onVanished();
+    ok(e._lastState === null, 'the extension forgets the last state');
+    ok(e._widget._state === null,
+       'and the cluster itself is cleared, so no stale dial is left on screen');
+});
+
 print('\nscroll to resize');
 
 function withCluster(settings, fn) {
@@ -346,7 +359,17 @@ print('\nlate daemon replies cannot resurrect or roll back the display');
 run('reply ordering', fakeSettings(), e => {
     const proxies = [];
     globalThis.__jamsysProxy = class {
-        constructor() { proxies.push(this); }
+        constructor(bus, name, path) {
+            // Strict, like every other stub here. A permissive constructor let
+            // three mutations through unnoticed: wrong bus type, wrong bus name
+            // and wrong object path all still "passed".
+            if (!bus) throw new Error('proxy: a bus connection is required');
+            if (name !== 'org.jamsys.Daemon')
+                throw new Error(`proxy: wrong bus name ${name}`);
+            if (path !== '/org/jamsys/Daemon')
+                throw new Error(`proxy: wrong object path ${path}`);
+            proxies.push(this);
+        }
         connectSignal(name, callback) {
             if (name !== 'StateChanged') throw new Error('unexpected signal');
             this.signal = callback;

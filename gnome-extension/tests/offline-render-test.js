@@ -42,5 +42,36 @@ for (const [face, width, height] of [['housing', CLUSTER_W, CLUSTER_H], ['cutout
         }
     }
 }
+/* --------------------------------------------------- degenerate sizes ----
+ * The sizes the widget actually passes through, as opposed to the ones a
+ * user chooses. A widget is 0x0 between construction and first allocation,
+ * and again while a monitor change is applied. The original arithmetic
+ * scaled by (w - 20): negative below 20px, zero at 20, and NaN at 0, which
+ * made the text render upside down, vanish, or throw. */
+for (const [w, h] of [[470, 176], [231, 87], [100, 40], [40, 30], [20, 15],
+                      [10, 10], [1, 1], [0, 0]]) {
+    const surface = new Cairo.ImageSurface(Cairo.Format.ARGB32,
+                                           Math.max(w, 1), Math.max(h, 1));
+    const cr = new Cairo.Context(surface);
+    let threw = null;
+    const sizes = [];
+    const baselines = [];
+    const probe = new Proxy(cr, {get(target, key) {
+        if (key === 'setFontSize')
+            return v => { sizes.push(v); target.setFontSize(v); };
+        if (key === 'moveTo')
+            return (x, y) => { baselines.push(y); target.moveTo(x, y); };
+        return typeof target[key] === 'function' ? target[key].bind(target) : target[key];
+    }});
+    try { drawUnavailable(probe, w, h); } catch (e) { threw = e.message; }
+    ok(threw === null, `${w}x${h}: does not throw`, threw ?? '');
+    ok(sizes.every(v => Number.isFinite(v) && v > 0),
+       `${w}x${h}: every font size is finite and positive`, JSON.stringify(sizes));
+    ok(baselines.every(y => y >= 0 && y <= h),
+       `${w}x${h}: every baseline drawn is inside the surface`,
+       `h=${h} baselines=${JSON.stringify(baselines)}`);
+    try { cr.$dispose(); } catch { /* already gone */ }
+}
+
 print(`${checks} checks, ${failures} failure(s)`);
 imports.system.exit(failures ? 1 : 0);

@@ -271,6 +271,94 @@ fn a_disappeared_collector_is_retried_without_restarting_monitoring() {
     assert_eq!(x.samples.len(), 2, "explicitly disabled collectors stay disabled");
 }
 
+#[test]
+fn re_enabling_while_the_hardware_is_still_absent_keeps_the_retry() {
+    // The obvious recovery gesture. A driver unloads, the Coverage page says
+    // "Unavailable", and the user toggles the collector off and on to kick it.
+    // That used to zero the retry deadline and drop the collector into the
+    // "never usable, never retry" state, stranding it until a daemon restart --
+    // the opposite of what the gesture was meant to achieve.
+    use jamsys::collectors::Registry;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Absent { present: Arc<AtomicBool> }
+    impl Collector for Absent {
+        fn name(&self) -> &'static str { "absent" }
+        fn tier(&self) -> Tier { Tier::Medium }
+        fn probe(&mut self) -> Support {
+            if self.present.load(Ordering::SeqCst) { Support::Full }
+            else { Support::Unsupported { reason: "driver unloaded".into() } }
+        }
+        fn collect(&mut self, ctx: &mut Ctx) -> CResult<()> {
+            if !self.present.load(Ordering::SeqCst) {
+                return Err(CollectorError::Gone("driver unloaded".into()));
+            }
+            ctx.g("test", "v", "", 1.0);
+            Ok(())
+        }
+    }
+
+    let present = Arc::new(AtomicBool::new(true));
+    let cfg = Config::default();
+    let mut r = Registry::new();
+    r.add(Box::new(Absent { present: present.clone() }), &cfg);
+    let mut x = ctx();
+    r.run_tier(Tier::Medium, &mut x, 0);
+
+    present.store(false, Ordering::SeqCst);
+    r.run_tier(Tier::Medium, &mut x, 10_000);
+    assert_eq!(r.coverage()[0]["label"], "Unavailable");
+
+    // The user toggles it off and back on while the driver is still missing.
+    r.set_enabled("absent", false);
+    r.set_enabled("absent", true);
+
+    // The driver returns. Without the fix this tick does nothing, for ever.
+    present.store(true, Ordering::SeqCst);
+    let before = x.samples.len();
+    r.run_tier(Tier::Medium, &mut x, 10_000 + 900_001);
+    assert_eq!(r.coverage()[0]["label"], "Full",
+               "toggling a collector must not cancel its retry");
+    assert_eq!(x.samples.len(), before + 1, "and monitoring must actually resume");
+}
+
+#[test]
+fn a_collector_that_can_read_nothing_does_not_report_itself_as_covered() {
+    // A probe that returns Partial while collect() can produce nothing is the
+    // worst failure this crate has: the Coverage page says the subsystem is
+    // watched, no data is ever stored, and because Partial counts as usable the
+    // registry schedules no retry, so it can never recover either.
+    use jamsys::collectors::Registry;
+
+    struct EmptyPartial;
+    impl Collector for EmptyPartial {
+        fn name(&self) -> &'static str { "emptypartial" }
+        fn tier(&self) -> Tier { Tier::Medium }
+        fn probe(&mut self) -> Support {
+            Support::Partial { detail: "advertises coverage it cannot deliver".into() }
+        }
+        fn collect(&mut self, _ctx: &mut Ctx) -> CResult<()> {
+            Err(CollectorError::Gone("nothing readable".into()))
+        }
+    }
+
+    let mut r = Registry::new();
+    r.add(Box::new(EmptyPartial), &Config::default());
+    let mut x = ctx();
+    for t in 0..6 {
+        r.run_tier(Tier::Medium, &mut x, t);
+    }
+    assert!(x.samples.is_empty(), "it produced nothing, as expected");
+    assert_ne!(r.coverage()[0]["label"], "Full",
+               "a source with no readings must never read as fully covered");
+    let runs = r.coverage()[0]["runs"].as_u64().unwrap_or(0);
+    for t in 6..60 {
+        r.run_tier(Tier::Medium, &mut x, t);
+    }
+    assert_eq!(r.coverage()[0]["runs"].as_u64().unwrap_or(0), runs,
+               "and it must back off rather than retry on every tick for ever");
+}
+
 // ---------------------------------------------------------------------------
 // Suspend and resume
 // ---------------------------------------------------------------------------

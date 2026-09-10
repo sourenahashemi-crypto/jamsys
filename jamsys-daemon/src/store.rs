@@ -61,6 +61,11 @@ pub const DISK_BUCKET_MS: i64 = 10_000;
 /// Cap per series so the in-memory ring cannot grow without bound on a long uptime.
 const LIVE_MAX_POINTS: usize = 1_200;
 
+/// Beyond this, a gap between two firings of the same alert is far more likely
+/// to be a clock step or a long suspend than a genuine re-occurrence, and
+/// counting it inflates the "fired N times" the user reads.
+const MAX_PLAUSIBLE_REFIRE_MS: i64 = 6 * 60 * 60 * 1000;
+
 impl Store {
     pub fn open(path: &Path) -> rusqlite::Result<Store> {
         if let Some(d) = path.parent() {
@@ -95,6 +100,23 @@ impl Store {
         s.migrate()?;
         s.load_ids()?;
         Ok(s)
+    }
+
+    /// Add a column to an existing table, ignoring "it is already there".
+    ///
+    /// There is no version counter in this schema; every table is created with
+    /// IF NOT EXISTS, which cannot add a column to a database that predates it.
+    fn add_column_if_missing(&self, table: &str, column: &str, decl: &str) {
+        let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {decl}");
+        match self.conn.execute(&sql, []) {
+            Ok(_) => crate::log_info!("schema: added {table}.{column}"),
+            Err(e) => {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column name") {
+                    crate::log_warn!("schema: could not add {table}.{column}: {e}");
+                }
+            }
+        }
     }
 
     fn migrate(&mut self) -> rusqlite::Result<()> {
@@ -151,7 +173,12 @@ CREATE TABLE IF NOT EXISTS alert (
   explanation TEXT NOT NULL,
   evidence    TEXT NOT NULL,
   suggestion  TEXT,
-  acked_ts    INTEGER
+  acked_ts    INTEGER,
+  -- The desktop notification currently on screen for this alert, so a daemon
+  -- restart can still take it down. Critical notifications are sent with
+  -- timeout 0 (never expires); without this an alert that resolved while the
+  -- daemon was restarting left its toast on the desktop for ever.
+  notify_id   INTEGER NOT NULL DEFAULT 0
 );
 -- At most one OPEN alert per fingerprint, enforced by the database rather than by
 -- daemon memory, so a restart cannot duplicate a firing alert.
@@ -203,9 +230,20 @@ CREATE TABLE IF NOT EXISTS threshold_override (
 );
 "#,
         )?;
+        // Databases created before this column exists get it here.
+        self.add_column_if_missing("alert", "notify_id", "INTEGER NOT NULL DEFAULT 0");
         self.conn.execute(
             "INSERT OR IGNORE INTO meta(k,v) VALUES('schema_version', ?1), ('install_ts', ?2)",
             params![SCHEMA_VERSION.to_string(), now_ms().to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Remember which desktop notification belongs to an open alert.
+    pub fn set_notify_id(&self, fingerprint: &str, id: u32) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE alert SET notify_id=?2 WHERE fingerprint=?1 AND resolved_ts IS NULL",
+            params![fingerprint, id as i64],
         )?;
         Ok(())
     }
@@ -414,6 +452,7 @@ CREATE TABLE IF NOT EXISTS threshold_override (
 
     // ---- alerts -----------------------------------------------------------
 
+
     /// Insert or coalesce. Returns `(row id, is_new)`.
     ///
     /// `is_new` drives notification: a re-fire of an already-open alert bumps `count`
@@ -445,7 +484,18 @@ CREATE TABLE IF NOT EXISTS threshold_override (
                 let last_ts: i64 = self.conn
                     .query_row("SELECT last_ts FROM alert WHERE id=?1", params![id], |r| r.get(0))
                     .unwrap_or(ts);
-                let distinct = ts - last_ts >= a.severity.cooldown_s() * 1000;
+                // Guard the wall clock. This is the one dedup layer that must
+                // stay on wall time -- `last_ts` is persisted and shown to the
+                // user -- while the notification cooldown in AlertManager runs on
+                // the monotonic clock, so the two are deliberately different
+                // domains and cannot be made to agree. What they must not do is
+                // produce nonsense: an NTP step backwards made this delta
+                // negative and stopped counting genuine re-fires until wall time
+                // caught up, and a step forwards invented an occurrence that
+                // never happened.
+                let delta = ts.saturating_sub(last_ts);
+                let distinct = delta >= 0 && delta >= a.severity.cooldown_s() * 1000
+                    && delta < MAX_PLAUSIBLE_REFIRE_MS;
                 self.conn.execute(
                     "UPDATE alert SET last_ts=?1, count=count+?8, severity=?2, title=?3,
                      explanation=?4, evidence=?5, suggestion=?6 WHERE id=?7",
@@ -489,7 +539,7 @@ CREATE TABLE IF NOT EXISTS threshold_override (
 
     pub fn alerts(&self, open_only: bool, limit: usize) -> rusqlite::Result<Vec<serde_json::Value>> {
         let sql = format!(
-            "SELECT id,fingerprint,rule_id,severity,first_ts,last_ts,resolved_ts,count,title,explanation,evidence,suggestion,acked_ts
+            "SELECT id,fingerprint,rule_id,severity,first_ts,last_ts,resolved_ts,count,title,explanation,evidence,suggestion,acked_ts,notify_id
              FROM alert {} ORDER BY (resolved_ts IS NULL) DESC, last_ts DESC LIMIT {}",
             if open_only { "WHERE resolved_ts IS NULL" } else { "" },
             limit.min(2000)
@@ -510,6 +560,7 @@ CREATE TABLE IF NOT EXISTS threshold_override (
                 "explanation": r.get::<_, String>(9)?,
                 "detail": serde_json::from_str::<serde_json::Value>(&ev).unwrap_or(serde_json::Value::Null),
                 "suggestion": r.get::<_, Option<String>>(11)?,
+                "notify_id": r.get::<_, i64>(13).unwrap_or(0),
                 "acked_ts": r.get::<_, Option<i64>>(12)?,
             }))
         })?;

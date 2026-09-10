@@ -223,7 +223,21 @@ impl Registry {
                         e.consecutive_failures = 0;
                         e.retry_after_ms = 0;
                     }
-                    _ => {
+                    Ok(s) => {
+                        // Keep the fresh verdict. Discarding it left Coverage
+                        // showing the original reason for ever -- reporting a
+                        // sensor as broken when the daemon had just established
+                        // it was simply absent, and disagreeing with event_fds(),
+                        // which filters on the same field.
+                        e.support = s;
+                        e.retry_after_ms = now_mono + QUARANTINE_RETRY_MS;
+                        continue;
+                    }
+                    Err(_) => {
+                        e.support = Support::Quarantined {
+                            reason: "probe panicked".into(),
+                            failures: e.consecutive_failures.max(1),
+                        };
                         e.retry_after_ms = now_mono + QUARANTINE_RETRY_MS;
                         continue;
                     }
@@ -250,14 +264,24 @@ impl Registry {
                         let s = catch_unwind(AssertUnwindSafe(|| e.c.probe()))
                             .unwrap_or(Support::Unsupported { reason: "probe panicked".into() });
                         e.support = s;
-                        e.consecutive_failures = 0;
-                        // A driver may still be absent during the immediate probe.
-                        // Keep a bounded retry path instead of disabling it forever.
-                        e.retry_after_ms = if e.support.is_usable() {
-                            0
+                        if e.support.is_usable() {
+                            // probe() says the source is fine but collect() disagrees.
+                            // Resetting the failure count here made that pair an
+                            // unbounded loop: a full re-probe and a journal line on
+                            // every tick, for ever, with quarantine unreachable. Count
+                            // it as the failure it is so three strikes back off.
+                            e.consecutive_failures += 1;
+                            crate::log_warn!(
+                                "collector {name} probes usable but keeps vanishing \
+                                 ({}/{QUARANTINE_AFTER})", e.consecutive_failures);
+                            Self::maybe_quarantine(e, now_mono);
                         } else {
-                            now_mono + QUARANTINE_RETRY_MS
-                        };
+                            // Genuinely absent. Reset the strike count -- this is a
+                            // coverage change, not a fault -- and take the bounded
+                            // retry path so a returning driver is picked up.
+                            e.consecutive_failures = 0;
+                            e.retry_after_ms = now_mono + QUARANTINE_RETRY_MS;
+                        }
                     } else {
                         e.consecutive_failures += 1;
                         crate::log_warn!("collector {name} failed ({}/{QUARANTINE_AFTER}): {err}", e.consecutive_failures);
@@ -298,14 +322,30 @@ impl Registry {
     pub fn set_enabled(&mut self, name: &str, enabled: bool) -> bool {
         for e in self.entries.iter_mut() {
             if e.c.name() == name {
-                e.retry_after_ms = 0;
-                e.support = if enabled {
-                    e.consecutive_failures = 0;
-                    catch_unwind(AssertUnwindSafe(|| e.c.probe()))
-                        .unwrap_or(Support::Unsupported { reason: "probe panicked".into() })
-                } else {
-                    Support::Disabled
-                };
+                if !enabled {
+                    // Keep any scheduled retry. Disabling is "stop sampling for
+                    // now", not "forget everything you knew"; discarding the
+                    // deadline here is what made an off/on toggle strand a
+                    // collector whose hardware was still absent.
+                    e.support = Support::Disabled;
+                    return true;
+                }
+                e.consecutive_failures = 0;
+                let scheduled = e.retry_after_ms;
+                e.support = catch_unwind(AssertUnwindSafe(|| e.c.probe()))
+                    .unwrap_or(Support::Unsupported { reason: "probe panicked".into() });
+                // Clear the deadline only when the probe actually succeeded;
+                // otherwise keep whatever was already scheduled. Zeroing it
+                // unconditionally meant the obvious recovery gesture -- toggle the
+                // collector off and on while the hardware is still absent --
+                // dropped it into the "never usable, never retry" sentinel and
+                // stranded it until the daemon restarted.
+                //
+                // Preserving the old deadline rather than computing a new one also
+                // keeps this function off the wall/monotonic clock entirely: every
+                // deadline is minted by run_tier from the tier's own `now_mono`,
+                // which is what the tests inject.
+                e.retry_after_ms = if e.support.is_usable() { 0 } else { scheduled };
                 return true;
             }
         }
@@ -478,12 +518,45 @@ mod tests {
         let mut r = Registry::new();
         r.add(Box::new(Flaky { mode: "gone", calls: 0 }), &Config::default());
         let mut c = ctx();
-        for _ in 0..5 {
-            r.run_tier(Tier::Fast, &mut c, 0);
+        // One or two vanishings are an unplug/replug, not a fault: stay covered.
+        r.run_tier(Tier::Fast, &mut c, 0);
+        assert_eq!(r.coverage()[0]["label"], "Full", "a single Gone is not a fault");
+        r.run_tier(Tier::Fast, &mut c, 1);
+        assert_eq!(r.coverage()[0]["label"], "Full", "nor is a second");
+
+        // But a probe that keeps saying "usable" while collect() keeps saying
+        // "gone" is a loop, not a recovery. Left alone it re-probed and logged on
+        // every single tick for ever, and could never reach quarantine. Three
+        // strikes must back it off.
+        r.run_tier(Tier::Fast, &mut c, 2);
+        assert_eq!(r.coverage()[0]["label"], "Quarantined",
+                   "a permanently vanishing source must stop being retried every tick");
+        let probes_at_quarantine = r.entries[0].total_runs;
+        for t in 3..40 {
+            r.run_tier(Tier::Fast, &mut c, t);
         }
-        // probe() still returns Full for this fixture, so it stays covered and never
-        // accumulates strikes: an unplug/replug cycle should restore monitoring.
+        assert_eq!(r.entries[0].total_runs, probes_at_quarantine,
+                   "quarantine must actually stop the work, not just relabel it");
+    }
+
+    #[test]
+    fn a_source_that_comes_back_clears_its_strikes() {
+        // The unplug/replug the previous test protects: two vanishings, then the
+        // interface returns, and the collector must be fully covered again with a
+        // clean slate rather than one strike away from quarantine.
+        let mut r = Registry::new();
+        r.add(Box::new(Flaky { mode: "gone", calls: 0 }), &Config::default());
+        let mut c = ctx();
+        r.run_tier(Tier::Fast, &mut c, 0);
+        r.run_tier(Tier::Fast, &mut c, 1);
+        r.entries[0].c = Box::new(Flaky { mode: "ok", calls: 0 });
+        r.run_tier(Tier::Fast, &mut c, 2);
         assert_eq!(r.coverage()[0]["label"], "Full");
+        assert_eq!(r.entries[0].consecutive_failures, 0, "strikes reset on success");
+        for t in 3..10 {
+            r.run_tier(Tier::Fast, &mut c, t);
+        }
+        assert_eq!(r.coverage()[0]["label"], "Full", "and it stays covered");
     }
 
     #[test]
