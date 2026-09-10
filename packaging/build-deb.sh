@@ -30,6 +30,7 @@ install -m 0755 "$TARGET/release/jamsys-kbd"     "$STAGE/usr/libexec/jamsys-kbd"
 # UI
 install -m 0644 "$ROOT"/jamsys-ui/jamsys_ui/*.py "$STAGE/usr/lib/python3/dist-packages/jamsys_ui/"
 install -m 0755 "$ROOT/jamsys-ui/bin/jamsys"     "$STAGE/usr/bin/jamsys"
+install -m 0755 "$ROOT/jamsys-ui/bin/jamsys-cluster" "$STAGE/usr/bin/jamsys-cluster"
 # The launcher's dev-tree sys.path insert is harmless but pointless once installed.
 sed -i 's|^sys.path.insert.*$|# installed under dist-packages; no path juggling needed|' \
     "$STAGE/usr/bin/jamsys"
@@ -39,6 +40,7 @@ install -m 0644 "$ROOT/packaging/systemd/jamsys-helper.service"    "$STAGE/usr/l
 install -m 0644 "$ROOT/packaging/systemd/jamsys-helper.timer"      "$STAGE/usr/lib/systemd/system/"
 install -m 0644 "$ROOT/packaging/systemd/tmpfiles-jamsys.conf"     "$STAGE/usr/lib/tmpfiles.d/jamsys.conf"
 install -m 0644 "$ROOT/packaging/desktop/org.jamsys.Monitor.desktop" "$STAGE/usr/share/applications/"
+install -m 0644 "$ROOT/packaging/desktop/org.jamsys.Cluster.desktop" "$STAGE/usr/share/applications/"
 install -m 0644 "$ROOT/packaging/polkit/org.jamsys.keyboard.policy" "$STAGE/usr/share/polkit-1/actions/"
 # The udev rule is shipped as an example rather than installed: it is the alternative
 # to the helper, and installing both would be contradictory.
@@ -67,7 +69,7 @@ Architecture: ${ARCH}
 Maintainer: JamSys <jamsys@localhost>
 Installed-Size: ${SIZE}
 Depends: libc6, python3 (>= 3.10), python3-gi, gir1.2-gtk-4.0, gir1.2-adw-1, systemd, policykit-1 | polkitd
-Recommends: libnotify-bin, gnome-shell (>= 48)
+Recommends: libnotify-bin, gnome-shell (>= 48), gjs
 Suggests: nvidia-utils-535 | libnvidia-ml1
 Description: Lightweight local system-health monitor
  JamSys answers one question: is this machine behaving normally right now, and
@@ -111,8 +113,11 @@ if [ "$1" = "configure" ]; then
     echo ""
     echo "  Then open 'JamSys' from your applications, or run: jamsys"
     echo ""
-    echo "  Enable the GNOME Shell corner readout (needs a session restart on"
-    echo "  Wayland - log out and back in, then):"
+    echo "  See the instrument cluster right now, in its own window:"
+    echo "      jamsys-cluster"
+    echo ""
+    echo "  Or put it in the GNOME Shell itself. A newly installed extension needs"
+    echo "  a session restart on Wayland - log out and back in, then:"
     echo "      gnome-extensions enable jamsys@jamsys.org"
     echo ""
     echo "  Optional, adds CPU package power and NVMe SMART (runs briefly as root"

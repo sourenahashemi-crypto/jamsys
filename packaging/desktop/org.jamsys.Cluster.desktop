@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=JamSys Cluster
+GenericName=System Instrument Cluster
+Comment=A floating instrument cluster showing system health at a glance
+Exec=jamsys-cluster
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;GTK;
+Keywords=monitor;gauge;cluster;widget;cpu;gpu;battery;temperature;
+StartupNotify=true
+StartupWMClass=org.jamsys.Cluster

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Launch the JamSys instrument cluster in its own window.
+#
+# This is the same Cairo drawing the GNOME Shell extension uses, in a plain GTK4
+# window. Useful when the Shell has not been restarted since the extension was
+# installed (a new extension needs a logout under Wayland), and on desktops other
+# than GNOME where the extension cannot run at all.
+set -euo pipefail
+
+for d in "$HOME/.local/share/gnome-shell/extensions/jamsys@jamsys.org" \
+         "/usr/share/gnome-shell/extensions/jamsys@jamsys.org" \
+         "$(dirname "$(readlink -f "$0")")/../../gnome-extension/jamsys@jamsys.org"; do
+    if [ -f "$d/standalone.js" ]; then
+        exec gjs -m "$d/standalone.js" "$@"
+    fi
+done
+
+echo "jamsys-cluster: could not find standalone.js; is JamSys installed?" >&2
+exit 1

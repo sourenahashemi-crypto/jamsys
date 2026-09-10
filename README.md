@@ -45,6 +45,18 @@ When something is wrong it says so, in the header and on the instruments:
 It does not poll. The daemon pushes an update only when a displayed value has changed
 enough for a human to notice, so nothing repaints for sensor noise and nothing animates.
 
+Two ways to run it:
+
+```bash
+jamsys-cluster                       # its own window — works immediately, any desktop
+gnome-extensions enable jamsys@jamsys.org   # in the Shell — needs a logout first
+```
+
+The Shell extension is the better one: it can pin itself to a corner and stay above
+other windows, which Wayland does not allow an ordinary window to do. But GNOME will
+not load a newly installed extension until the session restarts, so the window is what
+you get today.
+
 Prefer a line of text in the top panel instead? That is still there:
 
 ```
@@ -275,6 +287,7 @@ Every collector can be disabled individually, from the file or from the Coverage
 ## Command line
 
 ```bash
+jamsys-cluster            # the instrument cluster in its own window
 jamsysd --discover        # hardware and coverage report
 jamsysd --check           # validate the config
 jamsys  --json snapshot   # current state as JSON

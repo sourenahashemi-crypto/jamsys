@@ -16,11 +16,14 @@ install -m 0644 "$ROOT"/jamsys-ui/jamsys_ui/*.py "$PREFIX/lib/jamsys_ui/"
 sed "s|^sys.path.insert.*|sys.path.insert(0, '$PREFIX/lib')|" \
     "$ROOT/jamsys-ui/bin/jamsys" > "$PREFIX/bin/jamsys"
 chmod 0755 "$PREFIX/bin/jamsys"
+install -m 0755 "$ROOT/jamsys-ui/bin/jamsys-cluster" "$PREFIX/bin/jamsys-cluster"
 
 sed "s|/usr/bin/jamsysd|$PREFIX/bin/jamsysd|" \
     "$ROOT/packaging/systemd/jamsysd.service" > "$HOME/.config/systemd/user/jamsysd.service"
 sed "s|^Exec=jamsys$|Exec=$PREFIX/bin/jamsys|" \
     "$ROOT/packaging/desktop/org.jamsys.Monitor.desktop" > "$PREFIX/share/applications/org.jamsys.Monitor.desktop"
+sed "s|^Exec=jamsys-cluster$|Exec=$PREFIX/bin/jamsys-cluster|" \
+    "$ROOT/packaging/desktop/org.jamsys.Cluster.desktop" > "$PREFIX/share/applications/org.jamsys.Cluster.desktop"
 
 # GNOME Shell extension. Installed to the per-user directory; GNOME will not load a
 # *newly added* extension until the session restarts, which on Wayland means logging
@@ -29,6 +32,8 @@ EXT_SRC="$ROOT/gnome-extension/jamsys@jamsys.org"
 EXT_DST="$HOME/.local/share/gnome-shell/extensions/jamsys@jamsys.org"
 if [ -d "$EXT_SRC" ]; then
     mkdir -p "$EXT_DST/schemas"
+    # *.js covers extension.js, prefs.js, format.js, gauges.js and standalone.js —
+    # the standalone window lives beside the extension because it shares gauges.js.
     install -m 0644 "$EXT_SRC"/*.js "$EXT_SRC/metadata.json" "$EXT_SRC/stylesheet.css" "$EXT_DST/"
     install -m 0644 "$EXT_SRC"/schemas/*.gschema.xml "$EXT_DST/schemas/"
     glib-compile-schemas "$EXT_DST/schemas" 2>/dev/null || true
@@ -55,6 +60,7 @@ if [ -n "$JD_PID" ] && [ "$JD_PID" != "0" ]; then
 fi
 
 echo "Open the interface with:  $PREFIX/bin/jamsys"
+echo "Show the cluster now with: $PREFIX/bin/jamsys-cluster"
 if [ -d "$EXT_DST" ]; then
     echo
     echo "The corner readout needs a session restart before GNOME will see it."
