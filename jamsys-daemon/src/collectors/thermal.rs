@@ -129,6 +129,9 @@ impl Collector for ThermalCollector {
 
         // Every channel disappearing at once means a driver unloaded, not a bad reading.
         if gone > 0 && st.temps.is_empty() && st.fans.is_empty() {
+            // Ctx retains the previous tick. Clear it even when the registry will
+            // stop sampling this collector, or old temperatures keep driving alerts.
+            ctx.snap.thermal = st;
             return Err(CollectorError::Gone("all hwmon channels vanished".into()));
         }
 
@@ -183,5 +186,26 @@ mod tests {
         // Simulates a VM: probe against an empty hwmon root.
         let chans = discover_hwmon_in("/nonexistent", &[HwmonKind::Temp]);
         assert!(chans.is_empty());
+    }
+
+    #[test]
+    fn losing_all_channels_clears_the_previous_snapshot() {
+        let mut c = ThermalCollector {
+            temps: vec![HwmonChannel {
+                driver: "coretemp".into(), label: "Package id 0".into(),
+                kind: HwmonKind::Temp, input: "/nonexistent/jamsys-temp".into(),
+                crit: None, max: None,
+            }],
+            fans: Vec::new(),
+        };
+        let mut x = Ctx::new(Arc::new(Config::default()));
+        x.snap.thermal.cpu_package_c = Some(99.0);
+        x.snap.thermal.max_temp_c = Some(99.0);
+        x.snap.thermal.temps.push(Reading { value: 99.0, ..Default::default() });
+        assert!(matches!(c.collect(&mut x), Err(CollectorError::Gone(_))));
+        assert_eq!(x.snap.thermal.cpu_package_c, None, "a vanished sensor must not stay hot forever");
+        assert_eq!(x.snap.thermal.max_temp_c, None);
+        assert!(x.snap.thermal.temps.is_empty());
+        assert!(x.samples.is_empty());
     }
 }

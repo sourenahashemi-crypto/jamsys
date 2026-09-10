@@ -214,6 +214,63 @@ fn a_sensor_that_vanishes_mid_run_is_not_a_crash() {
     assert_eq!(chans[0].read(), None, "a vanished sensor reads as absent");
 }
 
+#[test]
+fn a_disappeared_collector_is_retried_without_restarting_monitoring() {
+    use jamsys::collectors::Registry;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct Removable {
+        present: Arc<AtomicBool>,
+        probes: Arc<AtomicUsize>,
+    }
+    impl Collector for Removable {
+        fn name(&self) -> &'static str { "removable" }
+        fn tier(&self) -> Tier { Tier::Medium }
+        fn probe(&mut self) -> Support {
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            if self.present.load(Ordering::SeqCst) {
+                Support::Full
+            } else {
+                Support::Unsupported { reason: "driver unloaded".into() }
+            }
+        }
+        fn collect(&mut self, ctx: &mut Ctx) -> CResult<()> {
+            if !self.present.load(Ordering::SeqCst) {
+                return Err(CollectorError::Gone("driver unloaded".into()));
+            }
+            ctx.g("thermal", "cpu_package_c", "C", 55.0);
+            Ok(())
+        }
+    }
+
+    let present = Arc::new(AtomicBool::new(true));
+    let probes = Arc::new(AtomicUsize::new(0));
+    let cfg = Config::default();
+    let mut registry = Registry::new();
+    registry.add(Box::new(Removable { present: present.clone(), probes: probes.clone() }), &cfg);
+    let mut x = ctx();
+    registry.run_tier(Tier::Medium, &mut x, 0);
+    assert_eq!(x.samples.len(), 1);
+
+    present.store(false, Ordering::SeqCst);
+    registry.run_tier(Tier::Medium, &mut x, 10_000);
+    assert_eq!(registry.coverage()[0]["label"], "Unavailable");
+    let after_loss = probes.load(Ordering::SeqCst);
+    for t in [20_000, 30_000, 900_000] {
+        registry.run_tier(Tier::Medium, &mut x, t);
+    }
+    assert_eq!(probes.load(Ordering::SeqCst), after_loss, "do not hot-loop on absent hardware");
+    registry.run_tier(Tier::Medium, &mut x, 910_000);
+    assert_eq!(probes.load(Ordering::SeqCst), after_loss + 1, "retry after fifteen minutes");
+    present.store(true, Ordering::SeqCst);
+    registry.run_tier(Tier::Medium, &mut x, 1_810_000);
+    assert_eq!(registry.coverage()[0]["label"], "Full");
+    assert_eq!(x.samples.len(), 2, "collection resumes after driver returns");
+    registry.set_enabled("removable", false);
+    registry.run_tier(Tier::Medium, &mut x, 2_710_000);
+    assert_eq!(x.samples.len(), 2, "explicitly disabled collectors stay disabled");
+}
+
 // ---------------------------------------------------------------------------
 // Suspend and resume
 // ---------------------------------------------------------------------------
