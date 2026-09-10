@@ -20,21 +20,48 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
-TARGET="${CARGO_TARGET_DIR:-$ROOT/target}"
 
-missing=0
-for b in jamsys-kbd jamsys-power; do
-    if [ ! -x "$TARGET/release/$b" ]; then
-        echo "missing $TARGET/release/$b -- build it first:" >&2
-        echo "    (cd $ROOT/$b && cargo build --release)" >&2
-        missing=1
-    fi
-done
-[ "$missing" -eq 0 ] || exit 2
+# Find the built binaries. sudo scrubs CARGO_TARGET_DIR from the environment, so
+# relying on it here silently sends the search to a directory that does not exist --
+# and on a machine using the staged toolchain, the artefacts are under the *invoking
+# user's* cache, not root's. Look everywhere they legitimately land.
+invoker_home=""
+if [ -n "${SUDO_USER:-}" ]; then
+    invoker_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+fi
+
+find_binary() {
+    local name="$1" c
+    for c in \
+        ${CARGO_TARGET_DIR:+"$CARGO_TARGET_DIR/release/$name"} \
+        "$ROOT/target/release/$name" \
+        ${invoker_home:+"$invoker_home/.cache/jamsys-target/release/$name"} \
+        "$HOME/.cache/jamsys-target/release/$name"
+    do
+        [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+    done
+    return 1
+}
+
+KBD="$(find_binary jamsys-kbd)" || {
+    echo "cannot find a built jamsys-kbd. Build both helpers first, as your normal user:" >&2
+    echo "    cd $ROOT && source scripts/devenv.sh" >&2
+    echo "    (cd jamsys-kbd && cargo build --release)" >&2
+    echo "    (cd jamsys-power && cargo build --release)" >&2
+    exit 2
+}
+PWR="$(find_binary jamsys-power)" || {
+    echo "cannot find a built jamsys-power. Build it first, as your normal user:" >&2
+    echo "    cd $ROOT && source scripts/devenv.sh && (cd jamsys-power && cargo build --release)" >&2
+    exit 2
+}
+echo "using:"
+echo "  $KBD"
+echo "  $PWR"
 
 install -d -m 0755 /usr/libexec
-install -o root -g root -m 0755 "$TARGET/release/jamsys-kbd"   /usr/libexec/jamsys-kbd
-install -o root -g root -m 0755 "$TARGET/release/jamsys-power" /usr/libexec/jamsys-power
+install -o root -g root -m 0755 "$KBD" /usr/libexec/jamsys-kbd
+install -o root -g root -m 0755 "$PWR" /usr/libexec/jamsys-power
 install -o root -g root -m 0644 "$ROOT/packaging/polkit/org.jamsys.keyboard.policy" \
     /usr/share/polkit-1/actions/org.jamsys.keyboard.policy
 install -o root -g root -m 0644 "$ROOT/packaging/polkit/org.jamsys.power.policy" \

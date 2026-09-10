@@ -482,6 +482,29 @@ impl RuleEngine {
     fn service_rules(&mut self, s: &Snapshot, cfg: &Config, _now: i64, out: &mut Vec<Alert>) {
         let _ = cfg;
         for u in s.services.failed.iter().chain(s.services.failed_user.iter()) {
+            // A unit whose file no longer exists is not a broken service: it is
+            // bookkeeping left behind when the package was removed. systemd keeps
+            // the failed result until someone resets it, so this never clears on
+            // its own and reporting it as a failure is actively misleading -- the
+            // user removes the thing and the warning stays.
+            if u.load_state == "not-found" {
+                let user = s.services.failed_user.iter().any(|x| x.name == u.name);
+                let scope = if user { "--user " } else { "" };
+                self.fire(out, Alert::new("service.orphaned", &u.name, Severity::Notice,
+                    format!("{} is gone but still listed as failed", u.name),
+                    Explanation::new(format!(
+                        "The unit {} no longer exists — its unit file has been \
+                         removed — but systemd is still holding its last failed \
+                         result.", u.name))
+                        .expected("removed units to disappear from the failed list")
+                        .evidence("Load state", u.load_state.clone())
+                        .evidence("Last result", u.sub_state.clone())
+                        .cause("the package that provided it was uninstalled while \
+                                the unit was in a failed state")
+                        .action(format!("sudo systemctl {scope}reset-failed {}", u.name))
+                        .action("Nothing is broken; this only clears the leftover record")));
+                continue;
+            }
             self.fire(out, Alert::new("service.failed", &u.name, Severity::Warning,
                 format!("{} has failed", u.name),
                 Explanation::new(format!("The systemd unit {} is in a failed state.", u.name))
@@ -967,6 +990,58 @@ mod tests {
         let alerts = e.evaluate(&s, &cfg(), now).alerts;
         let a = alerts.iter().find(|a| a.rule_id == "bluetooth.disconnected").unwrap();
         assert!(a.explanation.actions.iter().any(|x| x.contains("autosuspend")));
+    }
+
+    // ---- failed units -------------------------------------------------
+
+    fn unit(name: &str, load: &str, sub: &str) -> crate::dbus::Unit {
+        crate::dbus::Unit {
+            name: name.into(),
+            description: "a unit".into(),
+            load_state: load.into(),
+            active_state: "failed".into(),
+            sub_state: sub.into(),
+        }
+    }
+
+    #[test]
+    fn a_genuinely_failed_unit_is_a_warning() {
+        let mut e = RuleEngine::new(&cfg());
+        let mut s = snap();
+        s.services.failed = vec![unit("nginx.service", "loaded", "failed")];
+        let a = e.evaluate(&s, &cfg(), 1000).alerts.into_iter()
+            .find(|a| a.rule_id == "service.failed").expect("a loaded unit that failed");
+        assert_eq!(a.severity, Severity::Warning);
+    }
+
+    #[test]
+    fn a_removed_unit_is_reported_as_leftover_bookkeeping_not_a_failure() {
+        // The user uninstalls the package, the warning stays forever, and nothing
+        // they do to the (now absent) service makes any difference.
+        let mut e = RuleEngine::new(&cfg());
+        let mut s = snap();
+        s.services.failed = vec![unit("snap.openshell.gateway.service", "not-found", "failed")];
+        let alerts = e.evaluate(&s, &cfg(), 1000).alerts;
+        assert!(!alerts.iter().any(|a| a.rule_id == "service.failed"),
+            "a unit that no longer exists has not failed");
+        let a = alerts.iter().find(|a| a.rule_id == "service.orphaned")
+            .expect("it should still be reported, but as what it actually is");
+        assert_eq!(a.severity, Severity::Notice, "nothing is broken, so not a warning");
+        assert!(a.title.contains("gone but still listed"));
+        assert!(a.explanation.actions.iter().any(|x| x.contains("reset-failed")),
+            "the fix is one command and it must be given");
+        assert!(a.explanation.actions.iter().any(|x| x.contains("Nothing is broken")));
+    }
+
+    #[test]
+    fn a_removed_user_unit_gets_the_user_flag_in_its_fix() {
+        let mut e = RuleEngine::new(&cfg());
+        let mut s = snap();
+        s.services.failed_user = vec![unit("foo.service", "not-found", "failed")];
+        let a = e.evaluate(&s, &cfg(), 1000).alerts.into_iter()
+            .find(|a| a.rule_id == "service.orphaned").unwrap();
+        assert!(a.explanation.actions.iter().any(|x| x.contains("systemctl --user reset-failed")),
+            "a user unit needs --user or the command silently does nothing");
     }
 
     #[test]

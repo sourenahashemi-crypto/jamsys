@@ -146,13 +146,37 @@ something is wrong.
 
 `--housing` brings the old panel back, and the right-click menu has the same toggle.
 
-**Clicks fall through the gaps.** With no panel there is no rectangle to click, so the
-window's input region is cut down to the dials and the capsule
-(`bareHitRegions()` -> `Gdk.Surface.set_input_region()`). Verified with
-`XShapeGetRectangles(..., ShapeInput, ...)`, which reports six rectangles rather than
-one; `xwininfo -shape` will not show this, as it reports the bounding shape only.
-Without it an invisible box would swallow clicks meant for the window underneath,
-which is the usual complaint about desktop widgets.
+**Click-through is available but off by default.** With no panel there is no
+rectangle to click, so in principle the gaps should belong to whatever is behind the
+gadget, and `bareHitRegions()` -> `Gdk.Surface.set_input_region()` does exactly that.
+
+It is off by default because on this compositor it costs far more than it buys.
+Measured on GNOME Shell 50.1 / Mutter with an XWayland surface: once the input region
+is shaped, `_NET_ACTIVE_WINDOW` is ignored so the window can never be focused again,
+and pointer clicks stop arriving even at coordinates inside the region Mutter itself
+reports through `XShapeGetRectangles(..., ShapeInput, ...)`. The result was a gadget
+that could not be focused, clicked, or closed. A gadget you cannot close is a worse
+bug than a gadget that occupies a rectangle, so this is now a menu item that says
+what it costs, and turning it on shows a dialog naming `jamsys-cluster --quit` as the
+way back.
+
+#### Closing it
+
+Three ways, in order of how likely they are to work when something else has gone
+wrong:
+
+1. **The close button**, top right. It is a real `Gtk.Button` in a `Gtk.Overlay`
+   above the drawing area -- *not* a shape painted into the canvas and hit-tested by
+   hand. That was tried first and does not work: the whole face is a
+   `Gtk.WindowHandle` so it can be dragged from anywhere, and a press inside a window
+   handle is a candidate window drag, so the handle claims the gesture and the child
+   never sees a click. A widget in an overlay sits outside the handle's subtree and
+   gets the press directly.
+2. **Escape or Ctrl+Q**, when the gadget has keyboard focus.
+3. **`jamsys-cluster --quit`**, which needs neither focus nor a working pointer. The
+   window writes its pid to `$XDG_RUNTIME_DIR/jamsys-cluster.pid` and `--quit` checks
+   `/proc/<pid>/cmdline` still refers to the cluster before signalling, so a recycled
+   pid is never hit.
 
 #### Size
 
