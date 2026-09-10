@@ -46,6 +46,7 @@ install -m 0644 "$ROOT/packaging/udev/99-jamsys-keyboard.rules" "$STAGE/usr/shar
 
 # GNOME Shell extension
 EXTDIR="$STAGE/usr/share/gnome-shell/extensions/jamsys@jamsys.org"
+# extension.js, prefs.js, format.js, gauges.js
 install -m 0644 "$ROOT"/gnome-extension/jamsys@jamsys.org/*.js       "$EXTDIR/"
 install -m 0644 "$ROOT/gnome-extension/jamsys@jamsys.org/metadata.json"   "$EXTDIR/"
 install -m 0644 "$ROOT/gnome-extension/jamsys@jamsys.org/stylesheet.css"  "$EXTDIR/"

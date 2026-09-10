@@ -4,7 +4,7 @@ Three surfaces, in descending order of how often you look at them.
 
 | Surface | Technology | Purpose | Runs where |
 |---|---|---|---|
-| **Corner readout** | GNOME Shell extension (GJS) | The glance. Nearly invisible while healthy. | inside `gnome-shell` |
+| **Corner cluster** | GNOME Shell extension, Cairo (GJS) | The glance. An instrument binnacle in a screen corner. | inside `gnome-shell` |
 | **Full window** | GTK4 + libadwaita (PyGObject) | The investigation. Opened when something needs looking at. | its own process |
 | **CLI** | `jamsys --json <op>` | Scripting and support. | its own process |
 
@@ -14,79 +14,106 @@ and what would let any of them be replaced without touching the backend.
 
 ---
 
-## 1. The corner readout
+## 1. The corner cluster
 
-The most important surface, because it is the one that is on screen all the time.
-
-### Calm by construction
-
-* **It does not poll.** It subscribes to `StateChanged` on the session bus and repaints
-  when told to. There is no timer in the extension at all.
-* **The daemon decides what "changed" means.** Percentages are quantised to whole
-  numbers, temperature to whole degrees, power to 0.1 W. A reading that would not alter
-  a single rendered character produces no signal, so the panel does not repaint several
-  times a second for noise. Measured on a live machine: 22 repaints over several minutes.
-* **No animation, no graphs, no colour cycling.** A panel element that moves is a panel
-  element you learn to tune out.
-* While healthy the text is drawn at 55 % opacity so it reads as part of the panel.
-
-### Two layouts
-
-Compact — one line, the default:
+A desktop instrument binnacle that lives in a screen corner. It is the surface you
+actually look at, so it gets the most design attention and the least CPU.
 
 ```
-CPU 7% · 52° | RAM 18% | GPU — | 11.2W | NET ✓
+          ╭──────────────────────────────────────────────────────╮
+          │                   J A M S Y S                        │
+          │    ╭────╮        ╭──────────╮        ╭────╮          │
+          │    │RAM │        │   CPU    │        │GPU │          │
+          │    │ 18%│        │  7%  52° │        │ —  │          │
+          │    ╰────╯        ╰──────────╯        ╰────╯          │
+          │  PWR ▮▮▮▯▯▯▯▯  11.2W  BAT ▮▮▮▮▮▯ 87%  NET SVC SYS    │
+          ╰──────────────────────────────────────────────────────╯
 ```
 
-Minimal — stacked, for people who want to read it vertically:
+### The look
 
-```
-CPU 7% · 52°
-RAM 18%
-GPU —
-11.2W
-NET ✓
-```
+Automotive, deliberately: a swept 270° tachometer for CPU load with a green-amber-red
+band and a redline, flanked by smaller auxiliary dials for memory and GPU. Machined
+bezels, a domed dial face, precise tick cadence, and a tapered needle with a
+counterweight tail and a lit bloom underneath it.
 
-`GPU —` rather than `GPU 0%` when the discrete GPU is suspended: zero would imply it was
-measured, when in fact the card is powered down and was deliberately not queried.
+Two details that make it read as an instrument rather than a chart:
 
-### When something is wrong
+* **The value sits in a recessed digital window drawn over the needle.** Without it the
+  needle sweeps across the number at exactly the loads you most want to read. Modern
+  clusters solve this the same way, with an inset LCD.
+* **Captions live in the 90° sector at the bottom that carries no ticks**, and numerals
+  ride just inside the tick ring. Nothing is typeset where the needle or another label
+  will land on it.
 
-The readings are **replaced**, not appended to. The spec's requirement is to show only
-the important abnormal metric, so that is literally what happens:
+Auxiliary dials carry **no numerals**. A 46-pixel gauge with numbers on it is
+unreadable, and real clusters leave them off too — the coloured band does that work.
 
-```
-⚠ POWER 29.8W
-```
+### Calm, even so
 
-Clicking it opens a menu carrying the full explanation — measurement, expected range,
-and an **Open JamSys** item that launches the window straight to the relevant page
-via `jamsys --page Power`.
+An instrument cluster is inherently more visually present than a line of text, so the
+restraint has to come from behaviour rather than from hiding:
+
+* **It does not poll.** It subscribes to `StateChanged` and repaints when told to.
+  There is no timer in the extension at all.
+* **The daemon decides what "changed" means** — percentages to whole numbers,
+  temperature to whole degrees, power to 0.1 W. A reading that would not alter a single
+  drawn pixel produces no signal.
+* **Nothing animates.** No sweeping needles on startup, no pulsing, no glow cycles.
+* **Telltales are dark until they have something to say.** That is the entire point of
+  a warning lamp, and they are the only elements that ever light up.
+* Housing opacity is adjustable down to 0.35, so it can sink into the wallpaper.
+
+### What each instrument says
+
+| | |
+|---|---|
+| Centre dial | CPU load, redlined at 90 %. Needle turns red on a critical alert. |
+| Below it | CPU package temperature, coloured: cyan under 75 °C, amber to 90 °C, red above |
+| Left dial | Memory in use |
+| Right dial | GPU utilisation — or a dash on a dimmed dial when the discrete GPU is asleep, because zero would imply it was measured |
+| PWR bar | System draw, 0–60 W full scale, segmented rather than smooth. Cyan and labelled CHG while charging. |
+| BAT | Charge, red below 15 %. Absent entirely on a machine with no battery, which says "no battery sensor" rather than drawing 0 W. |
+| NET / SVC / SYS | Telltales |
+| Header | The product name, or the single most important alert in full |
 
 ### Placement, and an honest limitation
 
-GNOME Shell has **no bottom panel**. Top-left, top-centre and top-right insert into
-`Main.panel`'s boxes and are completely robust.
+The cluster is always a `Main.layoutManager` chrome actor — the same mechanism OSD
+popups use, not a fake always-on-top window, which cannot work under Wayland at all.
+All four corners plus top-centre are available, with an adjustable edge margin.
 
-Bottom-left and bottom-right are implemented with `Main.layoutManager.addChrome()` — the
-same mechanism OSD popups use, not a fake always-on-top window, which cannot work under
-Wayland at all. They work, but they are genuinely less robust than the panel: the readout
-floats above the desktop, can overlap a dock, and is hidden by fullscreen windows. The
-preferences dialog says so in the placement description rather than letting you discover
-it. If you want it truly out of the way, use a top position.
+It floats above the desktop. It can overlap a dock, and it is hidden by fullscreen
+windows. That is inherent to being a desktop gadget on GNOME, and it is stated in the
+preferences dialog rather than left to be discovered.
 
-### What the extension deliberately does not do
+### How it was designed without being able to see it
 
-No sampling, no thresholds, no history, no D-Bus calls on a timer, no file reads, no
-subprocess except launching the window on an explicit click. It is about 300 lines, and
-the only part with real logic — turning a state object into a label — lives in
-`format.js` so it can be unit-tested outside `gnome-shell`, where none of the Shell
-imports resolve. 23 tests cover it.
+GNOME Shell will not load a newly installed extension on Wayland without a session
+restart, so the cluster could not simply be looked at. The drawing therefore lives in
+`gauges.js` with **no Shell imports at all**: inside the Shell the Cairo context comes
+from an `St.DrawingArea` repaint, and `tests/render-cluster.js` feeds the identical code
+an `ImageSurface` and writes a PNG. Every state — idle, load, warning, critical, on AC,
+no battery, and live against the running daemon — was rendered and reviewed that way.
 
----
+Three defects were found and fixed by looking at those renders: captions colliding with
+numerals, the needle crossing the value, and the `100` numeral being clipped by the
+digital inset. None would have been caught by a test.
 
-## 2. The full window
+## 2. The panel line
+
+The two line styles put a text readout in the top panel instead of a floating cluster,
+for people who would rather have nothing on the desktop:
+
+```
+CPU 7% · 52° | RAM 18% | GPU — | 11.2W | NET ✓        ← compact
+⚠ POWER 29.8W                                          ← abnormal replaces it
+```
+
+Same rules: pushed, not polled; the abnormal state replaces the readings rather than
+being appended to them.
+
+## 3. The full window
 
 GTK4 + libadwaita, following the GNOME HIG. One `AdwApplicationWindow` with an
 `AdwNavigationSplitView`: a sidebar of subsystems, and a content pane.

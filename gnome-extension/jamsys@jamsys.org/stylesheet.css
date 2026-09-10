@@ -32,3 +32,13 @@
 .jamsys-menu-title { font-weight: bold; padding-bottom: 4px; }
 .jamsys-menu-detail { font-family: monospace; font-size: 0.85em; }
 .jamsys-menu-expected { color: rgba(255, 255, 255, 0.6); font-size: 0.85em; }
+
+/* The instrument cluster paints its own housing in Cairo, so the container itself
+   must add nothing: no background, no border, no shadow that would double up on the
+   panel already drawn inside it. */
+.jamsys-cluster {
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+}

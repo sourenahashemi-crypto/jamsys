@@ -82,7 +82,9 @@ Wired, running, and observed producing correct values on this machine.
 | D-Bus service `org.jamsys.Daemon` | introspection, methods and signals verified with `gdbus` and GJS |
 | Push-on-material-change | 22 signals over several minutes; sub-quantum noise emits nothing |
 | GTK4 window, 16 pages | rendered against live data |
-| Corner-readout rendering | 23 tests; exact single-line format from the specification |
+| Corner cluster rendering | Cairo instrument cluster; every state rendered to PNG and reviewed, including live against the daemon |
+| Cluster value mapping | 22 tests: needle clamping, NaN parking, charge vs drain, unknown power |
+| Panel-line rendering | 23 tests; exact single-line format from the specification |
 | `jamsys --json <op>` CLI | reference client |
 | `jamsysd --discover` | hardware and coverage report |
 | .deb packaging | 37 files, valid control, maintainer scripts syntax-checked |
@@ -91,8 +93,8 @@ Wired, running, and observed producing correct values on this machine.
 
 | Capability | What works | What does not, and why |
 |---|---|---|
-| **GNOME Shell readout** | Everything: rendering (23 tests), D-Bus proxy, live `StateChanged`, JSON parse, label generation, placement code, preferences — all verified against the running daemon by a GJS harness using the identical interface and code path. | **It has never been displayed in a panel.** GNOME Shell on Wayland will not load a *newly installed* extension without a session restart, and this session cannot be restarted. Everything except the final `Main.panel.addToStatusArea` call is exercised. |
-| **Bottom placement** | Implemented with `Main.layoutManager.addChrome()`, the same mechanism as OSD popups. | Genuinely less robust than the panel: floats above the desktop, can overlap a dock, hidden by fullscreen. Documented in the preferences dialog rather than hidden. |
+| **GNOME Shell cluster** | Everything short of being on screen: the full Cairo drawing (rendered to PNG in seven states and reviewed, including live against the running daemon), value mapping (22 tests), D-Bus proxy, live `StateChanged`, JSON parse, placement arithmetic, preferences (loads cleanly under stubs), and the module itself loading with every expected method present. | **It has never been displayed on the desktop.** GNOME Shell on Wayland will not load a *newly installed* extension without a session restart, and this session cannot be restarted. Everything except `addChrome()` actually putting the actor on screen is exercised. |
+| **Floating placement** | `Main.layoutManager.addChrome()`, the same mechanism as OSD popups — not a fake always-on-top window, which cannot work under Wayland. | Inherently a desktop gadget: floats above the wallpaper, can overlap a dock, hidden by fullscreen windows. Stated in the preferences dialog rather than left to be discovered. |
 | **Keyboard RGB control** | Capability detection, field-order readback, the full UI, argument validation (10 tests including injection attempts), correct exit codes, refusal when unprivileged. | **No colour has been written to hardware.** Every path is `root:root` and this environment has no usable `sudo`. See §3. |
 | **Bluetooth** | Adapter, address, rfkill, **count** of connections. | No device *names* or battery levels — needs BlueZ `ObjectManager` enumeration, which the minimal D-Bus client does not implement. |
 | **Audio** | Service state, sound cards, restart detection via PID change. | No default sink/source names, no per-stream detail. `libpipewire-0.3` headers are not installed, so the native API cannot be linked; the alternative is spawning `pw-dump` on a timer, which the specification rules out. |
@@ -139,9 +141,10 @@ never executed.
 
 ## 5. Known limitations
 
-1. **The Shell readout has not been seen on screen.** Every layer beneath the final
-   panel insertion is verified, but that is not the same as having looked at it. It is
-   the first thing to check after a logout.
+1. **The Shell cluster has not been seen on the desktop.** The drawing itself *has*
+   been looked at — every state was rendered to PNG through the same code path, which
+   is how three layout defects were found and fixed — but a PNG is not a live actor in
+   a compositor. It is the first thing to check after a logout.
 2. **Keyboard writes are unproven.** The most likely failure is a firmware that accepts
    mode 0 but not 1–3; try static first.
 3. **The window is heavy.** 110 MB PSS, dominated by the Python interpreter, PyGObject
@@ -195,13 +198,14 @@ matters: the dGPU draws 6.8 W awake, and the gate keeps JamSys from causing that
 
 ## 8. Tests
 
-**285 assertions, all passing.**
+**307 assertions, all passing.**
 
 ```
 jamsys-daemon   231 unit + 16 integration
 jamsys-helper     5 unit
 jamsys-kbd       10 unit   (every injection attempt is a named test)
-extension          23 rendering  +  live end-to-end against the running daemon
+extension          23 panel-line + 22 gauge  +  live end-to-end against the daemon
+cluster            7 states rendered to PNG and visually reviewed
 fault injection     5 safe scenarios executed on real hardware
 ```
 

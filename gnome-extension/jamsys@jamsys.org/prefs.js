@@ -1,4 +1,4 @@
-/* Preferences for the JamSys corner readout. Presentation only — nothing here
+/* Preferences for the JamSys desktop cluster. Presentation only — nothing here
  * affects what is monitored, which is entirely the daemon's business. */
 
 import Adw from 'gi://Adw';
@@ -7,47 +7,83 @@ import Gtk from 'gi://Gtk';
 
 import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
+const POSITIONS = ['top-left', 'top-center', 'top-right', 'bottom-left', 'bottom-right'];
+const POSITION_LABELS = ['Top left', 'Top centre', 'Top right', 'Bottom left', 'Bottom right'];
+const MODES = ['cluster', 'compact', 'minimal'];
+const MODE_LABELS = ['Instrument cluster', 'Compact line (panel)', 'Stacked lines (panel)'];
+
 export default class JamSysPrefs extends ExtensionPreferences {
     fillPreferencesWindow(window) {
         const settings = this.getSettings();
-        const page = new Adw.PreferencesPage({title: 'Readout'});
+        const page = new Adw.PreferencesPage({title: 'Display', icon_name: 'video-display-symbolic'});
         window.add(page);
 
-        const placement = new Adw.PreferencesGroup({
-            title: 'Placement',
-            description: 'Bottom positions float above the desktop rather than living in '
-                       + 'the panel, because GNOME Shell has no bottom panel. They can '
-                       + 'overlap a dock and are hidden by fullscreen windows.',
+        // -- presentation ------------------------------------------------
+        const look = new Adw.PreferencesGroup({
+            title: 'Presentation',
+            description: 'The instrument cluster is a desktop gadget and floats in a '
+                       + 'corner. The two line modes live in the top panel instead.',
         });
-        page.add(placement);
+        page.add(look);
 
-        const positions = ['top-left', 'top-center', 'top-right', 'bottom-left', 'bottom-right'];
-        const labels = ['Top left', 'Top centre', 'Top right',
-                        'Bottom left (floating)', 'Bottom right (floating)'];
-        const posRow = new Adw.ComboRow({
-            title: 'Position',
-            model: Gtk.StringList.new(labels),
-        });
-        posRow.set_selected(Math.max(0, positions.indexOf(settings.get_string('position'))));
-        posRow.connect('notify::selected', r =>
-            settings.set_string('position', positions[r.get_selected()]));
-        placement.add(posRow);
-
-        const modes = ['compact', 'minimal'];
         const modeRow = new Adw.ComboRow({
-            title: 'Layout',
-            subtitle: 'Compact is one line; minimal stacks each reading',
-            model: Gtk.StringList.new(['Compact (single line)', 'Minimal (stacked)']),
+            title: 'Style',
+            model: Gtk.StringList.new(MODE_LABELS),
         });
-        modeRow.set_selected(Math.max(0, modes.indexOf(settings.get_string('mode'))));
+        modeRow.set_selected(Math.max(0, MODES.indexOf(settings.get_string('mode'))));
         modeRow.connect('notify::selected', r =>
-            settings.set_string('mode', modes[r.get_selected()]));
-        placement.add(modeRow);
+            settings.set_string('mode', MODES[r.get_selected()]));
+        look.add(modeRow);
 
+        const posRow = new Adw.ComboRow({
+            title: 'Corner',
+            subtitle: 'Where the cluster sits, or which end of the panel the line uses',
+            model: Gtk.StringList.new(POSITION_LABELS),
+        });
+        posRow.set_selected(Math.max(0, POSITIONS.indexOf(settings.get_string('position'))));
+        posRow.connect('notify::selected', r =>
+            settings.set_string('position', POSITIONS[r.get_selected()]));
+        look.add(posRow);
+
+        // -- cluster --------------------------------------------------------
+        const cluster = new Adw.PreferencesGroup({
+            title: 'Instrument cluster',
+            description: 'GNOME Shell has no bottom panel, so the cluster is drawn as a '
+                       + 'floating desktop element. It stays out of the way of maximised '
+                       + 'windows and is hidden by fullscreen ones.',
+        });
+        page.add(cluster);
+
+        const scale = new Adw.SpinRow({
+            title: 'Size',
+            subtitle: '1.0 is 420 × 192 pixels',
+            adjustment: new Gtk.Adjustment({lower: 0.55, upper: 1.8, step_increment: 0.05}),
+            digits: 2,
+        });
+        settings.bind('scale', scale, 'value', Gio.SettingsBindFlags.DEFAULT);
+        cluster.add(scale);
+
+        const opacity = new Adw.SpinRow({
+            title: 'Housing opacity',
+            subtitle: 'The instruments themselves stay fully opaque',
+            adjustment: new Gtk.Adjustment({lower: 0.35, upper: 1.0, step_increment: 0.02}),
+            digits: 2,
+        });
+        settings.bind('opacity', opacity, 'value', Gio.SettingsBindFlags.DEFAULT);
+        cluster.add(opacity);
+
+        const margin = new Adw.SpinRow({
+            title: 'Distance from the screen edge',
+            adjustment: new Gtk.Adjustment({lower: 0, upper: 120, step_increment: 2}),
+        });
+        settings.bind('margin', margin, 'value', Gio.SettingsBindFlags.DEFAULT);
+        cluster.add(margin);
+
+        // -- line modes -------------------------------------------------------
         const shown = new Adw.PreferencesGroup({
-            title: 'What to show while healthy',
-            description: 'When something is abnormal the readout replaces all of this '
-                       + 'with the one thing that is wrong.',
+            title: 'Panel line: what to show while healthy',
+            description: 'Applies to the two line styles. When something is abnormal the '
+                       + 'line replaces all of this with the one thing that is wrong.',
         });
         page.add(shown);
 
@@ -68,7 +104,7 @@ export default class JamSysPrefs extends ExtensionPreferences {
         page.add(calm);
         const dim = new Adw.SwitchRow({
             title: 'Fade into the panel while healthy',
-            subtitle: 'The readout should be almost invisible when there is nothing to say',
+            subtitle: 'Line styles only. The cluster is always legible.',
         });
         settings.bind('dim-when-healthy', dim, 'active', Gio.SettingsBindFlags.DEFAULT);
         calm.add(dim);
