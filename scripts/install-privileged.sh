@@ -25,9 +25,13 @@ ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 # relying on it here silently sends the search to a directory that does not exist --
 # and on a machine using the staged toolchain, the artefacts are under the *invoking
 # user's* cache, not root's. Look everywhere they legitimately land.
+# sudo exports SUDO_USER; pkexec exports PKEXEC_UID instead. Handle both, so the
+# script works however it was elevated.
 invoker_home=""
 if [ -n "${SUDO_USER:-}" ]; then
     invoker_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+elif [ -n "${PKEXEC_UID:-}" ]; then
+    invoker_home="$(getent passwd "$PKEXEC_UID" | cut -d: -f6)"
 fi
 
 find_binary() {

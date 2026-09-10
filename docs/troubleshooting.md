@@ -535,8 +535,29 @@ switch it off and on again rather than retrying from the computer.
 
 ### The controls are greyed out
 
-No write path is installed. The Hardware page says which of the two to set up. Check
-what the daemon sees:
+No write path is installed. On a from-source install that is the usual state, because
+`install-user.sh` writes only into `~/.local` and the helper must be root-owned in
+`/usr/libexec`. Run once:
+
+```bash
+sudo ./scripts/install-privileged.sh
+systemctl --user restart jamsysd
+```
+
+or, to authenticate through the desktop prompt instead of a terminal:
+
+```bash
+pkexec /bin/bash ./scripts/install-privileged.sh
+```
+
+That installs both `jamsys-kbd` (lighting) and `jamsys-power` (battery charge limit)
+with their Polkit actions. It finds the built binaries whichever way it was elevated:
+`sudo` exports `SUDO_USER`, `pkexec` exports `PKEXEC_UID`, and both scrub
+`CARGO_TARGET_DIR` — an earlier version relied on that variable and therefore always
+failed on a machine using the staged toolchain.
+
+The Hardware page says which of the two write paths is available. Check what the
+daemon sees:
 
 ```bash
 jamsys --json snapshot | python3 -c \
