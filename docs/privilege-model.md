@@ -220,3 +220,19 @@ those two metrics to `Unsupported` on the Coverage page. The Hardware page notic
 keyboard helper is gone and shows the lighting controls as read-only, with instructions
 for both ways to re-enable them. Nothing else changes, and monitoring is unaffected —
 which is the whole reason lighting lives in a separate binary.
+
+
+## A sysfs attribute is not a stream
+
+The first colour ever written through `jamsys-kbd` failed with `EINVAL`, while the
+identical string written by a shell redirect succeeded. The helper was issuing two
+`write()` calls -- the value, then a bare `"\n"`.
+
+A sysfs attribute parses **each write independently**. The first call set the colour;
+the second handed the kernel a lone newline, its `sscanf` matched none of the six
+fields it wanted, and it returned `EINVAL`. So the helper reported failure for an
+operation that had already worked, which is worse than either succeeding or failing
+cleanly.
+
+`write_attr` now builds one buffer and issues exactly one `write()`. `attr_line()` is
+split out so the rule is testable without a device, and two tests pin it.
