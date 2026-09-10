@@ -90,6 +90,27 @@ It floats above the desktop. It can overlap a dock, and it is hidden by fullscre
 windows. That is inherent to being a desktop gadget on GNOME, and it is stated in the
 preferences dialog rather than left to be discovered.
 
+### One face, two surfaces
+
+`gauges.js` has always been shared, but for a while only the *window* used the new
+face: the Shell extension still called `drawCluster` while `drawClusterBare` and
+everything that came with it -- four dials, the two GPUs split apart, network
+throughput -- went into the window alone. Nobody noticed until the extension was
+finally loaded after a session restart, at which point the corner widget was
+visibly a version behind.
+
+Both now read the same `style` setting (`cutout` by default, `housing` for the old
+boxed layout) and pick the same renderer. The two faces have different natural sizes
+-- 470x176 against 420x192 -- so the extension's `_resize()` follows the face rather
+than assuming one, and `style` joins `mode` and `position` in the list of keys that
+rebuild the widget.
+
+The lesson is in the test rather than the code: `shell-api-test.js` used a permissive
+settings fake, so `get_string('style')` returned `undefined`, `undefined !== 'housing'`
+was true, and the cut-out path "passed" without the setting existing at all. The fake
+now throws on a key the schema does not define, and both faces are exercised
+explicitly.
+
 ### The same cluster, as a window
 
 `jamsys-cluster` puts the identical drawing in a plain GTK4 window. It exists because

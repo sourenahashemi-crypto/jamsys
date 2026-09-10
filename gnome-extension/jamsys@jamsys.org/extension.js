@@ -31,7 +31,8 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
 import {labelFor, normalLine, styleFor} from './format.js';
-import {drawCluster, CLUSTER_W, CLUSTER_H} from './gauges.js';
+import {drawCluster, drawClusterBare,
+        CLUSTER_W, CLUSTER_H, BARE_W, BARE_H} from './gauges.js';
 
 const BUS_NAME = 'org.jamsys.Daemon';
 const OBJECT_PATH = '/org/jamsys/Daemon';
@@ -77,10 +78,18 @@ class JamSysCluster extends St.Widget {
         this._resize();
     }
 
+    /** 'cutout' by default: the same face the standalone window draws. */
+    _cutout() {
+        return this._settings.get_string('style') !== 'housing';
+    }
+
     _resize() {
         const k = this._settings.get_double('scale');
-        this._w = Math.round(CLUSTER_W * k);
-        this._h = Math.round(CLUSTER_H * k);
+        // The two faces have different natural sizes, so the actor has to follow
+        // whichever is in force or the drawing is letterboxed inside a stale box.
+        const cut = this._cutout();
+        this._w = Math.round((cut ? BARE_W : CLUSTER_W) * k);
+        this._h = Math.round((cut ? BARE_H : CLUSTER_H) * k);
         this.set_size(this._w, this._h);
         this._area.set_size(this._w, this._h);
         this._area.queue_repaint();
@@ -103,7 +112,8 @@ class JamSysCluster extends St.Widget {
             }
             let opacity = this._settings.get_double('opacity');
             if (this.hover) opacity = Math.min(1, opacity + 0.06);
-            drawCluster(cr, w, h, this._state, {opacity});
+            if (this._cutout()) drawClusterBare(cr, w, h, this._state, {opacity});
+            else drawCluster(cr, w, h, this._state, {opacity});
         } catch (e) {
             // A drawing bug must never take down the compositor.
             logError(e, 'JamSys: cluster repaint failed');
@@ -225,7 +235,7 @@ export default class JamSysExtension extends Extension {
 
         // Anything that changes the shape of the widget rebuilds it; anything that
         // only changes its appearance just repaints.
-        this._rebuildIds = ['mode', 'position'].map(k =>
+        this._rebuildIds = ['mode', 'position', 'style'].map(k =>
             this._settings.connect(`changed::${k}`, () => this._rebuild()));
         this._redrawIds = ['scale', 'opacity', 'margin', 'show-cpu', 'show-temp',
                            'show-ram', 'show-gpu', 'show-power', 'show-net',

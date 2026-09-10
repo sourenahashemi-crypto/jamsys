@@ -20,12 +20,21 @@ const ok = (c, what, extra = '') => {
 // A settings object good enough for the extension's reads.
 function fakeSettings(overrides = {}) {
     const v = {
-        position: 'bottom-right', mode: 'cluster', scale: 1.0, opacity: 0.92, margin: 14,
+        position: 'bottom-right', mode: 'cluster', style: 'cutout',
+        scale: 1.0, opacity: 0.92, margin: 14,
         'show-cpu': true, 'show-temp': true, 'show-ram': true, 'show-gpu': true,
         'show-power': true, 'show-net': true, 'dim-when-healthy': true, ...overrides,
     };
     return {
-        get_string: k => v[k], get_double: k => v[k], get_int: k => v[k],
+        get_string(k) {
+            // Strict on purpose. A key the schema does not have must fail loudly
+            // here rather than return undefined and quietly take a default branch,
+            // which is how the cut-out face first passed its own test without ever
+            // reading the setting that selects it.
+            if (!(k in v)) throw new Error(`settings.get_string: unknown key '${k}'`);
+            return v[k];
+        },
+        get_double: k => v[k], get_int: k => v[k],
         get_boolean: k => v[k], set_string(k, x) { v[k] = x; },
         connect: () => 1, disconnect() {},
     };
@@ -114,6 +123,12 @@ for (const [scale, opacity] of [[0.55, 0.35], [1.8, 1.0]])
     run(`scale ${scale}`, fakeSettings({scale, opacity}), () => {});
 
 print('\nstate can be applied and cleared without a live daemon');
+// The face the extension draws is the whole point of this round of work: the
+// Shell widget was still rendering the old boxed cluster long after the window
+// had moved on, because nothing tied the two together.
+run('cut-out face', fakeSettings({style: 'cutout'}), () => {});
+run('housing face', fakeSettings({style: 'housing'}), () => {});
+
 run('state', fakeSettings(), e => {
     e._apply(JSON.stringify({
         health: 'critical', cpu_pct: 99, cpu_temp_c: 97, mem_pct: 90, gpu_pct: 50,

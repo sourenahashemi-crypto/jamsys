@@ -424,6 +424,23 @@ jamsys --json stats | grep dbus_signals
 
 ---
 
+## The corner widget looks older than the window
+
+They are two surfaces over one drawing, and after a session restart the Shell
+extension may still be running a build from before your last install. GNOME caches a
+loaded extension's module, so `disable`/`enable` reuses the old one -- only logging
+out and back in picks up a change.
+
+If it looks like a boxed panel with three dials, it is either the older build or the
+`housing` face. Pick the face in **Extension preferences -> Display -> Face**, or:
+
+```bash
+gnome-extensions prefs jamsys@jamsys.org
+```
+
+The cut-out face -- four dials, both GPUs separately, network throughput -- is the
+default.
+
 ## I cannot close the gadget
 
 ```bash
