@@ -199,6 +199,25 @@ path.
 Installed and ready with the .deb — `/usr/libexec/jamsys-kbd` plus a Polkit action.
 Open **Hardware** in the window.
 
+**Installed from source instead?** The user installer writes only into `~/.local`, and
+the helper has to be root-owned in `/usr/libexec`, so the lighting and battery controls
+stay greyed out until you run this once:
+
+```bash
+sudo ./scripts/install-privileged.sh
+```
+
+or, to authenticate through the desktop's own prompt rather than a terminal:
+
+```bash
+pkexec /bin/bash ./scripts/install-privileged.sh
+```
+
+Then `systemctl --user restart jamsysd`. The script finds the built helpers however it
+was elevated: `sudo` exports `SUDO_USER`, `pkexec` exports `PKEXEC_UID`, and both scrub
+`CARGO_TARGET_DIR`, so it searches the source tree *and* the invoking user's
+`~/.cache/jamsys-target`.
+
 If you would rather have no privileged binary at all, install the udev rule instead and
 skip the helper:
 
