@@ -593,6 +593,23 @@ switch it off and on again rather than retrying from the computer.
 
 ### The controls are greyed out
 
+No write path is installed. Two routes, and the first is much less trouble.
+
+**The helper.** One command, no group changes, no re-login. Use the absolute path —
+the relative form only works from inside the source tree:
+
+```bash
+sudo /home/ronin/app/monitoring/scripts/install-privileged.sh
+systemctl --user restart jamsysd
+```
+
+**The udev rule**, if you would rather have no privileged binary at all. Note that
+it grants access to the `video` group and therefore does nothing unless you are in
+it — check `id -nG` first, and if `video` is absent you need
+`sudo usermod -aG video "$USER"` and a full log out and back in.
+
+Older wording below.
+
 No write path is installed. On a from-source install that is the usual state, because
 `install-user.sh` writes only into `~/.local` and the helper must be root-owned in
 `/usr/libexec`. Run once:

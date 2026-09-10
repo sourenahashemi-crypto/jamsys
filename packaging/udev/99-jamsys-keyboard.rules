@@ -20,6 +20,15 @@
 #
 # Then set  [controls] keyboard_direct = true  in ~/.config/jamsys/config.toml
 
+# IMPORTANT: this grants access to the `video` group, so it does nothing at all
+# unless your user is in it. Check with `id -nG`, and if `video` is missing:
+#
+#     sudo usermod -aG video "$USER"
+#
+# then log out and back in — group membership is only picked up at login. If that
+# sounds like more trouble than it is worth, install the helper instead
+# (scripts/install-privileged.sh); it needs no group and no re-login.
+
 ACTION=="add|change", SUBSYSTEM=="leds", KERNEL=="asus::kbd_backlight", \
     RUN+="/bin/chgrp video /sys/class/leds/%k/brightness /sys/class/leds/%k/kbd_rgb_mode /sys/class/leds/%k/kbd_rgb_state", \
     RUN+="/bin/chmod g+w /sys/class/leds/%k/brightness /sys/class/leds/%k/kbd_rgb_mode /sys/class/leds/%k/kbd_rgb_state"
