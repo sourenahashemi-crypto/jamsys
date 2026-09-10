@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist gettext-domain="jamsys">
+  <enum id="org.gnome.shell.extensions.jamsys.position">
+    <value nick="top-left" value="0"/>
+    <value nick="top-center" value="1"/>
+    <value nick="top-right" value="2"/>
+    <value nick="bottom-left" value="3"/>
+    <value nick="bottom-right" value="4"/>
+  </enum>
+  <enum id="org.gnome.shell.extensions.jamsys.mode">
+    <value nick="compact" value="0"/>
+    <value nick="minimal" value="1"/>
+  </enum>
+  <schema id="org.gnome.shell.extensions.jamsys"
+          path="/org/gnome/shell/extensions/jamsys/">
+    <key name="position" enum="org.gnome.shell.extensions.jamsys.position">
+      <default>'top-right'</default>
+      <summary>Where the readout sits</summary>
+    </key>
+    <key name="mode" enum="org.gnome.shell.extensions.jamsys.mode">
+      <default>'compact'</default>
+      <summary>Compact single line, or minimal multi-line</summary>
+    </key>
+    <key name="show-cpu" type="b"><default>true</default><summary>Show CPU</summary></key>
+    <key name="show-temp" type="b"><default>true</default><summary>Show CPU temperature</summary></key>
+    <key name="show-ram" type="b"><default>true</default><summary>Show memory</summary></key>
+    <key name="show-gpu" type="b"><default>true</default><summary>Show GPU</summary></key>
+    <key name="show-power" type="b"><default>true</default><summary>Show power draw</summary></key>
+    <key name="show-net" type="b"><default>true</default><summary>Show network</summary></key>
+    <key name="dim-when-healthy" type="b">
+      <default>true</default>
+      <summary>Fade the readout into the panel while everything is normal</summary>
+    </key>
+  </schema>
+</schemalist>

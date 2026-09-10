@@ -1,0 +1,14 @@
+[Unit]
+Description=Refresh JamSys privileged metrics every minute
+Documentation=file:///usr/share/doc/jamsys/PRIVILEGE-MODEL.md
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=60s
+AccuracySec=15s
+# Do not wake the machine just to read a power counter.
+WakeSystem=false
+Persistent=false
+
+[Install]
+WantedBy=timers.target
