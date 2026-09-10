@@ -183,6 +183,17 @@ X11 clients, so the launcher runs the window on XWayland. Wayland itself gives a
 application no way to raise itself — under `jamsys-cluster --wayland` the two stacking
 toggles are greyed out and say so.
 
+### Battery care
+
+If the firmware supports it -- this ASUS does -- **Hardware -> Battery care** stops
+charging at 60/80/90%, and the machine runs from the charger beyond that. Keeping a
+lithium cell at 100% is what ages it fastest.
+
+The current limit is read without any privilege. Changing it goes through
+`jamsys-power`, a helper that takes one integer, validates it to 20-100, and writes
+one attribute name on one of three compile-time battery paths. It cannot be given a
+path.
+
 ### Keyboard lighting
 
 Installed and ready with the .deb — `/usr/libexec/jamsys-kbd` plus a Polkit action.

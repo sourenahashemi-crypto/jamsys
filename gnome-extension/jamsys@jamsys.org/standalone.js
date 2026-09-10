@@ -177,6 +177,13 @@ const sizeFor = s => [Math.round(natW() * s), Math.round(natH() * s)];
 
 function applySize() {
     const [w, h] = sizeFor(scale);
+    // A maximized window ignores set_default_size outright, so every resize would
+    // silently do nothing. This is not hypothetical: the whole face is a
+    // Gtk.WindowHandle, which behaves like a title bar, and GNOME's default
+    // action-double-click-titlebar is toggle-maximize -- so one double-click on the
+    // gadget pinned it full-screen with no title bar left to double-click back.
+    if (win.is_maximized()) win.unmaximize();
+    if (win.is_fullscreen()) win.unfullscreen();
     area.set_content_width(w);
     area.set_content_height(h);
     // A resizable window keeps whatever the user dragged it to, so shrink it back to
@@ -282,22 +289,42 @@ app.connect('activate', () => {
     area.add_controller(scroll);
 
     const keys = new Gtk.EventControllerKey();
-    keys.connect('key-pressed', (_c, keyval, _code, mods) => {
+    keys.connect('key-pressed', (_c, keyval, code, mods) => {
         const ctrl = (mods & Gdk.ModifierType.CONTROL_MASK) !== 0;
-        switch (keyval) {
-        case Gdk.KEY_Escape:                       win.close(); return true;
-        case Gdk.KEY_q: case Gdk.KEY_Q:            if (ctrl) { win.close(); return true; } break;
-        case Gdk.KEY_plus: case Gdk.KEY_equal:
-        case Gdk.KEY_KP_Add:                       setScale(scale * 1.12); return true;
-        case Gdk.KEY_minus: case Gdk.KEY_KP_Subtract:
-                                                   setScale(scale / 1.12); return true;
-        case Gdk.KEY_0: case Gdk.KEY_KP_0:         setScale(DEFAULT_SCALE); return true;
+        const is = (...wanted) => pressed(keyval, code, wanted);
+        if (is(Gdk.KEY_Escape)) { win.close(); return true; }
+        if (ctrl && is(Gdk.KEY_q, Gdk.KEY_Q)) { win.close(); return true; }
+        if (is(Gdk.KEY_plus, Gdk.KEY_equal, Gdk.KEY_KP_Add)) {
+            setScale(scale * 1.12);
+            return true;
         }
+        if (is(Gdk.KEY_minus, Gdk.KEY_KP_Subtract)) {
+            setScale(scale / 1.12);
+            return true;
+        }
+        if (is(Gdk.KEY_0, Gdk.KEY_KP_0)) { setScale(DEFAULT_SCALE); return true; }
         return false;
     });
     win.add_controller(keys);
 
     applySize();
+
+    // A desktop gadget has no business being maximized or fullscreened. Both are
+    // reachable by accident -- double-click, a keybinding, a misfired window-menu
+    // item -- and both leave it stuck, because there is no title bar to undo them
+    // with. Refuse them instead of trying to explain them.
+    win.connect('notify::maximized', () => {
+        if (win.is_maximized()) {
+            win.unmaximize();
+            applySize();
+        }
+    });
+    win.connect('notify::fullscreened', () => {
+        if (win.is_fullscreen()) {
+            win.unfullscreen();
+            applySize();
+        }
+    });
 
     win.connect('map', () => {
         const ok = stackingAvailable();
@@ -390,6 +417,30 @@ function applyStacking() {
     if (!stackingAvailable()) return;
     setWmState('above', ontop);
     setWmState('sticky', sticky);
+}
+
+/* ------------------------------------------------------------- shortcuts */
+/* Match shortcuts on the *physical key*, not only on the keysym it happens to
+ * produce right now.
+ *
+ * With a non-Latin layout active the keysym is not the one the shortcut was
+ * written against: on a machine with us+ir installed, the "0" key delivers
+ * Farsi_0 (0x10006f0) rather than 48, so "reset the size" silently stopped
+ * working while "-" and "=" kept working, because those two happen to be
+ * identical in both groups. Asking the display which keyvals a keycode can
+ * produce in *any* group makes the shortcut layout-independent. */
+
+function pressed(keyval, keycode, wanted) {
+    if (wanted.includes(keyval)) return true;
+    const display = Gdk.Display.get_default();
+    if (!display || typeof display.map_keycode !== 'function') return false;
+    try {
+        const [ok, , keyvals] = display.map_keycode(keycode);
+        if (!ok || !keyvals) return false;
+        return keyvals.some(k => wanted.includes(k));
+    } catch {
+        return false;
+    }
 }
 
 /* ---------------------------------------------------------- free transform */

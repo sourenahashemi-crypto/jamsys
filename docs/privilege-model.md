@@ -12,6 +12,7 @@ possible, and what does run as root should have no input channel at all.**
 | `jamsysd` | you (`systemd --user`) | UI over a `0700` socket dir; the extension over a session-bus name | `~/.local/share/jamsys/` |
 | `jamsys-helper` | root, `oneshot` on a timer, **optional** | **nobody** | `/run/jamsys/privileged.json` |
 | `jamsys-kbd` | root, via Polkit, **optional** | you, through pkexec | three ASUS LED attributes |
+| `jamsys-power` | root, via Polkit, **optional** | you, through pkexec | one attribute: the battery charge threshold |
 | `jamsys-xabove` | you (no privilege at all) | you, from the cluster window | nothing — one X11 `ClientMessage` |
 
 **The UI never runs as root. The daemon never runs as root. The Shell extension holds no
@@ -24,6 +25,20 @@ opens no files, spawns no shell, and its whole vocabulary is two window-manager 
 a numeric window id, and `on`/`off`, all validated before the X display is opened
 (`jamsys-ui/tests/xabove-test.py`, 34 tests). It is listed here so the table stays a
 complete account of what JamSys executes, not because it widens the trust boundary.
+
+`jamsys-power` is a separate binary from `jamsys-kbd` rather than another verb in
+it, because each privileged helper should do one thing to one closed set of paths.
+`jamsys-kbd` refuses to run at all on a machine with no lit keyboard, which is right
+for a keyboard tool and wrong for a battery one. It takes no path argument and
+cannot be given one: three candidate battery directories are compile-time constants,
+the attribute name is a constant, and the only input is an integer validated to
+20-100 before anything is opened. 20 is a floor, not a formality -- a "charge limit"
+below that is a way to be caught with a flat battery.
+
+Its Polkit action is deliberately **stricter** than the keyboard's. Keyboard colour
+is cosmetic and changed constantly, so `allow_active=yes` is right there. A charge
+limit is set rarely and changes how the machine treats its battery, so it uses
+`auth_admin_keep`: authenticate once, remembered for a few minutes.
 
 Note the asymmetry between the two root components, which is deliberate:
 `jamsys-helper` **reads** and therefore has no input channel at all;

@@ -1,0 +1,13 @@
+[package]
+name = "jamsys-power"
+version = "1.0.0"
+edition = "2021"
+description = "Validated privileged writer for the battery charge threshold"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+panic = "unwind"
+opt-level = "s"
+strip = true

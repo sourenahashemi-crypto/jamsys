@@ -116,8 +116,24 @@ jamsys-cluster --reset                  # forget remembered settings
 
 #### The cut-out cluster
 
-The default face has no housing: three dials sit directly on the wallpaper with one
-slim capsule for the readings that are not dials. The rectangular panel had been doing
+The default face has no housing: four dials sit directly on the wallpaper with one
+slim capsule for the readings that are not dials.
+
+The four are RAM, CPU, **iGPU** and **dGPU**. The two graphics processors get their
+own instruments rather than one averaged "GPU" number, because on a hybrid laptop
+the interesting question is usually *which* of them is working -- and because they
+have independent power states. The dGPU dial dims to a dash and reads "asleep" while
+the card is suspended, and it is never woken to be read.
+
+iGPU busy is `100 - RC6 residency`. That is a proxy, not a hardware busy counter --
+i915 exposes none without `CAP_PERFMON` -- so the dial carries its clock underneath
+rather than implying more precision than exists.
+
+The capsule carries download and upload rates for the active interface, watts,
+battery, and the telltales. The old power segment bar was dropped to make room: the
+numeric watts already said the same thing. Rates are formatted by `rate()`, whose
+precision follows magnitude (`1.5 kB/s`, `46 MB/s`) and which never returns more than
+three digits, so the strip cannot grow and shove the telltales off the end. The rectangular panel had been doing
 two jobs — grouping the instruments, and giving them a legible ground. Grouping three
 objects in a row is unnecessary. A legible ground is not, so each dial gets a soft
 halo instead: six concentric translucent rings, because Cairo has no blur. It was
@@ -157,6 +173,24 @@ instruments to a corner of their own housing looks like a bug.
 Size, opacity, decoration and stacking are remembered in
 `~/.config/jamsys/cluster.json`, written debounced one second after the last change so
 a scroll gesture does not write the file on every tick.
+
+#### Two ways it used to break when resized
+
+**It could be maximized by accident.** The whole face is a `Gtk.WindowHandle` so that
+it can be dragged from anywhere, but a window handle also behaves like a title bar,
+and GNOME's default `action-double-click-titlebar` is `toggle-maximize`. One
+double-click pinned the gadget full-screen -- and with no title bar there was nothing
+to double-click back. Worse, a maximized window ignores `set_default_size`, so every
+subsequent resize silently did nothing. The window now refuses both maximize and
+fullscreen (`notify::maximized` -> `unmaximize()`), and `applySize()` un-maximizes
+before resizing.
+
+**Shortcuts died under a non-Latin keyboard layout.** They were matched on keysym, and
+with an `ir` layout active the "0" key delivers `Farsi_0` (0x10006f0) rather than 48,
+so "reset the size" stopped working. `-` and `=` kept working purely by luck: those
+two keysyms are identical in both groups. Shortcuts now match the *physical key* --
+`Gdk.Display.map_keycode()` gives every keyval a keycode can produce in any group, and
+the shortcut fires if the wanted one is among them.
 
 #### Always on top, and how it actually works
 

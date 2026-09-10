@@ -63,7 +63,20 @@ pub struct WidgetState {
     pub cpu_pct: f64,
     pub cpu_temp_c: f64,
     pub mem_pct: f64,
+    /// dGPU utilisation. Kept for compatibility with an older widget.
     pub gpu_pct: f64,
+    /// Intel iGPU busy, derived as 100 - RC6 residency. This is a proxy, not a
+    /// hardware busy counter -- i915 exposes none without CAP_PERFMON -- and the
+    /// widget labels it as one.
+    pub igpu_pct: f64,
+    pub igpu_freq_mhz: f64,
+    /// NVIDIA dGPU utilisation. Zero and dimmed while the card is suspended; it is
+    /// never woken to be read.
+    pub dgpu_pct: f64,
+    pub dgpu_temp_c: f64,
+    /// Bytes per second on the active interface, both directions.
+    pub net_rx_bps: f64,
+    pub net_tx_bps: f64,
     /// Positive while discharging, negative while charging, 0 with no battery.
     pub power_w: f64,
     pub battery_pct: f64,
@@ -80,6 +93,18 @@ pub struct WidgetState {
     pub alert_subsystem: String,
     pub alert_severity: u8,
     pub open_alerts: u32,
+}
+
+/// Quantise a byte-rate for change detection.
+///
+/// A linear step is wrong here: 1 kB/s of difference is everything at idle and
+/// nothing at 100 MB/s. Bucketing by roughly 5% of magnitude keeps the widget still
+/// during steady transfers without hiding the moment traffic starts.
+fn net_step(v: f64) -> i64 {
+    if !v.is_finite() || v <= 0.0 {
+        return 0;
+    }
+    ((v.ln() / 0.05).round()) as i64
 }
 
 impl WidgetState {
@@ -106,6 +131,14 @@ impl WidgetState {
             || q(self.cpu_temp_c, 1.0) != q(other.cpu_temp_c, 1.0)
             || q(self.mem_pct, 1.0) != q(other.mem_pct, 1.0)
             || q(self.gpu_pct, 1.0) != q(other.gpu_pct, 1.0)
+            || q(self.igpu_pct, 1.0) != q(other.igpu_pct, 1.0)
+            || q(self.igpu_freq_mhz, 50.0) != q(other.igpu_freq_mhz, 50.0)
+            || q(self.dgpu_pct, 1.0) != q(other.dgpu_pct, 1.0)
+            || q(self.dgpu_temp_c, 1.0) != q(other.dgpu_temp_c, 1.0)
+            // Throughput is quantised coarsely and on a log-ish step: nobody reads
+            // the difference between 1.20 and 1.21 MB/s, but 0 -> 30 kB/s matters.
+            || net_step(self.net_rx_bps) != net_step(other.net_rx_bps)
+            || net_step(self.net_tx_bps) != net_step(other.net_tx_bps)
             || q(self.power_w, 0.1) != q(other.power_w, 0.1)
             || q(self.battery_pct, 1.0) != q(other.battery_pct, 1.0)
     }
@@ -135,6 +168,14 @@ impl WidgetState {
             cpu_temp_c: s.thermal.cpu_package_c.unwrap_or(0.0),
             mem_pct: 100.0 - s.memory.available_pct,
             gpu_pct: s.gpu.nvidia.util_pct.unwrap_or(0.0),
+            // RC6 is the fraction of time the render engine spent asleep, so busy is
+            // its inverse. Absent RC6, report zero rather than inventing a number.
+            igpu_pct: s.gpu.intel.rc6_pct.map(|r| (100.0 - r).clamp(0.0, 100.0)).unwrap_or(0.0),
+            igpu_freq_mhz: s.gpu.intel.act_freq_mhz,
+            dgpu_pct: s.gpu.nvidia.util_pct.unwrap_or(0.0),
+            dgpu_temp_c: s.gpu.nvidia.temp_c.unwrap_or(0.0),
+            net_rx_bps: active.map(|i| i.rx_bps).unwrap_or(0.0),
+            net_tx_bps: active.map(|i| i.tx_bps).unwrap_or(0.0),
             power_w: s.power.power_w,
             battery_pct: s.power.percent,
             on_battery: s.power.on_battery,
@@ -330,6 +371,12 @@ mod tests {
             cpu_temp_c: 52.3,
             mem_pct: 18.2,
             gpu_pct: 0.0,
+            igpu_pct: 0.0,
+            igpu_freq_mhz: 0.0,
+            dgpu_pct: 0.0,
+            dgpu_temp_c: 0.0,
+            net_rx_bps: 0.0,
+            net_tx_bps: 0.0,
             power_w: 11.24,
             battery_pct: 87.0,
             on_battery: true,

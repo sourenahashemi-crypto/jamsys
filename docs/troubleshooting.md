@@ -424,6 +424,26 @@ jamsys --json stats | grep dbus_signals
 
 ---
 
+## The gadget jumped to full screen
+
+Fixed. The whole face is a drag handle, which also behaves like a title bar, and
+GNOME's default double-click-on-titlebar action is "maximize" -- so a double-click
+pinned it full screen, and a maximized window ignores every resize request after
+that. It now refuses to maximize at all. If you are running an older build, drag it
+back with the window menu (Alt+Space -> Unmaximize) or restart it:
+
+```bash
+jamsys-cluster --reset
+```
+
+## Resizing does nothing, or "0" does not reset the size
+
+Fixed, and worth knowing why: the shortcuts used to match the keyboard *symbol*, so
+with a non-Latin layout active the "0" key produced `Farsi_0` rather than `0` and the
+reset silently stopped working, while `-` and `=` kept working because those symbols
+are the same in both layouts. They now match the physical key, so they work whatever
+layout is selected.
+
 ## Bluetooth keeps disconnecting
 
 JamSys now names the device and the time of every drop, and escalates to a warning
