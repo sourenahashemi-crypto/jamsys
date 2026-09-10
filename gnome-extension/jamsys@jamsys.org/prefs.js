@@ -10,6 +10,8 @@ import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/ex
 const POSITIONS = ['top-left', 'top-center', 'top-right', 'bottom-left', 'bottom-right'];
 const POSITION_LABELS = ['Top left', 'Top centre', 'Top right', 'Bottom left', 'Bottom right'];
 const MODES = ['cluster', 'compact', 'minimal'];
+const STYLES = ['cutout', 'housing'];
+const STYLE_LABELS = ['Cut-out dials (no panel)', 'Panel housing'];
 const MODE_LABELS = ['Instrument cluster', 'Compact line (panel)', 'Stacked lines (panel)'];
 
 export default class JamSysPrefs extends ExtensionPreferences {
@@ -34,6 +36,17 @@ export default class JamSysPrefs extends ExtensionPreferences {
         modeRow.connect('notify::selected', r =>
             settings.set_string('mode', MODES[r.get_selected()]));
         look.add(modeRow);
+
+        const styleRow = new Adw.ComboRow({
+            title: 'Face',
+            subtitle: 'Cut-out shows four dials directly on the wallpaper, with '
+                    + 'network throughput; the panel is the older boxed layout',
+            model: Gtk.StringList.new(STYLE_LABELS),
+        });
+        styleRow.set_selected(Math.max(0, STYLES.indexOf(settings.get_string('style'))));
+        styleRow.connect('notify::selected', r =>
+            settings.set_string('style', STYLES[r.get_selected()]));
+        look.add(styleRow);
 
         const posRow = new Adw.ComboRow({
             title: 'Corner',

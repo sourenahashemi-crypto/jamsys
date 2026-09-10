@@ -89,7 +89,7 @@ Wired, running, and observed producing correct values on this machine.
 | Window always-on-top and all-workspaces | EWMH over XWayland. Verified with `XQueryTree`: with `_NET_WM_STATE_ABOVE` the cluster stayed topmost across three explicit raises of a competing window; cleared, the competing window went back on top. `_NET_WM_STATE_STICKY` toggles both ways. Window stays a 32-bit ARGB visual, so transparency is unaffected. |
 | `jamsys-xabove` helper | unprivileged; 34 tests including closed verb vocabulary, path/shell-metacharacter/range refusals |
 | Bluetooth per-device monitoring | live against BlueZ on this machine; a forced disconnect/reconnect was detected and timestamped to the second (drop 00:07:34, return 00:07:45), 26 tests |
-| Cut-out cluster | four dials with no housing, rendered and reviewed over both a light and a dark ground; 20 geometry and formatting tests |
+| Cut-out cluster (window **and** Shell extension) | four dials with no housing, rendered and reviewed over both a light and a dark ground; 20 geometry and formatting tests |
 | Both GPUs, separately | Intel iGPU and NVIDIA dGPU are distinct dials. Measured live: iGPU 80% at 900 MHz while the dGPU sat suspended and was never woken to be read. |
 | Network throughput | download and upload on the active interface, on the gadget. Measured live at 43 MB/s down / 731 kB/s up during a real transfer. |
 | Battery charge limit | `charge_control_end_threshold` read unprivileged by the daemon and reported on the Hardware page; writes go through `jamsys-power` (7 helper tests + 22 UI-side tests) |
