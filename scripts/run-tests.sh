@@ -52,6 +52,7 @@ done
 echo "Python"
 run "xabove"        python3 jamsys-ui/tests/xabove-test.py
 run "charge-limit"  python3 jamsys-ui/tests/charge-limit-test.py
+run "report"        python3 jamsys-ui/tests/report-test.py
 if [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then
     run "page-refresh (GTK)" python3 jamsys-ui/tests/page-refresh-test.py
 else

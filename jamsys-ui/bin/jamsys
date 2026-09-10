@@ -25,6 +25,36 @@ if "--json" in sys.argv or "--cli" in sys.argv:
         raise SystemExit(1)
     raise SystemExit(0)
 
+# `--report` prints the same summary the Report page shows, as Markdown. Useful
+# over SSH, in a bug report, or piped to a file -- no display required.
+if "--report" in sys.argv:
+    import json
+    from jamsys_ui import report as _report
+    from jamsys_ui.client import Client, DaemonError
+    c = Client()
+    if not c.connect():
+        print("cannot reach jamsysd; is it running?  systemctl --user status jamsysd",
+              file=sys.stderr)
+        raise SystemExit(1)
+
+    def _call(op, **kw):
+        try:
+            return c.call(op, **kw)
+        except DaemonError:
+            return None
+
+    summary = _report.summarise(
+        _call("snapshot") or {},
+        _report.rows(_call("alerts", open_only=True, limit=50), "alerts"),
+        _call("coverage"),
+        _call("events", limit=15),
+        _call("stats") or {},
+        _call("inventory"),
+    )
+    plain = "--markdown" not in sys.argv and sys.stdout.isatty()
+    print(_report.to_plain(summary) if plain else _report.to_markdown(summary))
+    raise SystemExit(0)
+
 # `--charge-limit <N>` sets the battery charge-stop threshold without opening the
 # window, so it can go in a script or a login hook. It goes through the same
 # validated helper the Hardware page uses; nothing here gains privilege.
@@ -66,6 +96,8 @@ if "--help" in sys.argv or "-h" in sys.argv:
         "  jamsys --page <Name>      open straight to a page (CPU, Power, GPU, ...)\n"
         "  jamsys --json <op> [args] one IPC call, printed as JSON\n"
         "  jamsys --charge-limit <N> stop charging at N% (100 = charge normally)\n"
+        "  jamsys --report           summarise everything worth acting on\n"
+        "  jamsys --report --markdown  the same, as Markdown for pasting\n"
         "  jamsys --help             this text\n"
     )
     raise SystemExit(0)

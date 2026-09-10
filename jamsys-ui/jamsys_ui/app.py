@@ -9,6 +9,7 @@ one without touching the backend.
 
 from __future__ import annotations
 
+import datetime
 import sys
 import time
 from typing import Optional
@@ -19,6 +20,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
+from . import report
 from .client import Client, DaemonError, run_async
 from .hardware import (CHARGE_LIMITS, MODES, PRESETS, SPEEDS, ChargeLimitControl,
                        KeyboardControl, helper_path,
@@ -1287,6 +1289,183 @@ class HardwarePage(Page):
                   lambda ok, err: self._apply(bool(ok) and not err, "Lighting states"))
 
 
+class ReportPage(Page):
+    """Everything worth acting on, in one place, in the order to act on it.
+
+    The other pages answer "what is this subsystem doing?". This answers the
+    question you have when something is actually wrong, and produces the same
+    thing as text you can hand to someone else.
+    """
+
+    title, icon = "Report", "text-x-generic-symbolic"
+
+    def __init__(self, win):
+        super().__init__(win)
+        self._summary = None
+        self._extra = {"alerts": [], "coverage": [], "events": [], "stats": {}}
+        self._pending = False
+
+    def render(self, snap):
+        self.clear()
+        self._fetch()
+
+        s = self._summary
+        if s is None:
+            g = self.group("Report", "Collecting from the daemon…")
+            self.body.append(g)
+            return
+
+        headline = {
+            "healthy": ("Everything is normal", "sv-healthy"),
+            "attention": (f"{len(s['alerts'])} thing(s) need attention", "sv-warn"),
+            "critical": (f"{len(s['alerts'])} thing(s) need attention, "
+                         "including a critical one", "sv-critical"),
+        }[s["verdict"]]
+
+        top = self.group("Verdict")
+        row = Adw.ActionRow(title=headline[0])
+        icon = Gtk.Image.new_from_icon_name(
+            "emblem-ok-symbolic" if s["verdict"] == "healthy"
+            else "dialog-warning-symbolic")
+        icon.add_css_class(headline[1])
+        row.add_prefix(icon)
+        copy = Gtk.Button(label="Copy report", valign=Gtk.Align.CENTER)
+        copy.connect("clicked", self._copy)
+        row.add_suffix(copy)
+        save = Gtk.Button(label="Save…", valign=Gtk.Align.CENTER)
+        save.connect("clicked", self._save)
+        row.add_suffix(save)
+        top.add(row)
+        m = s["machine"]
+        top.add(self.row("Machine", f"{m['model']}", f"kernel {m['kernel']}"))
+        top.add(self.row("Collectors usable", m["collectors"]))
+        self.body.append(top)
+
+        if s["alerts"]:
+            g = self.group("Open problems",
+                           "Most serious first. Each one says what was measured, "
+                           "what was expected, and what to try.")
+            for a in s["alerts"]:
+                d = a.get("detail") or {}
+                r = Adw.ExpanderRow(
+                    title=GLib.markup_escape_text(a.get("title", "Untitled")),
+                    subtitle=GLib.markup_escape_text(
+                        report.SEVERITY.get(a.get("severity", 0), "?")
+                        + " · " + report._age(a.get("first_ts"))))
+                if d.get("what"):
+                    r.add_row(self.row("What", "", d["what"]))
+                if d.get("expected"):
+                    r.add_row(self.row("Expected", str(d["expected"])))
+                for ev in d.get("evidence") or []:
+                    r.add_row(self.row(str(ev.get("label", "")), str(ev.get("value", ""))))
+                if d.get("likely_cause"):
+                    r.add_row(self.row("Likely cause", "", str(d["likely_cause"])))
+                for act in d.get("actions") or []:
+                    r.add_row(self.row("Try", "", str(act)))
+                g.add(r)
+            self.body.append(g)
+
+        if s["risks"]:
+            g = self.group("Configuration worth changing",
+                           "Not faults, but known causes of problems you would "
+                           "otherwise spend a long time chasing.")
+            for note in s["risks"]:
+                g.add(self.row("Risk", "", note))
+            self.body.append(g)
+
+        if s["gaps"]:
+            g = self.group("Not being watched",
+                           "An absent sensor explains a missing alert as much as "
+                           "a present one explains a firing alert.")
+            for c in s["gaps"]:
+                g.add(self.row(str(c.get("name", "?")), str(c.get("label", "?")),
+                               str(c.get("detail") or c.get("reason") or "")))
+            self.body.append(g)
+
+        if s["events"]:
+            g = self.group("Recent events")
+            for e in s["events"][:10]:
+                g.add(self.row(report._ts(e.get("ts")),
+                               str(e.get("kind", "")),
+                               (e.get("summary") or "")[:160]))
+            self.body.append(g)
+
+    # -- data ---------------------------------------------------------
+
+    def _fetch(self):
+        """Pull the extra views the report needs, then re-render once."""
+        if self._pending or not self.win.client.connected:
+            return
+        self._pending = True
+
+        def work():
+            c = self.win.client
+            out = {}
+            for key, op, params in (("alerts", "alerts", {"open_only": True, "limit": 50}),
+                                    ("coverage", "coverage", {}),
+                                    ("events", "events", {"limit": 15}),
+                                    ("stats", "stats", {}),
+                                    ("inventory", "inventory", {})):
+                try:
+                    out[key] = c.call(op, **params)
+                except Exception:  # noqa: BLE001 — a missing view must not blank the page
+                    out[key] = [] if key != "stats" else {}
+            return out
+
+        def done(res, err):
+            self._pending = False
+            if err or not res:
+                return
+            self._extra = {
+                "alerts": report.rows(res.get("alerts"), "alerts"),
+                "coverage": res.get("coverage"),
+                "events": res.get("events"),
+                "stats": res.get("stats") or {},
+                "inventory": res.get("inventory"),
+            }
+            self._summary = report.summarise(
+                self.win.last_snapshot or {}, self._extra["alerts"],
+                self._extra["coverage"], self._extra["events"],
+                self._extra["stats"], self._extra["inventory"])
+            # Only now is there anything to draw.
+            if self.win.current_page() is self:
+                self.render(self.win.last_snapshot or {})
+
+        run_async(work, done)
+
+    # -- actions ------------------------------------------------------
+
+    def _markdown(self) -> str:
+        if self._summary is None:
+            return "JamSys report: still collecting."
+        return report.to_markdown(self._summary)
+
+    def _copy(self, _btn):
+        text = self._markdown()
+        self.get_clipboard().set(text)
+        self.win.toasts.add_toast(Adw.Toast(
+            title=f"Report copied ({len(text.splitlines())} lines)", timeout=3))
+
+    def _save(self, _btn):
+        name = datetime.datetime.now().strftime("jamsys-report-%Y%m%d-%H%M.md")
+        dlg = Gtk.FileDialog(initial_name=name)
+
+        def finish(d, res):
+            try:
+                f = d.save_finish(res)
+            except GLib.Error:
+                return              # the user cancelled; not an error
+            try:
+                path = f.get_path()
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(self._markdown())
+                self.win.toasts.add_toast(Adw.Toast(title=f"Saved to {path}", timeout=5))
+            except OSError as e:
+                self.win.toasts.add_toast(Adw.Toast(title=f"Could not save: {e}", timeout=6))
+
+        dlg.save(self.win, None, finish)
+
+
 class DiagnosticsPage(Page):
     """What the monitoring application costs. A monitor that will not report its own
     overhead is asking to be taken on trust."""
@@ -1379,7 +1558,8 @@ class SettingsPage(Page):
 
 PAGES = [OverviewPage, CpuPage, MemoryPage, GpuPage, PowerPage, ThermalPage,
          StoragePage, NetworkPage, DevicesPage, ServicesPage, ProcessPage,
-         HardwarePage, EventsPage, CoveragePage, DiagnosticsPage, SettingsPage]
+         HardwarePage, ReportPage, EventsPage, CoveragePage, DiagnosticsPage,
+         SettingsPage]
 
 
 class MainWindow(Adw.ApplicationWindow):

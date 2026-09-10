@@ -520,3 +520,39 @@ The only page with write access to anything, so it is built to be obvious about 
 Urgency maps INFO/NOTICE → low, WARNING → normal, CRITICAL → critical (which persists on
 screen). Body text is the first two lines of the explanation, always with real numbers.
 Notification actions map to Snooze 1 h and Open. No sound by default.
+
+
+## Refreshing without fighting the user
+
+Every page rebuilds its whole body from scratch on each two-second refresh.
+That is fine for text and hostile for anything interactive: an open dropdown was
+destroyed under the pointer and the scroll position snapped back to the top,
+so the page appeared to jump and a list could be neither scrolled nor picked
+from.
+
+`Page.update()` is the guard, in the base class so all sixteen pages get it:
+
+- it skips the rebuild entirely while a `Gtk.Popover` is open anywhere beneath
+  the page, or while a text entry has focus;
+- otherwise it renders and restores the scroll offset on idle, once the new
+  children have been allocated and the adjustment's bounds mean something.
+
+Data is at most one tick stale while a menu is open, which nobody can perceive
+and everybody prefers to a list that moves as they reach for it. Page switches
+and explicit filter clicks still call `render()` directly, because those are
+user intent rather than a background refresh.
+
+## The report
+
+One page that answers the question the rest of the interface does not: *what is
+wrong, why do we think so, and what should I do about it.* `report.py` holds the
+judgement and is pure text assembly with no GTK, so the same summary renders as
+widgets, as Markdown for the clipboard, and as plain text from `jamsys --report`
+with no display attached.
+
+The awkward part is that IPC replies are not uniformly shaped — `coverage`
+returns `{"collectors": […]}`, `inventory` returns `{"items": […]}`, `alerts`
+returns `{"alerts": […]}`, and others return a bare list. Assuming one shape
+produced a report that looked complete while silently dropping whole sections,
+which is the worst failure mode for something whose entire job is to tell you
+what is wrong. `rows()` normalises them and is tested against each shape.
