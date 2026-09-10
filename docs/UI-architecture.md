@@ -113,6 +113,8 @@ it back in a corner.
 
 The menu is a `PopupMenu` the widget owns, because a chrome actor has no
 `PanelMenu.Button` to inherit one from, and it is destroyed with the widget.
+Its actor belongs to `Main.uiGroup`, outside the widget's child tree, so teardown
+explicitly destroys the popup on every rebuild as well as on disable.
 
 ### Resizing, on both surfaces
 
@@ -166,7 +168,8 @@ of three real constraints:
 
 It is undecorated and sized to its contents, with the whole face acting as a drag
 handle (`Gtk.WindowHandle`), so it behaves like a gadget rather than an application.
-Clicking it opens the full window on the relevant page; Escape closes it.
+Double-clicking it opens the full window on the relevant page; a single click does
+nothing. Escape closes it.
 
 ```bash
 jamsys-cluster                          # remembered size, or 546x250 on first run
@@ -318,6 +321,23 @@ remains the primary surface.
 One copy of the rendering, three consumers: the Shell widget, this window, and the PNG
 harness. That is why `standalone.js` lives beside the extension rather than in its own
 directory — `gauges.js` is not duplicated.
+
+#### Losing and reconnecting to the daemon
+
+Both surfaces watch the session-bus service name and clear their readings when it
+vanishes. They release the previous signal subscription and fetch a fresh snapshot
+when the service returns. A connection generation rejects replies and queued signals
+from an old connection, including across Shell disable/re-enable. A newer push takes
+precedence over a delayed initial snapshot. Closing the standalone window releases
+both its bus-name watcher and its signal subscription.
+
+The shared `drawUnavailable()` face says “JamSys — waiting for monitoring” and shows
+`systemctl --user start jamsysd`. It is replaced automatically when live data arrives;
+it changes no settings and launches no command. The panel line preserves the same
+start command after a healthy reading or a rebuild while offline. Tests drive both
+surfaces' actual callback code and check real Cairo text bounds at small sizes on
+light and dark grounds. These are automated and render checks, not proof of live
+Shell or pointer behaviour; a logout and manual inspection are still required.
 
 ### How it was designed without being able to see it
 
