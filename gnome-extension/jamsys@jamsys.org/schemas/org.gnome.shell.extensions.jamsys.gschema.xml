@@ -29,7 +29,7 @@
 
     <key name="scale" type="d">
       <default>1.0</default>
-      <range min="0.55" max="1.8"/>
+      <range min="0.55" max="3.0"/>
       <summary>Size of the instrument cluster</summary>
     </key>
     <key name="opacity" type="d">

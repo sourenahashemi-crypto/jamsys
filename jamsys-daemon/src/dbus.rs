@@ -827,6 +827,31 @@ fn read_line(s: &mut UnixStream) -> std::io::Result<String> {
 ///
 /// `replaces_id` of 0 creates a new bubble; passing a previously-returned id updates
 /// that bubble in place, which is how an escalating alert avoids stacking up.
+/// Withdraw a notification the daemon previously raised.
+///
+/// Without this a resolved alert leaves its notification sitting in the shell for
+/// ever: critical notifications are sent with `timeout = 0`, which means "never
+/// expires", and GNOME keeps everything else in the message tray until it is
+/// dismissed by hand. The condition going away has to take the notification with
+/// it, or the user is left looking at a warning about something that is fixed.
+///
+/// A stale or unknown id is not an error: the spec says the server ignores it.
+pub fn close_notification(conn: &mut Connection, id: u32) -> std::io::Result<()> {
+    if id == 0 {
+        return Ok(());
+    }
+    let mut b = Marshal::new();
+    b.u32(id);
+    conn.send_no_reply(
+        "org.freedesktop.Notifications",
+        "/org/freedesktop/Notifications",
+        "org.freedesktop.Notifications",
+        "CloseNotification",
+        "u",
+        &b.buf,
+    )
+}
+
 pub fn notify(
     conn: &mut Connection,
     app_name: &str,

@@ -311,3 +311,22 @@ So a unit with `LoadState=not-found` gets its own rule, `service.orphaned`, at
 **Notice** rather than Warning, saying what it actually is and giving the single
 command that clears it -- with `--user` when the unit is a user unit, because without
 it the command silently does nothing.
+
+
+## Resolution takes the notification with it
+
+An alert that resolves used to leave its desktop notification behind. The id was
+stored while the alert was open and simply dropped on resolve, so nothing ever told
+the shell to take it down -- and critical notifications are sent with `timeout = 0`,
+meaning "never expires". The result was a warning about a fixed problem sitting on
+screen indefinitely.
+
+`clear()` and `clear_now()` now call `CloseNotification` with the stored id before
+forgetting it. A stale id is harmless: the specification says the server ignores one
+it does not recognise. Verified on the bus -- `Notify`, then `CloseNotification`,
+then the shell's own `NotificationClosed` signal.
+
+Note that this is separate from resolution *hysteresis*: an alert still has to stop
+firing for about two minutes before it resolves at all, so a notification will
+outlive the condition briefly by design. What it will not do any more is outlive it
+for ever.

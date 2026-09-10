@@ -25,6 +25,31 @@ if "--json" in sys.argv or "--cli" in sys.argv:
         raise SystemExit(1)
     raise SystemExit(0)
 
+# `--charge-limit <N>` sets the battery charge-stop threshold without opening the
+# window, so it can go in a script or a login hook. It goes through the same
+# validated helper the Hardware page uses; nothing here gains privilege.
+if "--charge-limit" in sys.argv:
+    from jamsys_ui.hardware import ChargeLimitControl
+    i = sys.argv.index("--charge-limit")
+    if i + 1 >= len(sys.argv):
+        print("usage: jamsys --charge-limit <20-100>   (100 = charge normally)",
+              file=sys.stderr)
+        raise SystemExit(2)
+    try:
+        want = int(sys.argv[i + 1])
+    except ValueError:
+        print(f"charge limit must be a whole number, not {sys.argv[i + 1]!r}",
+              file=sys.stderr)
+        raise SystemExit(2)
+    ctl = ChargeLimitControl()
+    if ctl.set_limit(want):
+        print(f"charge limit set to {want}%"
+              + ("  (charging normally again)" if want >= 100 else
+                 "  — above this the laptop runs from the charger"))
+        raise SystemExit(0)
+    print(f"could not set the charge limit: {ctl.last_error}", file=sys.stderr)
+    raise SystemExit(1)
+
 # `--page <Name>` opens straight to a subsystem. The GNOME Shell readout uses this
 # so that clicking a warning lands on the page that explains it.
 page = None
@@ -40,6 +65,7 @@ if "--help" in sys.argv or "-h" in sys.argv:
         "  jamsys                    open the window\n"
         "  jamsys --page <Name>      open straight to a page (CPU, Power, GPU, ...)\n"
         "  jamsys --json <op> [args] one IPC call, printed as JSON\n"
+        "  jamsys --charge-limit <N> stop charging at N% (100 = charge normally)\n"
         "  jamsys --help             this text\n"
     )
     raise SystemExit(0)

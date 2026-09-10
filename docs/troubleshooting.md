@@ -424,6 +424,47 @@ jamsys --json stats | grep dbus_signals
 
 ---
 
+## The battery charges past the limit
+
+Check what the firmware currently has:
+
+```bash
+cat /sys/class/power_supply/BAT0/charge_control_end_threshold
+```
+
+`100` means no limit is set. Setting it needs root once, and there are two ways.
+
+**Through JamSys** — Hardware -> Battery care, or from a terminal:
+
+```bash
+jamsys --charge-limit 80
+jamsys --charge-limit 100     # allow a full charge again
+```
+
+Both need `jamsys-power` installed (`sudo ./scripts/install-privileged.sh`); until
+then they fail with exactly that message rather than doing nothing.
+
+**Directly**, with no JamSys involvement at all:
+
+```bash
+echo 80  | sudo tee /sys/class/power_supply/BAT0/charge_control_end_threshold
+echo 100 | sudo tee /sys/class/power_supply/BAT0/charge_control_end_threshold
+```
+
+Two things worth knowing. The limit only takes effect on the next charge cycle -- a
+battery already at 100% does not discharge down to 80, it simply stops topping up.
+And some firmware forgets the threshold across a reboot; if yours does, there is a
+one-shot unit in `/usr/share/doc/jamsys/examples/jamsys-charge-limit.service` that
+re-applies it at boot.
+
+## The corner widget cannot be resized
+
+Scroll on it. That works on both surfaces now -- it always worked on the window, and
+the Shell extension used to be resizable only from its preferences dialog, which is
+not where anyone looks when a gadget is the wrong size. Range is 0.55x to 3x.
+
+`gnome-extensions prefs jamsys@jamsys.org` still has a slider if you prefer it.
+
 ## The corner widget looks older than the window
 
 They are two surfaces over one drawing, and after a session restart the Shell

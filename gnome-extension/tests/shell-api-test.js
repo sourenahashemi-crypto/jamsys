@@ -36,7 +36,9 @@ function fakeSettings(overrides = {}) {
         },
         get_double: k => v[k], get_int: k => v[k],
         get_boolean: k => v[k], set_string(k, x) { v[k] = x; },
+        set_double(k, x) { v[k] = x; },
         connect: () => 1, disconnect() {},
+        _values: v,
     };
 }
 
@@ -145,5 +147,72 @@ run('state', fakeSettings(), e => {
     ok(true, 'the daemon disappearing is handled');
 });
 
+
+/* ------------------------------------------------------- scroll to resize */
+/* The corner widget could only be resized from the preferences dialog, which is
+ * not where anyone looks when a gadget is the wrong size. These drive the real
+ * handler on the real widget; the interesting case is the one Wayland sends. */
+
+const Clutter = (await import(`file://${stubs}/clutter.js`)).default;
+const D = Clutter.ScrollDirection;
+const scrollEvent = (direction, dy = 0) => ({
+    get_scroll_direction: () => direction,
+    get_scroll_delta: () => [0, dy],
+});
+
+print('\nscroll to resize');
+
+function withCluster(settings, fn) {
+    Main.layoutManager.chrome.length = 0;
+    Main.panel.statusArea = {};
+    const e = Object.create(Ext.prototype);
+    e.uuid = 'jamsys@jamsys.org';
+    e.getSettings = () => settings;
+    e.enable();
+    try {
+        fn(e._widget, settings);
+    } finally {
+        e.disable();
+    }
+}
+
+withCluster(fakeSettings({scale: 1.0}), (c, st) => {
+    c._onScroll(scrollEvent(D.UP));
+    ok(st._values.scale > 1.0, 'scroll up grows the widget', `got ${st._values.scale}`);
+    const grown = st._values.scale;
+    c._onScroll(scrollEvent(D.DOWN));
+    ok(st._values.scale < grown, 'scroll down shrinks it again');
+});
+
+// Wayland sends SMOOTH, never UP/DOWN. Handling only the discrete directions
+// would mean the feature silently does nothing on the compositor this targets.
+withCluster(fakeSettings({scale: 1.0}), (c, st) => {
+    c._onScroll(scrollEvent(D.SMOOTH, -1.0));
+    ok(st._values.scale > 1.0, 'smooth scroll up grows it — this is the Wayland path',
+       `got ${st._values.scale}`);
+    const grown = st._values.scale;
+    c._onScroll(scrollEvent(D.SMOOTH, 1.0));
+    ok(st._values.scale < grown, 'smooth scroll down shrinks it');
+});
+
+withCluster(fakeSettings({scale: 1.0}), (c, st) => {
+    c._onScroll(scrollEvent(D.SMOOTH, 0));
+    ok(st._values.scale === 1.0, 'a zero-delta smooth event changes nothing');
+    c._onScroll(scrollEvent(D.LEFT));
+    ok(st._values.scale === 1.0, 'horizontal scroll changes nothing');
+});
+
+// Clamping must agree with the gschema range. If it does not, GSettings clamps the
+// write silently and the widget looks like it has stopped responding.
+withCluster(fakeSettings({scale: 3.0}), (c, st) => {
+    for (let i = 0; i < 20; i++) c._onScroll(scrollEvent(D.UP));
+    ok(st._values.scale <= 3.0, 'never exceeds the schema maximum', `got ${st._values.scale}`);
+});
+withCluster(fakeSettings({scale: 0.55}), (c, st) => {
+    for (let i = 0; i < 20; i++) c._onScroll(scrollEvent(D.DOWN));
+    ok(st._values.scale >= 0.55, 'never drops below the schema minimum', `got ${st._values.scale}`);
+});
+
 print(`\n${failures === 0 ? 'ALL PASS' : failures + ' FAILURE(S)'}`);
 imports.system.exit(failures === 0 ? 0 : 1);
+

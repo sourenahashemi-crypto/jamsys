@@ -1,0 +1,32 @@
+# Re-apply the battery charge limit at boot.
+#
+# Optional, and only needed if your firmware forgets the threshold across a
+# reboot -- many ASUS ECs keep it, some do not. Check after a restart:
+#
+#     cat /sys/class/power_supply/BAT0/charge_control_end_threshold
+#
+# If it reads 100 again, install this:
+#
+#     sudo install -m0644 jamsys-charge-limit.service /etc/systemd/system/
+#     sudo systemctl daemon-reload
+#     sudo systemctl enable --now jamsys-charge-limit.service
+#
+# Change the limit by editing ExecStart below, or just use the JamSys Hardware
+# page for the running session and leave this as the boot-time default.
+#
+# This writes one attribute and exits. It is not a daemon and holds no privilege
+# after it finishes.
+
+[Unit]
+Description=Apply the JamSys battery charge limit
+After=multi-user.target
+# The attribute does not exist until the battery driver has bound.
+ConditionPathExists=/sys/class/power_supply/BAT0/charge_control_end_threshold
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/jamsys-power charge-limit 80
+
+[Install]
+WantedBy=multi-user.target
