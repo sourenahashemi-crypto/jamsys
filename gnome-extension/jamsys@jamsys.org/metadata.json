@@ -1,0 +1,9 @@
+{
+  "uuid": "jamsys@jamsys.org",
+  "name": "JamSys",
+  "description": "A calm corner readout of system health, driven by the JamSys daemon over D-Bus. Nearly invisible when everything is normal; shows the one thing that is wrong when something is.",
+  "shell-version": ["48", "49", "50"],
+  "settings-schema": "org.gnome.shell.extensions.jamsys",
+  "url": "https://example.invalid/jamsys",
+  "version": 1
+}

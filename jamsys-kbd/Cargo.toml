@@ -1,0 +1,20 @@
+[package]
+name = "jamsys-kbd"
+version = "1.0.0"
+edition = "2021"
+description = "Minimal validated writer for ASUS keyboard backlight and RGB"
+license = "MIT"
+
+[[bin]]
+name = "jamsys-kbd"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

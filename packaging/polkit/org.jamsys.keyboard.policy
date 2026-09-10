@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/software/polkit/policyconfig-1.dtd">
+<policyconfig>
+  <vendor>JamSys</vendor>
+  <vendor_url>https://example.invalid/jamsys</vendor_url>
+
+  <action id="org.jamsys.keyboard.set">
+    <description>Change the keyboard backlight and RGB lighting</description>
+    <message>Authentication is required to change keyboard lighting</message>
+    <icon_name>input-keyboard</icon_name>
+
+    <!--
+      allow_active = yes.
+
+      This is the same posture the desktop already takes for screen brightness and
+      other laptop lighting: a person physically sitting at an active local session
+      may change their own keyboard colour without re-authenticating. Prompting for a
+      password on every drag of a colour picker would make the feature unusable, and
+      users would work around it by loosening something worse.
+
+      The privilege being granted is narrow by construction: the helper can write
+      exactly three sysfs attributes under /sys/class/leds/asus::kbd_backlight, with
+      range-checked integer arguments, and can read nothing back. See
+      docs/privilege-model.md.
+
+      Remote and inactive sessions must still authenticate as an administrator.
+    -->
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/jamsys-kbd</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>

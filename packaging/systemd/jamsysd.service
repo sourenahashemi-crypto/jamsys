@@ -1,0 +1,42 @@
+[Unit]
+Description=JamSys system-health monitor
+Documentation=file:///usr/share/doc/jamsys/README.md
+# Wait for the graphical session so desktop notifications have a bus to reach.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/jamsysd
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10s
+# A monitor must never become the problem it is watching for.
+Nice=5
+IOSchedulingClass=idle
+CPUWeight=20
+MemoryMax=256M
+TasksMax=32
+
+# Hardening. This is a user unit, so it already has no privileges to drop; these
+# further reduce what a compromised daemon could reach.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/jamsys %h/.config/jamsys
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# The daemon connects to the gateway/DNS for reachability checks (no payload sent);
+# set RestrictAddressFamilies to AF_UNIX AF_NETLINK only if you disable that feature.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+
+[Install]
+WantedBy=graphical-session.target

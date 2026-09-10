@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=JamSys
+GenericName=System Health Monitor
+Comment=Is everything on this machine working normally right now?
+Exec=jamsys
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;GTK;
+Keywords=monitor;system;health;cpu;battery;temperature;gpu;disk;network;
+StartupNotify=true
+X-GNOME-UsesNotifications=true

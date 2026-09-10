@@ -1,0 +1,25 @@
+# Optional alternative to the privileged helper.
+#
+# Installing this rule gives members of the `video` group direct write access to the
+# three ASUS keyboard lighting attributes. If you do that, JamSys needs no
+# privileged binary for keyboard control at all — which is strictly less attack
+# surface than any helper, because there is no privileged code to attack.
+#
+# The trade-off: it is coarser. Any process running as you can then write those
+# attributes at any time, whereas the helper route means each write goes through a
+# Polkit action that can be tightened, logged or revoked centrally.
+#
+# Pick one. The helper is the default because it is the more controllable of the two;
+# this file is provided because for a single-user laptop the simpler answer is often
+# the better one.
+#
+# Install:
+#   sudo install -m 0644 99-jamsys-keyboard.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload && sudo udevadm trigger -s leds
+#   sudo systemctl disable --now  # nothing to disable; just do not install the helper
+#
+# Then set  [controls] keyboard_direct = true  in ~/.config/jamsys/config.toml
+
+ACTION=="add|change", SUBSYSTEM=="leds", KERNEL=="asus::kbd_backlight", \
+    RUN+="/bin/chgrp video /sys/class/leds/%k/brightness /sys/class/leds/%k/kbd_rgb_mode /sys/class/leds/%k/kbd_rgb_state", \
+    RUN+="/bin/chmod g+w /sys/class/leds/%k/brightness /sys/class/leds/%k/kbd_rgb_mode /sys/class/leds/%k/kbd_rgb_state"

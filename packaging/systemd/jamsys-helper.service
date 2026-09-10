@@ -1,0 +1,39 @@
+[Unit]
+Description=JamSys privileged metric reader (RAPL and NVMe SMART)
+Documentation=file:///usr/share/doc/jamsys/privilege-model.md
+ConditionPathExists=/usr/libexec/jamsys-helper
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/jamsys-helper
+# Root code executes for a few milliseconds per run and then the process is gone.
+# The program takes no arguments, reads no stdin and opens no socket, so there is no
+# request parser running as root and nothing an unprivileged process can send it.
+
+# CAP_SYS_ADMIN is required only for the NVMe admin passthrough ioctl.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_OVERRIDE
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/run/jamsys
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=
+DeviceAllow=/dev/nvme0 r
+DeviceAllow=/dev/nvme1 r
+DevicePolicy=closed
+UMask=0022
