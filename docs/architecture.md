@@ -184,9 +184,12 @@ Rules enforced by the runtime, not by convention:
 4. Rollups (1 min / 5 min / 15 min) are computed by a maintenance pass at the glacial
    tier, then source rows past retention are deleted and the DB is incrementally vacuumed.
 
-All timestamps are stored as `INTEGER` Unix-epoch milliseconds (UTC).
-Durations and "has the machine been asleep" use `CLOCK_BOOTTIME` so that a suspend does
-not look like a stalled daemon.
+Stored timestamps and persisted snooze deadlines use `INTEGER` Unix-epoch milliseconds
+(UTC). Rule dwell, notification cooldown, token-bucket refill, and the 120-second
+alert-resolution hold use `CLOCK_MONOTONIC`, which excludes suspended time and is
+unaffected by wall-clock changes. Suspend detection compares `CLOCK_BOOTTIME` against
+`CLOCK_MONOTONIC`; boottime includes sleep. Regression tests check the alert manager's
+clock domain and both sides of the resolution boundary without changing the system clock.
 
 ---
 
@@ -194,7 +197,7 @@ not look like a stalled daemon.
 
 | Situation | Behaviour |
 |---|---|
-| Sensor file disappears (driver reload) | collector re-probes, coverage flips, no alert |
+| Sensor file disappears (driver reload) | `Gone` triggers an immediate re-probe; if still unavailable, retry after 15 minutes at the collector's next scheduled tier run. Thermal readings are cleared even when all channels disappear. |
 | Sensor returns garbage (`""`, `-1`, `2^63`) | value rejected by the parser, sample dropped |
 | NVML absent / NVIDIA removed | `Support::Unsupported`, card hidden in UI |
 | No battery (desktop) | power collector unsupported, idle-power baseline disabled |
@@ -207,6 +210,12 @@ not look like a stalled daemon.
 The hwmon-numbering point is a real hazard on Ubuntu: `hwmon4` is the NVMe today and may
 be `hwmon6` after the next kernel. Sensors are resolved by reading every `hwmon*/name`
 at probe time and matching on the driver name plus the `tempN_label`.
+
+Retry after `Gone` applies to a source that was previously usable. Sources unsupported
+at startup still require re-enabling or a daemon restart to probe again; explicitly
+disabled collectors stay disabled. Synthetic degradation tests cover loss, a failed
+retry, recovery, and disabling, without unloading a real driver. The thermal loss test
+verifies that stale temperatures cannot remain in the snapshot after a `Gone` error.
 
 
 ## Collector-owned event descriptors

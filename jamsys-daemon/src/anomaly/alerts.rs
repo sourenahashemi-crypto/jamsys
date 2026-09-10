@@ -45,7 +45,7 @@ impl Bucket {
 
 pub struct AlertManager {
     buckets: HashMap<Severity, Bucket>,
-    /// fingerprint -> (last notify ms, notification id, severity notified at)
+    /// fingerprint -> (last notify monotonic ms, notification id, severity notified at)
     notified: HashMap<String, (i64, u32, Severity)>,
     /// Fingerprints currently believed to be firing.
     open: HashMap<String, Severity>,
@@ -64,7 +64,7 @@ const MIN_RESOLVE_HOLD_S: i64 = 120;
 
 impl AlertManager {
     pub fn new(cfg: &Config, store: &Store) -> Self {
-        let now = crate::clock::now_ms();
+        let now = crate::clock::mono_ms();
         let mut buckets = HashMap::new();
         for s in [Severity::Info, Severity::Notice, Severity::Warning, Severity::Critical] {
             buckets.insert(s, Bucket::new(cfg.alerts.burst, cfg.alerts.refill_s, now));
@@ -115,10 +115,12 @@ impl AlertManager {
 
     /// Raise an alert. Returns whether a desktop notification was actually sent.
     pub fn raise(&mut self, a: Alert, store: &Store, cfg: &Config) -> bool {
-        let now = crate::clock::now_ms();
+        let now = crate::clock::mono_ms();
         self.clearing.remove(&a.fingerprint);
 
-        if self.is_suppressed(&a, now) {
+        // Suppressions persist as Unix timestamps; cooldown and refill intervals
+        // must remain independent of NTP or manual wall-clock changes.
+        if self.is_suppressed(&a, crate::clock::now_ms()) {
             self.total_suppressed += 1;
             // Still recorded, so the UI can show "muted" rather than hiding the fact.
             let _ = store.upsert_alert(&a);
@@ -175,7 +177,7 @@ impl AlertManager {
         if !self.open.contains_key(fingerprint) {
             return;
         }
-        let now = crate::clock::now_ms();
+        let now = crate::clock::mono_ms();
         let since = *self.clearing.entry(fingerprint.to_string()).or_insert(now);
         if (now - since) / 1000 < MIN_RESOLVE_HOLD_S {
             return;
@@ -279,6 +281,47 @@ mod tests {
     }
 
     #[test]
+    fn notification_intervals_use_monotonic_time() {
+        let (store, cfg) = setup();
+        let before = crate::clock::mono_ms();
+        let mut m = AlertManager::new(&cfg, &store);
+        m.raise(alert("cpu.hot", "", Severity::Warning), &store, &cfg);
+        let after = crate::clock::mono_ms();
+        let notified = m.notified["cpu.hot"].0;
+        assert!((before..=after).contains(&notified), "notification timestamp {notified} is not monotonic");
+        for bucket in m.buckets.values() {
+            assert!((before..=after).contains(&bucket.last_ms), "refill clock must be monotonic");
+        }
+    }
+
+    #[test]
+    fn resolution_finishes_after_monotonic_hold() {
+        let (store, cfg) = setup();
+        let mut m = AlertManager::new(&cfg, &store);
+        m.raise(alert("cpu.hot", "", Severity::Warning), &store, &cfg);
+        m.clear("cpu.hot", &store);
+        let since = m.clearing["cpu.hot"];
+        assert!((crate::clock::mono_ms() - since).abs() < 1_000,
+                "resolution hold started on the wall clock");
+        m.clearing.insert("cpu.hot".into(), crate::clock::mono_ms() - 119_000);
+        m.clear("cpu.hot", &store);
+        assert!(m.is_open("cpu.hot"), "must hold for the full two minutes");
+        m.clearing.insert("cpu.hot".into(), crate::clock::mono_ms() - 120_000);
+        m.clear("cpu.hot", &store);
+        assert!(!m.is_open("cpu.hot"));
+    }
+
+    #[test]
+    fn an_active_snooze_uses_wall_time_even_when_intervals_are_monotonic() {
+        let (store, cfg) = setup();
+        store.add_suppression("rule", "cpu.hot", Some(crate::clock::now_ms() + 60_000), None).unwrap();
+        let mut m = AlertManager::new(&cfg, &store);
+        m.raise(alert("cpu.hot", "", Severity::Warning), &store, &cfg);
+        assert_eq!(m.total_suppressed, 1);
+        assert!(!m.notified.contains_key("cpu.hot"));
+    }
+
+    #[test]
     fn an_alert_is_persisted_and_deduplicated() {
         let (store, cfg) = setup();
         let mut m = AlertManager::new(&cfg, &store);
@@ -340,7 +383,7 @@ mod tests {
         m.clear("net.iface_down:wlp108s0", &store);
         assert!(m.is_open("net.iface_down:wlp108s0"), "must not resolve instantly");
         // Force the hold to have elapsed.
-        m.clearing.insert("net.iface_down:wlp108s0".into(), crate::clock::now_ms() - 130_000);
+        m.clearing.insert("net.iface_down:wlp108s0".into(), crate::clock::mono_ms() - 130_000);
         m.clear("net.iface_down:wlp108s0", &store);
         assert!(!m.is_open("net.iface_down:wlp108s0"));
     }

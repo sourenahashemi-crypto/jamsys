@@ -147,7 +147,8 @@ struct Entry {
     c: Box<dyn Collector>,
     support: Support,
     consecutive_failures: u32,
-    /// Monotonic ms of the next attempt while quarantined.
+    /// Monotonic ms of the next attempt while quarantined or temporarily gone.
+    /// Zero for unsupported sources that have never been usable.
     retry_after_ms: i64,
     last_error: Option<String>,
     total_runs: u64,
@@ -202,10 +203,13 @@ impl Registry {
             if e.c.tier() != tier {
                 continue;
             }
-            if matches!(e.support, Support::Disabled | Support::Unsupported { .. }) {
+            if matches!(e.support, Support::Disabled) {
                 continue;
             }
-            if let Support::Quarantined { .. } = e.support {
+            if matches!(e.support, Support::Unsupported { .. }) && e.retry_after_ms == 0 {
+                continue;
+            }
+            if matches!(e.support, Support::Quarantined { .. } | Support::Unsupported { .. }) {
                 if now_mono < e.retry_after_ms {
                     continue;
                 }
@@ -217,6 +221,7 @@ impl Registry {
                         crate::log_info!("collector {name} recovered: {:?}", s);
                         e.support = s;
                         e.consecutive_failures = 0;
+                        e.retry_after_ms = 0;
                     }
                     _ => {
                         e.retry_after_ms = now_mono + QUARANTINE_RETRY_MS;
@@ -246,6 +251,13 @@ impl Registry {
                             .unwrap_or(Support::Unsupported { reason: "probe panicked".into() });
                         e.support = s;
                         e.consecutive_failures = 0;
+                        // A driver may still be absent during the immediate probe.
+                        // Keep a bounded retry path instead of disabling it forever.
+                        e.retry_after_ms = if e.support.is_usable() {
+                            0
+                        } else {
+                            now_mono + QUARANTINE_RETRY_MS
+                        };
                     } else {
                         e.consecutive_failures += 1;
                         crate::log_warn!("collector {name} failed ({}/{QUARANTINE_AFTER}): {err}", e.consecutive_failures);
@@ -286,6 +298,7 @@ impl Registry {
     pub fn set_enabled(&mut self, name: &str, enabled: bool) -> bool {
         for e in self.entries.iter_mut() {
             if e.c.name() == name {
+                e.retry_after_ms = 0;
                 e.support = if enabled {
                     e.consecutive_failures = 0;
                     catch_unwind(AssertUnwindSafe(|| e.c.probe()))
