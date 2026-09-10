@@ -207,3 +207,32 @@ not look like a stalled daemon.
 The hwmon-numbering point is a real hazard on Ubuntu: `hwmon4` is the NVMe today and may
 be `hwmon6` after the next kernel. Sensors are resolved by reading every `hwmon*/name`
 at probe time and matching on the driver name plus the `tempN_label`.
+
+
+## Collector-owned event descriptors
+
+Most collectors are polled at their tier. A few need to react the moment something
+happens, and Bluetooth is the case that forced the mechanism: a headset that drops and
+reconnects inside one sampling interval is completely invisible to polling, and that
+is exactly the fault people complain about.
+
+So `Collector` grew one optional method:
+
+```rust
+fn event_fd(&self) -> Option<RawFd> { None }
+```
+
+After registration the daemon collects these, adds each to the same epoll set as the
+journal and netlink sockets under `TOK_COLLECTOR_BASE + i`, and dispatches
+`ExternalEvent::CollectorReadable { name }` when one becomes readable. The collector
+drains its own descriptor; the daemon never interprets the bytes. There is still one
+thread and one event loop.
+
+The Bluetooth collector holds **two** system-bus connections, which is deliberate.
+`call()` reads the socket directly while `try_read_messages()` reads through an
+internal buffer; sharing one connection between them corrupts message framing the
+moment a signal interleaves a reply. One socket is non-blocking and watched by epoll
+purely as a wake-up, its messages drained and discarded; the other is blocking with a
+two-second timeout and used for `GetManagedObjects`. Because the state is always
+re-read authoritatively after a wake-up, a dropped or malformed signal costs latency
+and never correctness.

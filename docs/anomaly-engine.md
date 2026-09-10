@@ -251,3 +251,49 @@ The journal is the noisiest source on any Linux laptop, so it is filtered three 
    (ACPI `BIOS bug` notices, `ACPI Error: ... _PSS`, expected `iwlwifi`/`rtw89` debug
    resets, `psmouse` probe noise) are shipped as a default suppression list, editable in
    the UI. Identical messages are additionally collapsed with a 300 s window and a count.
+
+
+## Bluetooth rules
+
+Two rules, and the split between them is the point.
+
+| Rule | Severity | Fires when |
+|---|---|---|
+| `bluetooth.disconnected` | Notice | a connected device dropped in the last 120 s |
+| `bluetooth.flapping` | Warning | the same device dropped 3+ times in 15 minutes |
+
+A device that drops repeatedly is a fault; a device that drops once is usually the
+user switching it off. Reporting both at the same level would bury the first in the
+second, so flapping supersedes the individual notice for that device rather than
+firing alongside it.
+
+### An event is not a state
+
+Every other rule here describes a condition that is true for as long as it is true —
+a disk is full until it is not. A disconnect is instantaneous, and an alert that is
+raised and withdrawn between two evaluations is never seen. So the disconnect rule
+holds itself firing for 120 s after the event and then lets the normal resolution
+hysteresis take over.
+
+That hold is computed on the **monotonic** clock. Events carry two stamps: wall clock
+for display and history, monotonic for every age and window comparison. Mixing them
+was a real defect — the rule engine runs on the monotonic clock, so an age taken
+against a wall-clock stamp came out around minus 1.8 billion seconds, which read as
+"comfortably inside the hold window" and left the alert open forever. An alert that
+never resolves also never re-notifies, so the visible symptom was silence.
+`wall_clock_and_monotonic_stamps_are_not_mixed` is the regression test.
+
+### Where the cause comes from
+
+In order of precedence:
+
+1. **What BlueZ said.** A translated bluetoothd log line ("Host is down" becomes
+   "the device is not responding — it is probably switched off, asleep or out of
+   range"). This is the stack reporting a fact.
+2. **A precondition that actually held** at the moment of the drop: rfkill, adapter
+   powered down, a resume within 30 s, a bluetoothd restart, the radio USB-suspended.
+3. **Nothing.** Stated as "reason not observable", with the observed radio state
+   still listed as evidence.
+
+Coexistence is the one hypothesis offered, and it is worded as one, because it cannot
+be confirmed from userspace.

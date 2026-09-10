@@ -424,6 +424,58 @@ jamsys --json stats | grep dbus_signals
 
 ---
 
+## Bluetooth keeps disconnecting
+
+JamSys now names the device and the time of every drop, and escalates to a warning
+when the same device drops three times in fifteen minutes. Open **Devices**, or read
+it from the shell:
+
+```bash
+jamsys --json snapshot | python3 -c 'import json,sys,datetime; b=json.load(sys.stdin)["snapshot"]["bluetooth"]; [print(datetime.datetime.fromtimestamp(e["at_ms"]/1000).strftime("%H:%M:%S"), e["kind"], e["name"], e["likely_cause"]) for e in b["events"]]'
+```
+
+### Why it does not always say why
+
+The kernel does not expose an HCI disconnect reason to an unprivileged process, so
+JamSys reports what it could observe and says "reason not observable" rather than
+guessing. Note that `journalctl` will not help either: BlueZ logs nothing at all for
+a clean disconnect. It does log failures to *re*connect, and those are translated
+into plain language.
+
+### The two things worth fixing first
+
+Both are reported as risk notes on the alert when they apply.
+
+**USB autosuspend on the Bluetooth radio** is the most common cause of dropouts on
+Realtek combo adapters. Check it:
+
+```bash
+for d in /sys/bus/usb/devices/*/; do grep -qi bluetooth "$d/product" 2>/dev/null && echo "$d $(cat $d/power/control) suspended_for=$(cat $d/power/runtime_suspended_time)ms"; done
+```
+
+If it says `auto`, disable it for that device with a udev rule:
+
+```bash
+echo 'ACTION=="add", SUBSYSTEM=="usb", ATTR{product}=="*Bluetooth*", TEST=="power/control", ATTR{power/control}="on"' | sudo tee /etc/udev/rules.d/50-bluetooth-no-autosuspend.rules
+```
+
+**Wi-Fi power save**, on a combo Wi-Fi/Bluetooth chip, adds coexistence pressure:
+
+```bash
+iw dev "$(ls /sys/class/net | grep -m1 wl)" get power_save
+```
+
+Turning it off costs a little battery and often ends the dropouts:
+
+```bash
+sudo iw dev "$(ls /sys/class/net | grep -m1 wl)" set power_save off
+```
+
+### "Host is down" / page timeout when reconnecting
+
+The headset is not answering. It has usually powered itself off or gone to standby;
+switch it off and on again rather than retrying from the computer.
+
 ## Keyboard lighting
 
 ### The controls are greyed out

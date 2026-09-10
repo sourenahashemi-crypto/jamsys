@@ -15,6 +15,7 @@ pub fn register_all(reg: &mut Registry, cfg: &Config) {
     reg.add(Box::new(collectors::storage::StorageCollector::new()), cfg);
     reg.add(Box::new(collectors::services::ServiceCollector::new()), cfg);
     reg.add(Box::new(collectors::devices::DeviceCollector::new()), cfg);
+    reg.add(Box::new(collectors::bluetooth::BluetoothCollector::new()), cfg);
     reg.add(Box::new(collectors::process::ProcCollector::new()), cfg);
     reg.add(Box::new(collectors::inventory::InventoryCollector::new()), cfg);
     reg.add(Box::new(collectors::keyboard::KeyboardCollector::new()), cfg);
@@ -86,6 +87,9 @@ pub struct Daemon {
     journal: Option<JournalStream>,
     nl_route: Option<NetlinkSocket>,
     nl_uevent: Option<NetlinkSocket>,
+    /// Collector names indexed by `TOK_COLLECTOR_BASE + i`, for collectors that own
+    /// an event fd and are woken by it rather than by their sampling tier.
+    collector_fds: Vec<&'static str>,
     /// The GNOME Shell widget's D-Bus surface. Optional: no session bus is a normal
     /// condition for a daemon started outside a graphical session.
     dbus: Option<DbusService>,
@@ -192,6 +196,20 @@ impl Daemon {
             }
         }
 
+        // Collectors that can be woken by their own fd rather than waiting for a
+        // sampling tier. Bluetooth is the reason this exists: a headset that drops
+        // and reconnects inside one sampling interval is invisible to polling.
+        let mut collector_fds: Vec<&'static str> = Vec::new();
+        for (name, fd) in reg.event_fds() {
+            let tok = TOK_COLLECTOR_BASE + collector_fds.len() as u64;
+            if el.add(fd, tok).is_ok() {
+                collector_fds.push(name);
+                log_info!("collector {name} is event-driven on fd {fd}");
+            } else {
+                log_warn!("could not watch {name}'s event fd; it will poll instead");
+            }
+        }
+
         let rules = RuleEngine::new(&cfg);
         let alerts = jamsys::anomaly::alerts::AlertManager::new(&cfg, &store);
         let now_mono = clock::mono_ms();
@@ -217,6 +235,7 @@ impl Daemon {
             journal,
             nl_route,
             nl_uevent,
+            collector_fds,
             dbus,
             sched: Scheduler::new(now_mono),
             suspend: clock::SuspendWatch::new(),
@@ -279,6 +298,9 @@ impl Daemon {
                     TOK_NETLINK_ROUTE => self.handle_netlink_route(),
                     TOK_NETLINK_UEVENT => self.handle_netlink_uevent(),
                     TOK_DBUS => self.handle_dbus(),
+                    t if t >= TOK_COLLECTOR_BASE && t < TOK_CLIENT_BASE => {
+                        self.handle_collector_fd(t)
+                    }
                     TOK_IPC_LISTEN => {
                         for (tok, fd) in self.ipc.accept() {
                             if self.el.add(fd, tok).is_err() {
@@ -587,6 +609,12 @@ impl Daemon {
             if self.cfg.journal_ignore.iter().any(|g| jamsys::util::glob_match(g, &e.message)) {
                 continue;
             }
+            // Collectors see the real entry. They are given it before classification,
+            // because a line the daemon's own rules do not recognise can still be the
+            // one a collector was waiting for -- bluetoothd's "Host is down" is not a
+            // classified kind, but it is the only place the reason for a failed
+            // reconnect ever appears.
+            self.reg.dispatch_event(&ExternalEvent::Journal(e.clone()), &mut ctx);
             let Some(c) = journal::classify(&e.message) else {
                 // Unclassified warnings are still worth recording as events, but they
                 // never become alerts. This is what keeps the journal from being a
@@ -654,10 +682,22 @@ impl Daemon {
                 }
             }
         }
-        self.reg.dispatch_event(&ExternalEvent::Journal(Default::default()), &mut ctx);
         for e in ctx.events.drain(..) {
             let _ = self.store.insert_event(&e);
         }
+    }
+
+    /// A collector's own fd became readable. The collector drains it and refreshes
+    /// its own state; the daemon does not interpret the bytes.
+    fn handle_collector_fd(&mut self, tok: u64) {
+        let idx = (tok - TOK_COLLECTOR_BASE) as usize;
+        let Some(name) = self.collector_fds.get(idx).copied() else { return };
+        let mut ctx = Ctx::new(self.cfg.clone());
+        ctx.snap = self.snap.clone();
+        self.reg
+            .dispatch_event(&ExternalEvent::CollectorReadable { name }, &mut ctx);
+        self.flush_ctx_events(&mut ctx);
+        self.snap = ctx.snap;
     }
 
     fn handle_netlink_route(&mut self) {

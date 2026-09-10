@@ -114,14 +114,42 @@ jamsys-cluster --decorated              # keep a title bar
 jamsys-cluster --reset                  # forget remembered settings
 ```
 
+#### The cut-out cluster
+
+The default face has no housing: three dials sit directly on the wallpaper with one
+slim capsule for the readings that are not dials. The rectangular panel had been doing
+two jobs — grouping the instruments, and giving them a legible ground. Grouping three
+objects in a row is unnecessary. A legible ground is not, so each dial gets a soft
+halo instead: six concentric translucent rings, because Cairo has no blur. It was
+reviewed over a light wallpaper as well as a dark one, which is where a cut-out design
+actually fails.
+
+There is no permanent header. A gadget that displays its own name at all times is
+wasting the space; the name is replaced by an alert pill that appears only when
+something is wrong.
+
+`--housing` brings the old panel back, and the right-click menu has the same toggle.
+
+**Clicks fall through the gaps.** With no panel there is no rectangle to click, so the
+window's input region is cut down to the dials and the capsule
+(`bareHitRegions()` -> `Gdk.Surface.set_input_region()`). Verified with
+`XShapeGetRectangles(..., ShapeInput, ...)`, which reports six rectangles rather than
+one; `xwininfo -shape` will not show this, as it reports the bounding shape only.
+Without it an invisible box would swallow clicks meant for the window underneath,
+which is the usual complaint about desktop widgets.
+
 #### Size
 
-The default is scale 1.3 (546x250 px), not 1.0. At 1.0 the main dials are readable but
+The default is scale 1.3 (546x229 px in cut-out mode), not 1.0. At 1.0 the main dials are readable but
 the secondary numerals are not, on a 1920x1200 laptop panel at a normal viewing
 distance — which is the whole point of a gadget you glance at.
 
-It resizes by **scroll wheel**, by `+` / `-`, and from the right-click menu's four
-presets; `0` returns to the default. Scale is clamped to 0.6-4.0. The window is freely
+It resizes by **scroll wheel**, by `+` / `-`, and by **Ctrl+drag** anywhere on the
+face — free transform, rather than a ladder of fixed sizes. `0` returns to the
+default and scale is clamped to 0.6-4.0. The drag gesture runs in the *capture* phase
+because the whole face is a `Gtk.WindowHandle`, which would otherwise claim the drag
+for moving the window before the gesture saw it; it denies the sequence immediately
+unless Ctrl is held, so an ordinary drag still moves the gadget. The window is freely
 resizable, so its aspect will rarely match the instruments exactly; `drawCluster`
 scales to fit and **centres**, letterboxing inside the housing, because anchoring the
 instruments to a corner of their own housing looks like a bug.

@@ -71,6 +71,7 @@ impl RuleEngine {
         self.network_rules(snap, cfg, now_ms, &mut out);
         self.service_rules(snap, cfg, now_ms, &mut out);
         self.device_rules(snap, cfg, now_ms, &mut out);
+        self.bluetooth_rules(snap, cfg, now_ms, &mut out);
         self.learned_rules(snap, cfg, now_ms, &mut out);
         Evaluation { alerts: out, firing: self.firing.clone() }
     }
@@ -527,6 +528,98 @@ impl RuleEngine {
 
     // ---- Layer 2 ---------------------------------------------------------
 
+    /// Bluetooth disconnects.
+    ///
+    /// A disconnect is an *event*, but alerts are *states*, so each one is held
+    /// firing for a short window and then allowed to resolve on its own. Without
+    /// that, the alert would appear and vanish between two evaluations and the user
+    /// would never see the notification they asked for.
+    fn bluetooth_rules(&mut self, s: &Snapshot, cfg: &Config, now: i64, out: &mut Vec<Alert>) {
+        let bt = &s.bluetooth;
+        if !bt.bluez_available {
+            return;
+        }
+        // How long a disconnect keeps the alert open.
+        let hold_ms = cfg.threshold("bluetooth.disconnect.hold", "seconds", 120.0) as i64 * 1000;
+        let flap_min = cfg.threshold("bluetooth.flap.count", "disconnects", 3.0) as u32;
+
+        // Flapping first: when a device is dropping repeatedly, that is the real
+        // finding and a single-drop notice would only bury it.
+        for (name, count) in bt.recent_disconnects.iter() {
+            if *count < flap_min {
+                continue;
+            }
+            let mins = crate::collectors::bluetooth::FLAP_WINDOW_MS / 60_000;
+            let last = bt
+                .events
+                .iter()
+                .rev()
+                .find(|e| &e.name == name && e.kind == crate::collectors::bluetooth::BtEventKind::Disconnected);
+            let mut ex = Explanation::new(format!(
+                "{name} has disconnected {count} times in the last {mins} minutes."
+            ))
+            .expected("a stable link stays connected".to_string())
+            .evidence("Disconnects", format!("{count} in {mins} min"));
+            if let Some(e) = last {
+                ex = ex.evidence("Radio power state", radio_phrase(&e.context));
+                if let Some(c) = bt.last_stack_error.as_ref().or(e.likely_cause.as_ref()) {
+                    ex = ex.cause(c.clone());
+                }
+            }
+            for note in &bt.risk_notes {
+                ex = ex.action(note.clone());
+            }
+            self.fire(out, Alert::new("bluetooth.flapping", name, Severity::Warning,
+                format!("{name} keeps disconnecting"), ex));
+        }
+
+        // Single disconnects, for devices that are not already reported as flapping.
+        for e in bt.events.iter().rev() {
+            if e.kind != crate::collectors::bluetooth::BtEventKind::Disconnected
+                || now - e.at_mono_ms > hold_ms
+            {
+                continue;
+            }
+            if bt.recent_disconnects.get(&e.name).copied().unwrap_or(0) >= flap_min {
+                continue;
+            }
+            let still_gone = bt
+                .devices
+                .iter()
+                .find(|d| d.address == e.address)
+                .map(|d| !d.connected)
+                .unwrap_or(true);
+            let what = if still_gone {
+                format!("{} disconnected and has not come back.", e.name)
+            } else {
+                format!("{} disconnected, then reconnected.", e.name)
+            };
+            let mut ex = Explanation::new(what)
+                .since((now - e.at_mono_ms) / 1000)
+                .evidence("Device", format!("{} ({})", e.name, e.address))
+                .evidence("Radio power state", radio_phrase(&e.context));
+            // BlueZ's own complaint, when it made one, outranks an inferred cause:
+            // it is the stack reporting what happened rather than us correlating.
+            match bt.last_stack_error.as_ref().or(e.likely_cause.as_ref()) {
+                Some(c) => ex = ex.cause(c.clone()),
+                // Saying so beats leaving a blank where a reason should be.
+                None => {
+                    ex = ex.evidence(
+                        "Reason",
+                        "not observable — the kernel does not expose an HCI \
+                         disconnect reason to an unprivileged process"
+                            .to_string(),
+                    )
+                }
+            }
+            for note in &bt.risk_notes {
+                ex = ex.action(note.clone());
+            }
+            self.fire(out, Alert::new("bluetooth.disconnected", &e.name, Severity::Notice,
+                format!("{} disconnected", e.name), ex));
+        }
+    }
+
     fn learned_rules(&mut self, s: &Snapshot, cfg: &Config, now: i64, out: &mut Vec<Alert>) {
         // Abnormal idle power — the worked example from the specification.
         if s.power.has_battery && s.idle && s.power.power_w > 0.0 {
@@ -750,6 +843,185 @@ mod tests {
         // Two passes: one to start the dwell, one after it has elapsed.
         e.evaluate(s, c, start);
         e.evaluate(s, c, start + secs * 1000).alerts
+    }
+
+    // ---- Bluetooth --------------------------------------------------
+
+    use crate::collectors::bluetooth::{BtContext, BtDevice, BtEvent, BtEventKind, BtState};
+
+    fn bt_snap(events: Vec<BtEvent>, connected: bool) -> Snapshot {
+        let mut s = snap();
+        let mut recent = std::collections::BTreeMap::new();
+        for e in events.iter().filter(|e| e.kind == BtEventKind::Disconnected) {
+            *recent.entry(e.name.clone()).or_insert(0u32) += 1;
+        }
+        s.bluetooth = BtState {
+            bluez_available: true,
+            adapter_powered: true,
+            connected_count: usize::from(connected),
+            devices: vec![BtDevice {
+                address: "D8:19:04:D9:D4:0E".into(),
+                name: "AXR100".into(),
+                icon: "audio-headset".into(),
+                paired: true,
+                connected,
+                battery: None,
+            }],
+            events,
+            recent_disconnects: recent,
+            risk_notes: vec!["USB autosuspend is enabled on the Bluetooth radio.".into()],
+            last_stack_error: None,
+        };
+        s
+    }
+
+    fn drop_event(at_ms: i64, cause: Option<&str>) -> BtEvent {
+        BtEvent {
+            at_ms,
+            at_mono_ms: at_ms,
+            kind: BtEventKind::Disconnected,
+            address: "D8:19:04:D9:D4:0E".into(),
+            name: "AXR100".into(),
+            context: BtContext {
+                adapter_powered: true,
+                radio_runtime_status: "suspended".into(),
+                radio_power_control: "auto".into(),
+                radio_suspended_recently: true,
+                ..Default::default()
+            },
+            likely_cause: cause.map(String::from),
+        }
+    }
+
+    #[test]
+    fn a_disconnect_raises_a_notice_naming_the_device() {
+        let mut e = RuleEngine::new(&cfg());
+        let now = 1_000_000;
+        let s = bt_snap(vec![drop_event(now - 5_000, Some("the radio was USB-autosuspended"))], false);
+        let alerts = e.evaluate(&s, &cfg(), now).alerts;
+        let a = alerts.iter().find(|a| a.rule_id == "bluetooth.disconnected")
+            .expect("a disconnect must be reported — this is the whole point");
+        assert!(a.title.contains("AXR100"), "the user needs the device name: {}", a.title);
+        assert_eq!(a.severity, Severity::Notice);
+        assert!(a.explanation.what.contains("has not come back"));
+        assert!(a.explanation.likely_cause.as_deref().unwrap().contains("autosuspend"));
+    }
+
+    #[test]
+    fn a_reconnect_is_described_differently_from_a_device_still_gone() {
+        let mut e = RuleEngine::new(&cfg());
+        let now = 1_000_000;
+        let s = bt_snap(vec![drop_event(now - 5_000, None)], true);
+        let alerts = e.evaluate(&s, &cfg(), now).alerts;
+        let a = alerts.iter().find(|a| a.rule_id == "bluetooth.disconnected").unwrap();
+        assert!(a.explanation.what.contains("then reconnected"), "{}", a.explanation.what);
+    }
+
+    #[test]
+    fn an_unexplained_drop_says_so_rather_than_leaving_a_blank() {
+        let mut e = RuleEngine::new(&cfg());
+        let now = 1_000_000;
+        let s = bt_snap(vec![drop_event(now - 5_000, None)], false);
+        let alerts = e.evaluate(&s, &cfg(), now).alerts;
+        let a = alerts.iter().find(|a| a.rule_id == "bluetooth.disconnected").unwrap();
+        assert!(a.explanation.likely_cause.is_none());
+        assert!(a.explanation.evidence.iter().any(|ev| ev.value.contains("not observable")),
+            "an unknown reason must be stated explicitly");
+    }
+
+    #[test]
+    fn an_old_disconnect_stops_firing_so_the_alert_can_resolve() {
+        let mut e = RuleEngine::new(&cfg());
+        let now = 1_000_000;
+        let s = bt_snap(vec![drop_event(now - 600_000, None)], true);
+        let alerts = e.evaluate(&s, &cfg(), now).alerts;
+        assert!(!alerts.iter().any(|a| a.rule_id == "bluetooth.disconnected"),
+            "a ten-minute-old event must not hold the alert open forever");
+    }
+
+    #[test]
+    fn repeated_drops_escalate_to_a_flapping_warning() {
+        let mut e = RuleEngine::new(&cfg());
+        let now = 1_000_000;
+        let s = bt_snap(
+            vec![drop_event(now - 400_000, None), drop_event(now - 200_000, None),
+                 drop_event(now - 5_000, Some("the radio was USB-autosuspended"))],
+            true,
+        );
+        let alerts = e.evaluate(&s, &cfg(), now).alerts;
+        let f = alerts.iter().find(|a| a.rule_id == "bluetooth.flapping")
+            .expect("three drops in the window is the actual finding");
+        assert_eq!(f.severity, Severity::Warning);
+        assert!(f.title.contains("keeps disconnecting"));
+        assert!(f.explanation.what.contains("3 times"));
+        // and it must not also emit a single-drop notice, which would bury it
+        assert!(!alerts.iter().any(|a| a.rule_id == "bluetooth.disconnected"),
+            "flapping supersedes the individual notice");
+    }
+
+    #[test]
+    fn the_known_misconfiguration_is_offered_as_an_action() {
+        let mut e = RuleEngine::new(&cfg());
+        let now = 1_000_000;
+        let s = bt_snap(vec![drop_event(now - 5_000, None)], false);
+        let alerts = e.evaluate(&s, &cfg(), now).alerts;
+        let a = alerts.iter().find(|a| a.rule_id == "bluetooth.disconnected").unwrap();
+        assert!(a.explanation.actions.iter().any(|x| x.contains("autosuspend")));
+    }
+
+    #[test]
+    fn bluez_own_error_outranks_an_inferred_cause() {
+        // When the stack says why, that beats our correlation. Verified against the
+        // line this machine actually logs: "Host is down (112)".
+        let mut e = RuleEngine::new(&cfg());
+        let now = 1_000_000;
+        let mut s = bt_snap(vec![drop_event(now - 5_000, Some("the radio was USB-autosuspended"))], false);
+        s.bluetooth.last_stack_error =
+            Some("the device is not responding — it is probably switched off".into());
+        let a = e.evaluate(&s, &cfg(), now).alerts.into_iter()
+            .find(|a| a.rule_id == "bluetooth.disconnected").unwrap();
+        assert!(a.explanation.likely_cause.as_deref().unwrap().contains("not responding"),
+            "BlueZ's own reason must win over the inferred one");
+    }
+
+    #[test]
+    fn wall_clock_and_monotonic_stamps_are_not_mixed() {
+        // Regression. Events carry a wall-clock stamp (~1.7e12) for display and a
+        // monotonic one (~1e6) for windowing; the rule engine runs on the monotonic
+        // clock. Subtracting the wrong one gave a hugely negative age, which read as
+        // "always inside the hold window" and left the alert open forever.
+        let mut e = RuleEngine::new(&cfg());
+        let now_mono = 1_000_000;
+        let wall = 1_757_400_000_000i64;
+        let mut ev = drop_event(wall, None);
+        ev.at_mono_ms = now_mono - 600_000; // ten minutes ago on the real clock
+        let s = bt_snap(vec![ev], true);
+        let alerts = e.evaluate(&s, &cfg(), now_mono).alerts;
+        assert!(
+            !alerts.iter().any(|a| a.rule_id == "bluetooth.disconnected"),
+            "a ten-minute-old drop must not still be firing"
+        );
+
+        let mut ev2 = drop_event(wall, None);
+        ev2.at_mono_ms = now_mono - 5_000;
+        let s2 = bt_snap(vec![ev2], true);
+        let a = e
+            .evaluate(&s2, &cfg(), now_mono)
+            .alerts
+            .into_iter()
+            .find(|a| a.rule_id == "bluetooth.disconnected")
+            .expect("a five-second-old drop is still current");
+        assert_eq!(a.explanation.since_s, 5, "age must be computed on one clock");
+    }
+
+    #[test]
+    fn nothing_is_reported_when_bluez_is_absent() {
+        let mut e = RuleEngine::new(&cfg());
+        let mut s = bt_snap(vec![drop_event(999_000, None)], false);
+        s.bluetooth.bluez_available = false;
+        let alerts = e.evaluate(&s, &cfg(), 1_000_000).alerts;
+        assert!(!alerts.iter().any(|a| a.rule_id.starts_with("bluetooth.")),
+            "without BlueZ there is no per-device truth to report");
     }
 
     #[test]
@@ -976,4 +1248,24 @@ mod tests {
         assert!(!is_learnable("cpu", "procs_total"), "counting processes is not a distribution");
         assert!(!is_learnable("memory", "total_bytes"), "a constant is not worth learning");
     }
+}
+
+/// One short phrase describing the radio's power state at a disconnect, for the
+/// evidence list. Kept human: "USB-autosuspended" means something to a reader,
+/// "runtime_status=suspended" does not.
+fn radio_phrase(c: &crate::collectors::bluetooth::BtContext) -> String {
+    if c.rfkill_hard {
+        return "hard-blocked".into();
+    }
+    if c.rfkill_soft {
+        return "soft-blocked".into();
+    }
+    if c.radio_runtime_status == "suspended" || c.radio_suspended_recently {
+        return "USB-autosuspended around the drop".into();
+    }
+    if c.radio_runtime_status.is_empty() {
+        return "unknown".into();
+    }
+    format!("{} (autosuspend {})", c.radio_runtime_status,
+        if c.radio_power_control == "auto" { "allowed" } else { "off" })
 }
