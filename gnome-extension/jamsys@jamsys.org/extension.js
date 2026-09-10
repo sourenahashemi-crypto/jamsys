@@ -277,10 +277,13 @@ export default class JamSysExtension extends Extension {
                 reactive: true,
                 child: this._widget,
             });
+            // addChrome takes only affectsStruts and trackFullscreen; it manages the
+            // input region itself, and GNOME 50 rejects the extra key outright rather
+            // than ignoring it. affectsStruts:false keeps the cluster from reserving
+            // screen space, trackFullscreen:true hides it under fullscreen windows.
             Main.layoutManager.addChrome(this._floating, {
-                trackFullscreen: true,
                 affectsStruts: false,
-                affectsInputRegion: true,
+                trackFullscreen: true,
             });
             this._monitorId = Main.layoutManager.connect('monitors-changed',
                                                          () => this._reposition());

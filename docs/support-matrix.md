@@ -93,7 +93,7 @@ Wired, running, and observed producing correct values on this machine.
 
 | Capability | What works | What does not, and why |
 |---|---|---|
-| **GNOME Shell cluster** | Everything short of being on screen: the full Cairo drawing (rendered to PNG in seven states and reviewed, including live against the running daemon), value mapping (22 tests), D-Bus proxy, live `StateChanged`, JSON parse, placement arithmetic, preferences (loads cleanly under stubs), and the module itself loading with every expected method present. | **It has never been displayed on the desktop.** GNOME Shell on Wayland will not load a *newly installed* extension without a session restart, and this session cannot be restarted. Everything except `addChrome()` actually putting the actor on screen is exercised. |
+| **GNOME Shell cluster** | Everything short of being on screen: the full Cairo drawing (rendered to PNG in seven states and reviewed, including live against the running daemon), value mapping (22 tests), D-Bus proxy, live `StateChanged`, JSON parse, placement arithmetic, preferences, and `enable()`/`disable()` run for real against strict stubs of GNOME 50's own API contracts in every mode and corner. | **It has never been displayed on the desktop.** GNOME Shell was, however, made to *load* it, which surfaced a genuine defect — `addChrome({affectsInputRegion})`, a key GNOME 50 rejects outright. That is fixed, and `tests/shell-api-test.js` now enforces the real parameter sets. The fix itself cannot be confirmed live: GJS caches the module, `ReloadExtension` is a stub, so it needs a logout. |
 | **Floating placement** | `Main.layoutManager.addChrome()`, the same mechanism as OSD popups — not a fake always-on-top window, which cannot work under Wayland. | Inherently a desktop gadget: floats above the wallpaper, can overlap a dock, hidden by fullscreen windows. Stated in the preferences dialog rather than left to be discovered. |
 | **Keyboard RGB control** | Capability detection, field-order readback, the full UI, argument validation (10 tests including injection attempts), correct exit codes, refusal when unprivileged. | **No colour has been written to hardware.** Every path is `root:root` and this environment has no usable `sudo`. See §3. |
 | **Bluetooth** | Adapter, address, rfkill, **count** of connections. | No device *names* or battery levels — needs BlueZ `ObjectManager` enumeration, which the minimal D-Bus client does not implement. |
@@ -141,10 +141,11 @@ never executed.
 
 ## 5. Known limitations
 
-1. **The Shell cluster has not been seen on the desktop.** The drawing itself *has*
-   been looked at — every state was rendered to PNG through the same code path, which
-   is how three layout defects were found and fixed — but a PNG is not a live actor in
-   a compositor. It is the first thing to check after a logout.
+1. **The Shell cluster has not been seen on the desktop.** The drawing *has* been
+   looked at — every state rendered to PNG through the same code path, which is how
+   three layout defects were found — and the Shell has been made to load the extension,
+   which is how a fourth defect (`affectsInputRegion`) was found. But a PNG is not a
+   live actor and a load is not a paint. It is the first thing to check after a logout.
 2. **Keyboard writes are unproven.** The most likely failure is a firmware that accepts
    mode 0 but not 1–3; try static first.
 3. **The window is heavy.** 110 MB PSS, dominated by the Python interpreter, PyGObject
@@ -198,13 +199,14 @@ matters: the dGPU draws 6.8 W awake, and the gate keeps JamSys from causing that
 
 ## 8. Tests
 
-**307 assertions, all passing.**
+**328 assertions, all passing.**
 
 ```
 jamsys-daemon   231 unit + 16 integration
 jamsys-helper     5 unit
 jamsys-kbd       10 unit   (every injection attempt is a named test)
-extension          23 panel-line + 22 gauge  +  live end-to-end against the daemon
+extension          23 panel-line + 22 gauge + 21 Shell-API contract
+                   +  live end-to-end against the running daemon
 cluster            7 states rendered to PNG and visually reviewed
 fault injection     5 safe scenarios executed on real hardware
 ```
