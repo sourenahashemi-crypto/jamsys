@@ -73,10 +73,28 @@ class JamSysCluster extends St.Widget {
         this._area.connect('repaint', a => this._repaint(a));
         this.add_child(this._area);
 
-        this.connect('button-press-event', () => {
-            this._ext.openApp(this._state?.alert_subsystem);
-            return Clutter.EVENT_STOP;
+        // Left-click used to open the main window. It should not: the gadget is
+        // something you glance at and drag around, and every stray click on it
+        // launching an application is the opposite of calm. Opening is now a
+        // deliberate act -- the right-click menu, or a double click.
+        this.connect('button-press-event', (_a, event) => {
+            if (event.get_button() === 3) {
+                this._showMenu();
+                return Clutter.EVENT_STOP;
+            }
+            if (event.get_button() === 1 && event.get_click_count() === 2) {
+                this._ext.openApp(this._state?.alert_subsystem);
+                return Clutter.EVENT_STOP;
+            }
+            return Clutter.EVENT_PROPAGATE;   // let the drag action have it
         });
+
+        // Drag to place it anywhere, not just the five preset corners. The drag
+        // action owns the pointer grab and only starts past Clutter's threshold,
+        // so a plain click is still a click.
+        this._drag = new Clutter.DragAction();
+        this._drag.connect('drag-end', () => this._onDragEnd());
+        this.add_action(this._drag);
         // Hover lifts the housing slightly, so it reads as a clickable object.
         this.connect('notify::hover', () => this._area.queue_repaint());
 
@@ -86,6 +104,64 @@ class JamSysCluster extends St.Widget {
         this.connect('scroll-event', (_a, event) => this._onScroll(event));
 
         this._resize();
+    }
+
+    /** Remember where it was dropped, and stop the corner logic overriding it. */
+    _onDragEnd() {
+        const [x, y] = this.get_position();
+        this._settings.set_int('custom-x', Math.round(x));
+        this._settings.set_int('custom-y', Math.round(y));
+        // Writing 'position' last: it is a rebuild key, so the widget is placed
+        // from the coordinates that are already stored.
+        this._settings.set_string('position', 'custom');
+    }
+
+    _showMenu() {
+        if (!this._menu) {
+            this._menu = new PopupMenu.PopupMenu(this, 0.5, St.Side.TOP);
+            this._menu.actor.add_style_class_name('jamsys-cluster-menu');
+
+            const open = new PopupMenu.PopupMenuItem('Open JamSys');
+            open.connect('activate', () => this._ext.openApp(this._state?.alert_subsystem));
+            this._menu.addMenuItem(open);
+
+            this._menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+
+            const bigger = new PopupMenu.PopupMenuItem('Bigger');
+            bigger.connect('activate', () => this._nudgeScale(1.15));
+            this._menu.addMenuItem(bigger);
+
+            const smaller = new PopupMenu.PopupMenuItem('Smaller');
+            smaller.connect('activate', () => this._nudgeScale(1 / 1.15));
+            this._menu.addMenuItem(smaller);
+
+            const reset = new PopupMenu.PopupMenuItem('Reset size and position');
+            reset.connect('activate', () => {
+                this._settings.set_double('scale', 1.0);
+                this._settings.set_int('custom-x', -1);
+                this._settings.set_int('custom-y', -1);
+                this._settings.set_string('position', 'top-right');
+            });
+            this._menu.addMenuItem(reset);
+
+            this._menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+
+            const prefs = new PopupMenu.PopupMenuItem('Preferences');
+            prefs.connect('activate', () => this._ext.openPreferences());
+            this._menu.addMenuItem(prefs);
+
+            Main.uiGroup.add_child(this._menu.actor);
+            this._menu.actor.hide();
+            this._menuManager = new PopupMenu.PopupMenuManager(this);
+            this._menuManager.addMenu(this._menu);
+        }
+        this._menu.toggle();
+    }
+
+    _nudgeScale(factor) {
+        const cur = this._settings.get_double('scale');
+        const next = Math.max(SCALE_MIN, Math.min(SCALE_MAX, cur * factor));
+        this._settings.set_double('scale', Math.round(next * 1000) / 1000);
     }
 
     /** Scroll up grows, scroll down shrinks; the setting is the single source. */
@@ -276,7 +352,8 @@ export default class JamSysExtension extends Extension {
         // only changes its appearance just repaints.
         this._rebuildIds = ['mode', 'position', 'style'].map(k =>
             this._settings.connect(`changed::${k}`, () => this._rebuild()));
-        this._redrawIds = ['scale', 'opacity', 'margin', 'show-cpu', 'show-temp',
+        this._redrawIds = ['scale', 'opacity', 'margin', 'custom-x', 'custom-y',
+                           'show-cpu', 'show-temp',
                            'show-ram', 'show-gpu', 'show-power', 'show-net',
                            'dim-when-healthy'].map(k =>
             this._settings.connect(`changed::${k}`, () => this._restyle()));
@@ -288,6 +365,11 @@ export default class JamSysExtension extends Extension {
     }
 
     disable() {
+        if (this._widget?._menu) {
+            this._widget._menu.destroy();
+            this._widget._menu = null;
+            this._widget._menuManager = null;
+        }
         if (this._watchId) {
             Gio.bus_unwatch_name(this._watchId);
             this._watchId = 0;
@@ -391,6 +473,23 @@ export default class JamSysExtension extends Extension {
         const m = this._settings.get_int('margin');
         const [w, h] = this._floating.get_size();
         const pos = this._settings.get_string('position');
+
+        // A dragged widget keeps where it was dropped. Clamped to the monitor so a
+        // drop near an edge -- or a later change of resolution, or growing the
+        // widget past the edge with the scroll wheel -- can never strand it
+        // off-screen where it cannot be dragged back.
+        if (pos === 'custom') {
+            const cx = this._settings.get_int('custom-x');
+            const cy = this._settings.get_int('custom-y');
+            if (cx >= 0 || cy >= 0) {
+                const x = Math.max(mon.x, Math.min(cx, mon.x + mon.width - w));
+                const y = Math.max(mon.y + Main.panel.height,
+                                   Math.min(cy, mon.y + mon.height - h));
+                this._floating.set_position(x, y);
+                return;
+            }
+        }
+
         const top = pos.startsWith('top');
         // The panel is only in the way for top placements.
         const topInset = top ? Main.panel.height + m : m;

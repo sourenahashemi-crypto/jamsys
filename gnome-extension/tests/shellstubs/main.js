@@ -37,6 +37,12 @@ export const layoutManager = {
     disconnect() {},
 };
 
+export const uiGroup = {
+    _children: [],
+    add_child(c) { this._children.push(c); },
+    remove_child(c) { this._children = this._children.filter(x => x !== c); },
+};
+
 export const panel = {
     height: 32,
     statusArea: {},

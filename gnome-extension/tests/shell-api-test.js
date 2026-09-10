@@ -21,7 +21,7 @@ const ok = (c, what, extra = '') => {
 function fakeSettings(overrides = {}) {
     const v = {
         position: 'bottom-right', mode: 'cluster', style: 'cutout',
-        scale: 1.0, opacity: 0.92, margin: 14,
+        scale: 1.0, opacity: 0.92, margin: 14, 'custom-x': -1, 'custom-y': -1,
         'show-cpu': true, 'show-temp': true, 'show-ram': true, 'show-gpu': true,
         'show-power': true, 'show-net': true, 'dim-when-healthy': true, ...overrides,
     };
@@ -37,6 +37,7 @@ function fakeSettings(overrides = {}) {
         get_double: k => v[k], get_int: k => v[k],
         get_boolean: k => v[k], set_string(k, x) { v[k] = x; },
         set_double(k, x) { v[k] = x; },
+        set_int(k, x) { v[k] = x; },
         connect: () => 1, disconnect() {},
         _values: v,
     };
@@ -211,6 +212,75 @@ withCluster(fakeSettings({scale: 3.0}), (c, st) => {
 withCluster(fakeSettings({scale: 0.55}), (c, st) => {
     for (let i = 0; i < 20; i++) c._onScroll(scrollEvent(D.DOWN));
     ok(st._values.scale >= 0.55, 'never drops below the schema minimum', `got ${st._values.scale}`);
+});
+
+
+/* ------------------------------------------------- clicking and dragging */
+/* Every click used to launch the main window. On a gadget you glance at and
+ * shove around the screen, that is the opposite of calm: opening has to be
+ * something you ask for. */
+
+print('\nclicking does not hijack');
+withCluster(fakeSettings(), (c, st) => {
+    let opened = 0;
+    c._ext = {openApp: () => { opened++; }};
+
+    ok(typeof c._showMenu === 'function', 'the cluster has its own menu');
+    ok(c._drag !== undefined, 'and a drag action for moving it');
+
+    ok(opened === 0, 'nothing has launched just by building the widget');
+
+    // right click -> menu, still nothing launches
+    c._showMenu();
+    ok(c._menu !== null && c._menu !== undefined, 'right click builds the menu');
+    ok(opened === 0, 'opening the menu does not open the main window either');
+
+    // the menu must offer the deliberate way in
+    const labels = c._menu.items.map(i => i.label && i.label.text).filter(Boolean);
+    ok(labels.includes('Open JamSys'), 'the menu offers Open JamSys', labels.join(', '));
+    ok(labels.some(l => l === 'Bigger') && labels.some(l => l === 'Smaller'),
+       'and size controls, for people who do not think to scroll');
+    ok(labels.some(l => l.startsWith('Reset size')),
+       'and a way back when it has been dragged somewhere silly');
+});
+
+// Fire the real button-press handler, which is the thing that was wrong.
+print('\nthe button-press handler itself');
+withCluster(fakeSettings(), c => {
+    let opened = 0;
+    c._ext = {openApp: () => { opened++; }, openPreferences: () => {}};
+    const ev = (button, clicks) => ({
+        get_button: () => button,
+        get_click_count: () => clicks,
+    });
+
+    const single = c.emitEvent('button-press-event', ev(1, 1));
+    ok(opened === 0, 'a single left click does NOT open the main window');
+    ok(single === false, 'and it propagates, so the drag action can have it',
+       String(single));
+
+    const dbl = c.emitEvent('button-press-event', ev(1, 2));
+    ok(opened === 1, 'a double left click does open it — deliberate, not accidental');
+    ok(dbl === true, 'and is consumed');
+
+    c.emitEvent('button-press-event', ev(3, 1));
+    ok(opened === 1, 'a right click still does not open it');
+    ok(c._menu, 'it opens the menu instead');
+
+    const middle = c.emitEvent('button-press-event', ev(2, 1));
+    ok(opened === 1, 'middle click does not open it either');
+    ok(middle === false, 'and is left alone');
+});
+
+print('\ndragging places it freely');
+withCluster(fakeSettings({position: 'top-right'}), (c, st) => {
+    c.set_position(640, 400);
+    c._onDragEnd();
+    ok(st._values['custom-x'] === 640 && st._values['custom-y'] === 400,
+       'where it was dropped is remembered',
+       `${st._values['custom-x']},${st._values['custom-y']}`);
+    ok(st._values.position === 'custom',
+       'and the corner logic is told to stop overriding it');
 });
 
 print(`\n${failures === 0 ? 'ALL PASS' : failures + ' FAILURE(S)'}`);

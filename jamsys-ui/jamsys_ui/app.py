@@ -917,6 +917,22 @@ class ProcessPage(Page):
             self.body.append(g)
 
 
+def _repo_script(name: str) -> str:
+    """Absolute path to a script in the source checkout, if we can find one.
+
+    A relative `./scripts/...` is useless in a message: it only works from inside
+    the tree, and this text is read from a window that could have been launched
+    from anywhere.
+    """
+    import os
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for base in (os.path.dirname(here), here):
+        cand = os.path.join(base, "scripts", name)
+        if os.path.isfile(cand):
+            return cand
+    return f"/path/to/jamsys/scripts/{name}"
+
+
 class HardwarePage(Page):
     """Hardware controls. Read-only monitoring is elsewhere; this page *changes* things,
     so every action here is explicit and reversible."""
@@ -1130,8 +1146,16 @@ class HardwarePage(Page):
         if control == "direct":
             return ("A udev rule has made the lighting attributes writable by your user, "
                     "so no privileged code is involved at all.")
-        return ("The lighting attributes are root-only and no control path is installed, "
-                "so these controls are read-only.")
+        # Saying "no control path is installed" told the user nothing they could
+        # act on. Give the exact command, with the absolute path, because the
+        # relative one only works from inside the source tree.
+        return ("The lighting attributes are root-only (kbd_rgb_mode is mode 0200) "
+                "and no write path is installed, so everything below is read-only.\n\n"
+                "Install the helper once — this is the whole fix:\n"
+                f"    sudo {_repo_script('install-privileged.sh')}\n"
+                "    systemctl --user restart jamsysd\n\n"
+                "It installs two small validated binaries and their Polkit actions. "
+                "Nothing runs as root afterwards.")
 
     def _control_subtitle(self, control):
         return {"helper": "jamsys-kbd via Polkit",

@@ -90,6 +90,30 @@ It floats above the desktop. It can overlap a dock, and it is hidden by fullscre
 windows. That is inherent to being a desktop gadget on GNOME, and it is stated in the
 preferences dialog rather than left to be discovered.
 
+### What clicking and dragging the corner widget do
+
+Every click used to open the main window. On something you glance at and shove
+around the desktop, that is the opposite of calm: a stray click launching an
+application is a bug, not a feature. Opening is now deliberate.
+
+| Gesture | Effect |
+|---|---|
+| Left drag | move it anywhere (`Clutter.DragAction`) |
+| Left click | nothing — the event propagates so the drag action can have it |
+| Double click | open the main window |
+| Right click | the widget's own menu: Open JamSys, Bigger, Smaller, Reset, Preferences |
+| Scroll | resize |
+
+Dragging stores the drop point in `custom-x`/`custom-y` and switches `position` to
+`custom`; the coordinates are written first, because `position` is a rebuild key.
+`_reposition()` then clamps the stored point to the monitor, so a drop near an edge
+— or growing the widget afterwards, or changing resolution — can never strand the
+gadget off-screen where it cannot be dragged back. "Reset size and position" puts
+it back in a corner.
+
+The menu is a `PopupMenu` the widget owns, because a chrome actor has no
+`PanelMenu.Button` to inherit one from, and it is destroyed with the widget.
+
 ### Resizing, on both surfaces
 
 Scroll resizes the cluster wherever it is drawn. The window has always had that; the

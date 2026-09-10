@@ -37,6 +37,15 @@
       <range min="0.35" max="1.0"/>
       <summary>Opacity of the cluster housing</summary>
     </key>
+    <key name="custom-x" type="i">
+      <default>-1</default>
+      <summary>Dragged position, x. -1 means never dragged.</summary>
+    </key>
+    <key name="custom-y" type="i">
+      <default>-1</default>
+      <summary>Dragged position, y. -1 means never dragged.</summary>
+    </key>
+
     <key name="margin" type="i">
       <default>14</default>
       <range min="0" max="120"/>
