@@ -37,6 +37,39 @@ shorter — normally `/run/user/$UID`.
 
 ---
 
+## I reinstalled, but nothing changed
+
+Check whether the *running process* is the binary you just installed. Replacing a file
+does not replace a running process, and the two look identical from the outside:
+
+```bash
+PID=$(systemctl --user show -p MainPID --value jamsysd)
+readlink /proc/$PID/exe
+```
+
+`/home/ronin/.local/bin/jamsysd (deleted)` means the process is still executing the old
+inode. Restart it:
+
+```bash
+systemctl --user restart jamsysd
+```
+
+`scripts/install-user.sh` now restarts unconditionally and prints which binary the
+daemon ended up on, because `systemctl enable --now` starts a stopped unit but does
+nothing at all to a running one.
+
+## The window does not open, "Message recipient disconnected"
+
+```
+Failed to register: GDBus.Error:org.freedesktop.DBus.Error.NoReply:
+Message recipient disconnected from message bus without replying
+```
+
+A previous instance was still releasing the application id when the new one tried to
+claim it — launching twice quickly, or relaunching right after closing. The application
+now retries registration a few times before giving up, so this should not be reachable;
+if it still appears, wait a second and launch again.
+
 ## The daemon will not start
 
 ```bash

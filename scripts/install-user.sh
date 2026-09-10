@@ -36,10 +36,24 @@ if [ -d "$EXT_SRC" ]; then
 fi
 
 systemctl --user daemon-reload
-systemctl --user enable --now jamsysd
+systemctl --user enable jamsysd
+# `enable --now` starts a stopped unit but does nothing to a running one, which on a
+# reinstall leaves the old process executing the replaced-and-now-deleted inode. The
+# files on disk look current while the running daemon is not, which is exactly the
+# kind of difference nobody thinks to check. Always restart.
+systemctl --user restart jamsysd
 echo "==> installed. Status:"
 systemctl --user --no-pager status jamsysd | head -8
 echo
+JD_PID="$(systemctl --user show -p MainPID --value jamsysd)"
+if [ -n "$JD_PID" ] && [ "$JD_PID" != "0" ]; then
+    if readlink "/proc/$JD_PID/exe" 2>/dev/null | grep -q '(deleted)'; then
+        echo "==> WARNING: the running daemon is still on a replaced binary"
+    else
+        echo "==> daemon is running the freshly installed binary (pid $JD_PID)"
+    fi
+fi
+
 echo "Open the interface with:  $PREFIX/bin/jamsys"
 if [ -d "$EXT_DST" ]; then
     echo
