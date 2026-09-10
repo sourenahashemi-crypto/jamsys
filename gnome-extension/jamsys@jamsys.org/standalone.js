@@ -30,7 +30,7 @@ import Gdk from 'gi://Gdk?version=4.0';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 
-import {drawCluster, drawClusterBare, bareHitRegions,
+import {drawCluster, drawClusterBare, drawUnavailable, bareHitRegions,
         CLUSTER_W, CLUSTER_H, BARE_W, BARE_H} from './gauges.js';
 
 const Cairo = imports.cairo;
@@ -237,6 +237,9 @@ let state = null;
 let area = null;
 let win = null;
 let proxy = null;
+let daemonWatch = 0;
+let daemonSignal = 0;
+let daemonGeneration = 0;
 let scale = opts.scale;
 let opacity = opts.opacity;
 let decorated = opts.decorated;
@@ -318,16 +321,7 @@ app.connect('activate', () => {
     area.set_draw_func((_a, cr, w, h) => {
         try {
             if (!state) {
-                cr.setSourceRGBA(0.03, 0.04, 0.05, 0.75);
-                cr.paint();
-                cr.selectFontFace('Ubuntu Sans Mono', 0, 1);
-                cr.setFontSize(12);
-                cr.setSourceRGBA(0.55, 0.60, 0.65, 1);
-                const msg = 'waiting for jamsysd …';
-                const e = cr.textExtents(msg);
-                cr.moveTo(w / 2 - e.width / 2, h / 2);
-                cr.showText(msg);
-                cr.newPath();
+                drawUnavailable(cr, w, h);
                 return;
             }
             if (bare) drawClusterBare(cr, w, h, state, {opacity});
@@ -454,6 +448,7 @@ app.connect('activate', () => {
     win.present();
     writePidFile();
     win.connect('close-request', () => {
+        stopDaemon();
         removePidFile();
         return false;   // let the close proceed
     });
@@ -787,19 +782,45 @@ function openApp() {
 /* ------------------------------------------------------------------ daemon */
 
 function connectDaemon() {
+    stopDaemon();
+    daemonWatch = Gio.bus_watch_name(
+        Gio.BusType.SESSION, BUS_NAME, Gio.BusNameWatcherFlags.NONE,
+        () => daemonAppeared(), () => disconnectDaemon());
+}
+
+function disconnectDaemon() {
+    daemonGeneration++;
+    if (proxy && daemonSignal) proxy.disconnectSignal(daemonSignal);
+    daemonSignal = 0;
+    proxy = null;
+    state = null;
+    area?.queue_draw();
+}
+
+function stopDaemon() {
+    if (daemonWatch) Gio.bus_unwatch_name(daemonWatch);
+    daemonWatch = 0;
+    disconnectDaemon();
+}
+
+function daemonAppeared() {
+    disconnectDaemon();
+    const generation = daemonGeneration;
     try {
         proxy = new Proxy(Gio.DBus.session, BUS_NAME, OBJECT_PATH);
     } catch (e) {
         printerr(`jamsys-cluster: cannot reach ${BUS_NAME}: ${e.message}`);
         printerr('  is the daemon running?  systemctl --user status jamsysd');
-        GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 3, () => {
-            connectDaemon();
-            return false;
-        });
         return;
     }
-    proxy.connectSignal('StateChanged', (_p, _s, [json]) => apply(json));
+    let pushed = false;
+    daemonSignal = proxy.connectSignal('StateChanged', (_p, _s, [json]) => {
+        if (generation !== daemonGeneration) return;
+        pushed = true;
+        apply(json);
+    });
     proxy.GetStateRemote(([json], err) => {
+        if (generation !== daemonGeneration || pushed) return;
         if (err) {
             printerr(`jamsys-cluster: GetState failed: ${err.message ?? err}`);
             return;

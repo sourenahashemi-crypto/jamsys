@@ -31,7 +31,7 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
 import {labelFor, normalLine, styleFor} from './format.js';
-import {drawCluster, drawClusterBare,
+import {drawCluster, drawClusterBare, drawUnavailable,
         CLUSTER_W, CLUSTER_H, BARE_W, BARE_H} from './gauges.js';
 
 /* Must match the range in the gschema, or set_double() is silently clamped by
@@ -229,9 +229,7 @@ class JamSysCluster extends St.Widget {
         const cr = area.get_context();
         try {
             if (!this._state) {
-                // Say nothing rather than draw meaningless zeroed instruments.
-                cr.setSourceRGBA(0.03, 0.04, 0.05, 0.75);
-                cr.paint();
+                drawUnavailable(cr, w, h);
                 return;
             }
             let opacity = this._settings.get_double('opacity');
@@ -313,6 +311,8 @@ class JamSysIndicator extends PanelMenu.Button {
         this._titleItem.label.text = 'The monitoring service is not running';
         this._detailItem.label.text = reason || '';
         this._expectedItem.label.text = 'systemctl --user start jamsysd';
+        this._detailItem.visible = true;
+        this._expectedItem.visible = true;
         this._ackItem.visible = false;
     }
 
@@ -363,6 +363,7 @@ export default class JamSysExtension extends Extension {
         this._signalId = 0;
         this._watchId = 0;
         this._lastState = null;
+        this._connectionGeneration = (this._connectionGeneration ?? 0) + 1;
 
         this._build();
 
@@ -383,20 +384,11 @@ export default class JamSysExtension extends Extension {
     }
 
     disable() {
-        if (this._widget?._menu) {
-            this._widget._menu.destroy();
-            this._widget._menu = null;
-            this._widget._menuManager = null;
-        }
         if (this._watchId) {
             Gio.bus_unwatch_name(this._watchId);
             this._watchId = 0;
         }
-        if (this._signalId && this._proxy) {
-            this._proxy.disconnectSignal(this._signalId);
-            this._signalId = 0;
-        }
-        this._proxy = null;
+        this._disconnect();
         for (const id of [...(this._rebuildIds ?? []), ...(this._redrawIds ?? [])])
             this._settings.disconnect(id);
         this._rebuildIds = this._redrawIds = null;
@@ -446,9 +438,18 @@ export default class JamSysExtension extends Extension {
 
         if (this._lastState)
             this._widget.setState(this._lastState);
+        else
+            this._widget.setUnavailable?.('Waiting for jamsysd.');
     }
 
     _teardown() {
+        // The popup lives in uiGroup, outside the widget's actor tree. Rebuilds
+        // must release it too, not only the extension's final disable().
+        if (this._widget?._menu) {
+            this._widget._menu.destroy();
+            this._widget._menu = null;
+            this._widget._menuManager = null;
+        }
         if (this._floating) {
             if (this._allocId) {
                 this._floating.disconnect(this._allocId);
@@ -522,18 +523,27 @@ export default class JamSysExtension extends Extension {
     /* -- daemon ------------------------------------------------------ */
 
     _connect() {
+        this._disconnect();
+        const generation = this._connectionGeneration;
         try {
             this._proxy = new JamSysProxy(Gio.DBus.session, BUS_NAME, OBJECT_PATH);
         } catch (e) {
             logError(e, 'JamSys: could not create the D-Bus proxy');
-            this._widget?.setUnavailable?.('Could not reach the monitoring service.');
+            this._onVanished();
             return;
         }
+        let pushed = false;
         this._signalId = this._proxy.connectSignal('StateChanged', (_p, _s, [json]) => {
+            if (generation !== this._connectionGeneration) return;
+            pushed = true;
             this._apply(json);
         });
         this._proxy.GetStateRemote(([json], err) => {
+            // Replies can arrive after disable/reconnect, or after a newer push.
+            if (generation !== this._connectionGeneration || pushed) return;
             if (err) {
+                this._lastState = null;
+                this._widget?.setState(null);
                 this._widget?.setUnavailable?.(String(err.message ?? err));
                 return;
             }
@@ -542,11 +552,19 @@ export default class JamSysExtension extends Extension {
     }
 
     _onVanished() {
-        this._proxy = null;
+        this._disconnect();
         this._lastState = null;
         this._widget?.setUnavailable?.('jamsysd is not running.');
         if (this._widget instanceof Cluster)
             this._widget.setState(null);
+    }
+
+    _disconnect() {
+        this._connectionGeneration++;
+        if (this._signalId && this._proxy)
+            this._proxy.disconnectSignal(this._signalId);
+        this._signalId = 0;
+        this._proxy = null;
     }
 
     _apply(json) {

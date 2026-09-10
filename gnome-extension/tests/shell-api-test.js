@@ -66,6 +66,9 @@ const MAP = {
     "gi://GObject": `${stubs}/gobject.js`,
 };
 for (const [a, b] of Object.entries(MAP)) src = src.replaceAll(`'${a}'`, `'file://${b}'`);
+// Keep the production callbacks, but control reply ordering without a real bus.
+src = src.replace('new JamSysProxy(', 'new (globalThis.__jamsysProxy ?? JamSysProxy)(');
+src = src.replace('Gio.DBus.session', '(globalThis.__jamsysProxy ? {} : Gio.DBus.session)');
 // Collect logError calls rather than letting them print. A passing test that emits a
 // scary JS ERROR teaches people to ignore test output.
 globalThis.__jamsysLogged = [];
@@ -313,6 +316,90 @@ withCluster(fakeSettings({position: 'top-right'}), (c, st) => {
        'and the corner logic is told to stop overriding it');
 });
 
+print('\nrebuilding destroys the old cluster menu');
+run('menu teardown', fakeSettings(), e => {
+    e._widget._showMenu();
+    const menu = e._widget._menu;
+    e._rebuild();
+    ok(menu.destroyed === true, 'the menu attached to uiGroup is destroyed on rebuild');
+    e._widget._showMenu();
+    const next = e._widget._menu;
+    e.disable();
+    ok(next.destroyed === true, 'the replacement menu is destroyed on disable');
+    // run() also disables; repeated teardown must be harmless.
+});
+
+print('\ndaemon loss releases its old signal subscription');
+run('proxy teardown', fakeSettings(), e => {
+    let disconnected = false;
+    e._proxy = {disconnectSignal(id) {
+        if (id !== 42) throw new Error('wrong signal id');
+        disconnected = true;
+    }};
+    e._signalId = 42;
+    e._onVanished();
+    ok(disconnected, 'vanished daemon proxy is disconnected');
+    ok(e._signalId === 0, 'signal id is cleared');
+});
+
+print('\nlate daemon replies cannot resurrect or roll back the display');
+run('reply ordering', fakeSettings(), e => {
+    const proxies = [];
+    globalThis.__jamsysProxy = class {
+        constructor() { proxies.push(this); }
+        connectSignal(name, callback) {
+            if (name !== 'StateChanged') throw new Error('unexpected signal');
+            this.signal = callback;
+            return 42;
+        }
+        disconnectSignal(id) {
+            if (id !== 42 || this.disconnected) throw new Error('invalid disconnect');
+            this.disconnected = true;
+        }
+        GetStateRemote(callback) { this.reply = callback; }
+    };
+    try {
+        e._connect();
+        e._onVanished();
+        proxies[0].reply([JSON.stringify({cpu_pct: 88})], null);
+        ok(e._lastState === null, 'a reply after daemon loss is ignored');
+        e._connect();
+        proxies[1].signal(null, null, [JSON.stringify({cpu_pct: 22})]);
+        proxies[1].reply([JSON.stringify({cpu_pct: 11})], null);
+        ok(e._lastState?.cpu_pct === 22, 'a push takes precedence over the initial reply');
+        e.disable();
+        proxies[1].signal(null, null, [JSON.stringify({cpu_pct: 99})]);
+        ok(e._lastState === null, 'a queued signal after disable is ignored');
+        e.enable();
+        e._connect();
+        try {
+            // GJS's installed Gio override calls replyFunc([], error, null).
+            proxies[2].reply([], new Error('service unavailable'));
+            ok(e._lastState === null, 'a failed initial call keeps the Shell widget offline');
+        } catch (err) {
+            ok(false, `a failed initial call must not throw: ${err.message}`);
+        }
+        e.disable();
+        e.enable();
+        e._connect();
+        proxies[2].reply([JSON.stringify({cpu_pct: 88})], null);
+        ok(e._lastState === null, 're-enabling does not reuse an old connection generation');
+    } finally {
+        delete globalThis.__jamsysProxy;
+    }
+});
+
+print('\noffline guidance remains visible after a healthy reading and rebuild');
+run('offline panel', fakeSettings({mode: 'compact'}), e => {
+    e._apply(JSON.stringify({health: 'healthy'}));
+    e._onVanished();
+    ok(e._widget._expectedItem.visible, 'the start command is shown after daemon loss');
+    e._rebuild();
+    ok(e._widget._label.text === 'JamSys — offline', 'rebuild preserves offline status');
+    ok(e._widget._expectedItem.visible &&
+       e._widget._expectedItem.label.text === 'systemctl --user start jamsysd',
+       'the panel gives the exact command to restore monitoring');
+});
+
 print(`\n${failures === 0 ? 'ALL PASS' : failures + ' FAILURE(S)'}`);
 imports.system.exit(failures === 0 ? 0 : 1);
-

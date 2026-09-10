@@ -56,6 +56,29 @@ function rgba(cr, c, a = 1) {
 
 /* ------------------------------------------------------------------ helpers */
 
+/** Shared offline face: never leave old measurements looking live. */
+export function drawUnavailable(cr, w, h) {
+    cr.save();
+    cr.setSourceRGBA(0.03, 0.04, 0.05, 0.94);
+    roundRect(cr, 0, 0, w, h, 12);
+    cr.fill();
+    cr.selectFontFace('Ubuntu Sans Mono', 0, 0);
+    const lines = ['JamSys — waiting for monitoring', 'systemctl --user start jamsysd'];
+    for (let i = 0; i < lines.length; i++) {
+        cr.setFontSize(Math.min(14, w / 27));
+        let ext = cr.textExtents(lines[i]);
+        if (ext.width > w - 20) {
+            cr.setFontSize(Math.min(14, w / 27) * (w - 20) / ext.width);
+            ext = cr.textExtents(lines[i]);
+        }
+        cr.setSourceRGBA(0.80, 0.85, 0.89, 1);
+        cr.moveTo((w - ext.width) / 2 - ext.xBearing, h / 2 + (i ? 18 : -8));
+        cr.showText(lines[i]);
+    }
+    cr.newPath();
+    cr.restore();
+}
+
 export function roundRect(cr, x, y, w, h, r) {
     r = Math.min(r, w / 2, h / 2);
     cr.newSubPath();
