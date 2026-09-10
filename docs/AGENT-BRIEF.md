@@ -123,20 +123,21 @@ attributable wake, and it must stay that way.
 
 ```bash
 cd /home/ronin/app/monitoring
-source scripts/devenv.sh                 # staged toolchain — always first
-
-for c in jamsys-daemon jamsys-helper jamsys-kbd jamsys-power; do (cd $c && cargo test --release); done
-python3 jamsys-ui/tests/xabove-test.py
-python3 jamsys-ui/tests/charge-limit-test.py
-for t in format-test gauges-test shell-api-test live-dbus-test; do gjs -m gnome-extension/tests/$t.js; done
+./scripts/run-tests.sh                   # every suite; --all adds the live one
 
 bash scripts/install-user.sh             # user install, no root
 bash packaging/build-deb.sh              # .deb
 ```
 
-Current baseline, all passing: **263** daemon, 16 degradation, 5 helper, 12 kbd,
-7 power, 34 xabove, 19 charge-limit, plus four JS suites. If your change drops a
-number, explain why.
+Use the runner rather than a hand-typed list. There was no single entry point
+for a long time, suites were listed in three documents in three different
+combinations, and two of them were listed nowhere anyone actually ran — so
+regressions in the offline face and the reconnect ordering would have shipped
+unnoticed. `scripts/devenv.sh` is sourced by the runner; source it yourself for
+anything else.
+
+Current baseline: **12 suites, 0 failures** — `./scripts/run-tests.sh` prints
+the counts. If your change drops one, explain why.
 
 Useful while working:
 

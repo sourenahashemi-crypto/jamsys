@@ -85,8 +85,13 @@ impl AlertManager {
             for r in rows {
                 if let (Some(fp), Some(sev)) = (r["fingerprint"].as_str(), r["severity"].as_i64()) {
                     m.open.insert(fp.to_string(), Severity::from_i64(sev));
-                    // Treat as already notified so a restart is quiet.
-                    m.notified.insert(fp.to_string(), (now, 0, Severity::from_i64(sev)));
+                    // Treat as already notified so a restart is quiet -- but carry
+                    // the real notification id across, or the toast still on screen
+                    // can never be replaced or withdrawn. Critical notifications are
+                    // sent with timeout 0, so "cannot withdraw" means "on the
+                    // desktop for ever".
+                    let nid = r["notify_id"].as_i64().unwrap_or(0).clamp(0, u32::MAX as i64) as u32;
+                    m.notified.insert(fp.to_string(), (now, nid, Severity::from_i64(sev)));
                 }
             }
         }
@@ -168,6 +173,8 @@ impl AlertManager {
         let replaces = self.notified.get(&a.fingerprint).map(|(_, id, _)| *id).unwrap_or(0);
         let id = self.send_notification(&a, replaces);
         self.notified.insert(a.fingerprint.clone(), (now, id, a.severity));
+        // Persist it so a restart can still take this notification down.
+        let _ = store.set_notify_id(&a.fingerprint, id);
         true
     }
 
@@ -319,6 +326,44 @@ mod tests {
         m.raise(alert("cpu.hot", "", Severity::Warning), &store, &cfg);
         assert_eq!(m.total_suppressed, 1);
         assert!(!m.notified.contains_key("cpu.hot"));
+    }
+
+    #[test]
+    fn a_notification_survives_a_restart_and_can_still_be_withdrawn() {
+        // Critical notifications are sent with timeout 0, meaning never expires.
+        // A restart used to reload open alerts with notification id 0, so the
+        // first re-notify created a second toast instead of replacing the first,
+        // and withdraw() bailed on id == 0 and left the original on the desktop
+        // for ever -- defeating the withdrawal it exists to perform.
+        let (store, cfg) = setup();
+        let a = alert("cpu.temp.critical", "", Severity::Critical);
+        {
+            let mut m = AlertManager::new(&cfg, &store);
+            m.raise(a.clone(), &store, &cfg);
+            // Simulate the shell having handed back a real id.
+            m.notified.insert(a.fingerprint.clone(), (crate::clock::mono_ms(), 4242,
+                                                      Severity::Critical));
+            store.set_notify_id(&a.fingerprint, 4242).unwrap();
+        }
+
+        let m2 = AlertManager::new(&cfg, &store);
+        let (_, id, _) = m2.notified[&a.fingerprint];
+        assert_eq!(id, 4242, "the id must survive the restart, or nothing can be withdrawn");
+    }
+
+    #[test]
+    fn a_snooze_that_has_expired_lets_the_alert_through() {
+        // The mirror of the active-snooze test, and the case that actually
+        // breaks if the suppression check is moved onto the monotonic clock: a
+        // past wall-clock deadline compared against monotonic time looks like it
+        // is still in the future, so the alert would stay muted for ever.
+        let (store, cfg) = setup();
+        store.add_suppression("rule", "cpu.hot", Some(crate::clock::now_ms() - 60_000), None)
+            .unwrap();
+        let mut m = AlertManager::new(&cfg, &store);
+        m.raise(alert("cpu.hot", "", Severity::Warning), &store, &cfg);
+        assert_eq!(m.total_suppressed, 0, "an expired snooze must not still suppress");
+        assert!(m.notified.contains_key("cpu.hot"), "and the alert must be notified");
     }
 
     #[test]

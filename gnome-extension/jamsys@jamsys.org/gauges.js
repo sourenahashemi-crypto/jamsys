@@ -58,23 +58,44 @@ function rgba(cr, c, a = 1) {
 
 /** Shared offline face: never leave old measurements looking live. */
 export function drawUnavailable(cr, w, h) {
+    // Degenerate allocations are real: a widget is 0x0 between construction and
+    // its first allocation, and again while a monitor change is being applied.
+    // The previous arithmetic scaled by (w - 20), which is negative below 20px
+    // and zero at 20 -- so the text rendered upside down, or vanished, and at
+    // w=0 Cairo threw "invalid matrix (not invertible)" from a font size of NaN.
+    if (!(w > 0) || !(h > 0)) return;
+
     cr.save();
     cr.setSourceRGBA(0.03, 0.04, 0.05, 0.94);
-    roundRect(cr, 0, 0, w, h, 12);
+    roundRect(cr, 0, 0, w, h, Math.min(12, w / 2, h / 2));
     cr.fill();
-    cr.selectFontFace('Ubuntu Sans Mono', 0, 0);
+
     const lines = ['JamSys — waiting for monitoring', 'systemctl --user start jamsysd'];
-    for (let i = 0; i < lines.length; i++) {
-        cr.setFontSize(Math.min(14, w / 27));
-        let ext = cr.textExtents(lines[i]);
-        if (ext.width > w - 20) {
-            cr.setFontSize(Math.min(14, w / 27) * (w - 20) / ext.width);
-            ext = cr.textExtents(lines[i]);
-        }
-        cr.setSourceRGBA(0.80, 0.85, 0.89, 1);
-        cr.moveTo((w - ext.width) / 2 - ext.xBearing, h / 2 + (i ? 18 : -8));
-        cr.showText(lines[i]);
+    const inset = Math.min(10, w * 0.06);
+    const avail = Math.max(1, w - inset * 2);
+    // Two lines plus a gap have to fit the height as well as the width, or the
+    // second line -- the only actionable thing here -- is clipped away.
+    let size = Math.max(1, Math.min(14, w / 27, h / 5));
+
+    cr.selectFontFace('Ubuntu Sans Mono', 0, 0);
+    for (const line of lines) {
+        cr.setFontSize(size);
+        const width = cr.textExtents(line).width;
+        if (width > avail) size = Math.max(1, size * avail / width);
     }
+    cr.setFontSize(size);
+
+    // Baselines derived from the font, not from constants that assumed one size.
+    const gap = size * 1.55;
+    const first = h / 2 - gap / 2 + size * 0.36;
+    cr.setSourceRGBA(0.80, 0.85, 0.89, 1);
+    lines.forEach((line, i) => {
+        const y = first + i * gap;
+        if (y < 0 || y > h) return;      // no room: better blank than clipped
+        const e = cr.textExtents(line);
+        cr.moveTo((w - e.width) / 2 - e.xBearing, y);
+        cr.showText(line);
+    });
     cr.newPath();
     cr.restore();
 }

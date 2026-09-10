@@ -63,15 +63,28 @@ impl Collector for ThermalCollector {
         self.temps = discover_hwmon(&[HwmonKind::Temp]);
         self.fans = discover_hwmon(&[HwmonKind::Fan]);
         if self.temps.is_empty() && self.fans.is_empty() {
-            // Fall back to thermal zones, which exist even where hwmon does not.
+            // No channels means no readings, and saying "Partial" here was a lie
+            // with teeth. `collect()` never reads /sys/class/thermal — grep for
+            // thermal_zone and the only other hit is a log filter — so the old
+            // fallback advertised coverage that could not exist. Worse, Partial
+            // counts as usable, so the registry scheduled no retry and, with the
+            // channel list now empty, `gone` could never again exceed zero and
+            // `Gone` could never fire: the collector reported healthy, produced
+            // nothing, and could not recover without a daemon restart.
+            //
+            // Unsupported is the honest answer and, because it is not usable, it
+            // puts the collector on the bounded retry path that does recover.
             let zones = list_dir("/sys/class/thermal")
                 .into_iter()
                 .filter(|z| z.starts_with("thermal_zone"))
                 .count();
-            if zones == 0 {
-                return Support::Unsupported { reason: "no hwmon or thermal zones".into() };
-            }
-            return Support::Partial { detail: "thermal zones only, no hwmon".into() };
+            let reason = if zones == 0 {
+                "no hwmon or thermal zones".to_string()
+            } else {
+                format!("no hwmon temperature or fan channels ({zones} thermal zones \
+                         exist but are not read)")
+            };
+            return Support::Unsupported { reason };
         }
         if self.fans.is_empty() {
             return Support::Partial {

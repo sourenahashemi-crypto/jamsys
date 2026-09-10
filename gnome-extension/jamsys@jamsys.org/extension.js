@@ -363,6 +363,7 @@ export default class JamSysExtension extends Extension {
         this._signalId = 0;
         this._watchId = 0;
         this._lastState = null;
+        this._reconnectId = 0;
         this._connectionGeneration = (this._connectionGeneration ?? 0) + 1;
 
         this._build();
@@ -387,6 +388,10 @@ export default class JamSysExtension extends Extension {
         if (this._watchId) {
             Gio.bus_unwatch_name(this._watchId);
             this._watchId = 0;
+        }
+        if (this._reconnectId) {
+            GLib.Source.remove(this._reconnectId);
+            this._reconnectId = 0;
         }
         this._disconnect();
         for (const id of [...(this._rebuildIds ?? []), ...(this._redrawIds ?? [])])
@@ -528,8 +533,19 @@ export default class JamSysExtension extends Extension {
         try {
             this._proxy = new JamSysProxy(Gio.DBus.session, BUS_NAME, OBJECT_PATH);
         } catch (e) {
+            // _connect() is only ever the name-appeared callback, so the name IS
+            // owned and the daemon IS running. Reporting "jamsysd is not running"
+            // here sent the user to fix something that was not broken.
             logError(e, 'JamSys: could not create the D-Bus proxy');
-            this._onVanished();
+            this._proxy = null;
+            this._lastState = null;
+            this._widget?.setState(null);
+            this._widget?.setUnavailable?.(
+                'The monitoring service is running but could not be reached.');
+            // name_appeared fires once per ownership change, so without a retry a
+            // single transient failure would strand the widget until the daemon
+            // itself restarted.
+            this._scheduleReconnect();
             return;
         }
         let pushed = false;
@@ -557,6 +573,16 @@ export default class JamSysExtension extends Extension {
         this._widget?.setUnavailable?.('jamsysd is not running.');
         if (this._widget instanceof Cluster)
             this._widget.setState(null);
+    }
+
+    /** One bounded retry, for a failure that the name watch will not repeat. */
+    _scheduleReconnect() {
+        if (this._reconnectId) return;
+        this._reconnectId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 10, () => {
+            this._reconnectId = 0;
+            if (!this._proxy && this._settings) this._connect();
+            return false;
+        });
     }
 
     _disconnect() {
