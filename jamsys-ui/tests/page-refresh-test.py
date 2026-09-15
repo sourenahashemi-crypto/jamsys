@@ -14,13 +14,14 @@ These drive the real Page.update() against real GTK widgets.
 import os
 import pathlib
 import sys
+import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import gi  # noqa: E402
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gtk  # noqa: E402
+from gi.repository import Adw, GLib, Gtk  # noqa: E402
 
 if not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")):
     print("no display; skipping (this suite needs a real GTK stack)")
@@ -41,6 +42,38 @@ def check(name, cond, detail=""):
     else:
         failed += 1
         print(f"  FAIL {name}  {detail}")
+
+
+def pump(until, seconds=5.0):
+    """Run the main loop until `until()` holds, or give up after `seconds`.
+
+    Not a fixed number of iterations. GLib's non-blocking iteration returns at
+    once when the queue is empty, so `for _ in range(80): iteration(False)` only
+    drains what has already arrived -- measured at 11-17 ms, all of it spent
+    spinning on an empty queue. It does not wait for anything.
+
+    That is what made this suite fail about one run in twelve, here on an idle
+    machine: with the forty rows built and the page allocated 400x264, the
+    scroller's adjustment had not yet been re-measured for the new content, so
+    upper still equalled page_size. An empty range clamps the test's own
+    set_value(1.0) back to zero, and the suite then reported a scroll offset of
+    0.0 as a product failure when nothing was wrong with the product.
+
+    Blocking for the next event is what actually waits; the throwaway timeout
+    guarantees the block ends, so a condition that never comes true costs the
+    deadline rather than hanging the suite.
+    """
+    ctx = GLib.MainContext.default()
+    deadline = time.monotonic() + seconds
+    while True:
+        while ctx.pending():
+            ctx.iteration(False)
+        if until():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        GLib.timeout_add(10, lambda: GLib.SOURCE_REMOVE)
+        ctx.iteration(True)
 
 
 class Counting(Page):
@@ -65,14 +98,13 @@ win.set_child(page)
 win.set_default_size(400, 300)
 win.present()
 
-# Let GTK allocate, so the scroller has a real upper bound.
-ctx = win.get_display().get_default_seat() and None
-for _ in range(80):
-    Gtk.main_iteration_do(False) if hasattr(Gtk, "main_iteration_do") else None
-    from gi.repository import GLib
-    GLib.MainContext.default().iteration(False)
+# Wait for a real allocation: everything below reads geometry the compositor
+# has not produced yet at this point.
+allocated = pump(lambda: page.get_width() > 0 and page.get_height() > 0)
 
 print("ordinary refresh")
+check("the window was allocated for the test", allocated,
+      f"{page.get_width()}x{page.get_height()} after the deadline")
 page.update({})
 check("a refresh with nothing open re-renders", page.renders >= 1,
       f"renders={page.renders}")
@@ -82,9 +114,7 @@ pop = Gtk.Popover()
 btn = Gtk.MenuButton(popover=pop)
 page.body.append(btn)
 pop.popup()
-for _ in range(40):
-    from gi.repository import GLib
-    GLib.MainContext.default().iteration(False)
+pump(lambda: _has_open_popover(page))
 
 check("the popover is detected as open", _has_open_popover(page))
 check("the page reports it is being interacted with", page.is_interacting())
@@ -94,9 +124,7 @@ check("update() does not rebuild while a popup is open",
       page.renders == before, f"renders went {before} -> {page.renders}")
 
 pop.popdown()
-for _ in range(40):
-    from gi.repository import GLib
-    GLib.MainContext.default().iteration(False)
+pump(lambda: not _has_open_popover(page))
 check("the popover is no longer detected once closed", not _has_open_popover(page))
 before = page.renders
 page.update({})
@@ -104,9 +132,9 @@ check("and the rebuild resumes after it closes", page.renders == before + 1)
 
 print("\nscroll position survives a rebuild")
 adj = page._scroller.get_vadjustment()
-from gi.repository import GLib
-for _ in range(60):
-    GLib.MainContext.default().iteration(False)
+# A scroller with no range cannot hold a position, so there is nothing to test
+# until the content is taller than the viewport.
+scrollable = pump(lambda: adj.get_upper() > adj.get_page_size() > 0)
 # Mid-scroll, not the very bottom: at the bottom the legitimate clamp to
 # (upper - page_size) is indistinguishable from a failure to restore, and the
 # clamp is the behaviour we want when content shrinks.
@@ -114,9 +142,11 @@ target = max(1.0, (adj.get_upper() - adj.get_page_size()) / 2.0)
 adj.set_value(target)
 moved = adj.get_value()
 page.update({})
-for _ in range(80):
-    GLib.MainContext.default().iteration(False)
-check("the scroll offset was actually set for the test", moved > 0.0, f"value={moved}")
+# The restore is queued at idle/low priority, so it lands some way after
+# update() returns; wait for it rather than assuming it already happened.
+pump(lambda: abs(adj.get_value() - moved) < 2.0)
+check("the scroll offset was actually set for the test", scrollable and moved > 0.0,
+      f"value={moved} upper={adj.get_upper():.0f} page={adj.get_page_size():.0f}")
 if moved > 0.0:
     check("scroll position is restored after a refresh",
           abs(adj.get_value() - moved) < 2.0,
