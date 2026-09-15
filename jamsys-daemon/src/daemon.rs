@@ -302,7 +302,11 @@ impl Daemon {
                         self.handle_collector_fd(t)
                     }
                     TOK_IPC_LISTEN => {
-                        for (tok, fd) in self.ipc.accept() {
+                        let (fresh, evicted) = self.ipc.accept();
+                        for fd in evicted {
+                            let _ = self.el.remove(fd);
+                        }
+                        for (tok, fd) in fresh {
                             if self.el.add(fd, tok).is_err() {
                                 self.ipc.drop_client(tok);
                             }
@@ -834,13 +838,18 @@ impl Daemon {
                     return Response::err(r.id, "bad_request", "subsystem and name are required");
                 }
                 let until = i("until_ms").unwrap_or_else(clock::now_ms);
-                let since = i("since_ms").unwrap_or(until - 3_600_000);
-                let id = MetricId::new(
-                    Box::leak(sub.into_boxed_str()),
-                    Box::leak(name.into_boxed_str()),
-                    s("instance"),
-                );
-                match self.store.history(&id, since, until, u("max_points", 300)) {
+                // saturating: `until` is whatever the caller sent, and i64::MIN - 1h
+                // wraps to a positive number in a release build, which would ask the
+                // store for a window running backwards from the far future.
+                let since = i("since_ms").unwrap_or(until.saturating_sub(3_600_000));
+                if since > until {
+                    return Response::err(r.id, "bad_request", "since_ms must not be after until_ms");
+                }
+                // Plain strings, not MetricId: its fields are &'static str, so building
+                // one here meant Box::leak on caller-supplied text -- 65 bytes leaked
+                // per ordinary request and 58 KB per crafted one, never freed.
+                match self.store.history_by_key(&sub, &name, &s("instance"),
+                                                since, until, u("max_points", 300)) {
                     Ok(v) => Response::ok(r.id, v),
                     Err(e) => Response::err(r.id, "query_failed", e.to_string()),
                 }

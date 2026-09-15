@@ -88,8 +88,16 @@ capped at 1 200 points per series — measured at 21.8 kB for 1 196 live points.
 so stopping the daemon does not silently discard up to ten seconds of samples.
 
 Retention is enforced by a maintenance pass at the glacial tier: roll up → delete expired
-→ `PRAGMA incremental_vacuum(256)`. Deletion is chunked (`LIMIT 5000`) so a long-idle
-machine catching up cannot stall the event loop.
+→ `PRAGMA incremental_vacuum(256)`. Deletion is chunked — 5 000 rows a statement, at most
+50 statements per table per pass — so a long-idle machine catching up cannot stall the
+event loop.
+
+The chunk is a subquery over the primary key, not `DELETE … LIMIT`: that syntax needs
+`SQLITE_ENABLE_UPDATE_DELETE_LIMIT`, which the bundled SQLite this links against does not
+define. The original code asked for `LIMIT`, caught the resulting error and fell back to an
+unlimited `DELETE`, so nothing was ever chunked — after a four-day gap one statement removed
+500 719 rows. Measured at 41 ms, so the cost was latency rather than a freeze, but the
+guarantee written here did not exist.
 
 ## Events and alerts
 
