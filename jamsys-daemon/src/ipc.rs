@@ -12,8 +12,11 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
-/// Refuse a line longer than this rather than buffering unboundedly.
+/// Refuse a single line longer than this rather than buffering unboundedly.
 const MAX_LINE: usize = 64 * 1024;
+/// And an overall ceiling, so a client that streams complete lines faster than they
+/// are parsed still cannot grow the daemon's memory without bound.
+const MAX_INBUF: usize = 1024 * 1024;
 /// A UI plus a couple of CLI queries is plenty; more suggests something is wrong.
 const MAX_CLIENTS: usize = 8;
 
@@ -63,6 +66,9 @@ pub struct Client {
     inbuf: Vec<u8>,
     outbuf: Vec<u8>,
     pub subscriptions: Vec<String>,
+    /// Monotonic milliseconds at the last request from this peer. Used only to pick
+    /// a victim when the connection table is full.
+    last_active_mono: i64,
 }
 
 impl Client {
@@ -79,8 +85,18 @@ impl Client {
                 Ok(0) => return Err("peer closed".into()),
                 Ok(n) => {
                     self.inbuf.extend_from_slice(&chunk[..n]);
-                    if self.inbuf.len() > MAX_LINE {
-                        return Err("request exceeded 64 KiB".into());
+                    // Measure the *unterminated tail*, not the buffer. Measuring the
+                    // buffer disconnected clients whose requests were all well under
+                    // the limit but arrived together in one burst.
+                    let tail = match self.inbuf.iter().rposition(|&b| b == b'\n') {
+                        Some(p) => self.inbuf.len() - p - 1,
+                        None => self.inbuf.len(),
+                    };
+                    if tail > MAX_LINE {
+                        return Err("a single request exceeded 64 KiB".into());
+                    }
+                    if self.inbuf.len() > MAX_INBUF {
+                        return Err("unparsed request backlog exceeded 1 MiB".into());
                     }
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -89,6 +105,9 @@ impl Client {
             }
         }
         let mut out = Vec::new();
+        if !self.inbuf.is_empty() {
+            self.last_active_mono = crate::clock::mono_ms();
+        }
         while let Some(pos) = self.inbuf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = self.inbuf.drain(..=pos).collect();
             let text = String::from_utf8_lossy(&line[..line.len() - 1]);
@@ -200,9 +219,32 @@ impl IpcServer {
         self.clients.len()
     }
 
-    /// Accept pending connections. Returns the new clients' tokens for epoll registration.
-    pub fn accept(&mut self) -> Vec<(u64, RawFd)> {
+    /// Silent for this long with nothing subscribed, and the connection is treated
+    /// as abandoned rather than as a client that is merely thinking.
+    const IDLE_MS: i64 = 60_000;
+
+    /// The least recently active abandoned client, if there is one.
+    ///
+    /// A subscriber is never a victim: waiting quietly for pushes is exactly what
+    /// the push protocol asks a client to do, so silence does not make it idle.
+    fn idle_victim_at(&self, now: i64) -> Option<u64> {
+        self.clients
+            .values()
+            .filter(|c| c.subscriptions.is_empty() && now - c.last_active_mono > Self::IDLE_MS)
+            .min_by_key(|c| c.last_active_mono)
+            .map(|c| c.token)
+    }
+
+    fn idle_victim(&self) -> Option<u64> {
+        self.idle_victim_at(crate::clock::mono_ms())
+    }
+
+    /// Accept pending connections. Returns the new clients' tokens for epoll
+    /// registration, and any fds evicted to make room, which the caller must
+    /// deregister.
+    pub fn accept(&mut self) -> (Vec<(u64, RawFd)>, Vec<RawFd>) {
         let mut new = Vec::new();
+        let mut evicted: Vec<RawFd> = Vec::new();
         loop {
             match self.listener.accept() {
                 Ok((stream, _)) => {
@@ -217,8 +259,23 @@ impl IpcServer {
                         }
                     }
                     if self.clients.len() >= MAX_CLIENTS {
-                        crate::log_warn!("IPC client limit reached, refusing connection");
-                        continue;
+                        // Eight peers that connect and then say nothing would
+                        // otherwise lock the window out of its own daemon for as
+                        // long as they hold the socket open. Reclaim the least
+                        // recently active one, but only once it has been silent
+                        // long enough that it cannot be a working client.
+                        match self.idle_victim() {
+                            Some(v) => {
+                                crate::log_warn!("IPC client limit reached, dropping idle client {v}");
+                                if let Some(fd) = self.drop_client(v) {
+                                    evicted.push(fd);
+                                }
+                            }
+                            None => {
+                                crate::log_warn!("IPC client limit reached, refusing connection");
+                                continue;
+                            }
+                        }
                     }
                     if set_nonblocking(stream.as_raw_fd()).is_err() {
                         continue;
@@ -228,7 +285,9 @@ impl IpcServer {
                     let fd = stream.as_raw_fd();
                     self.clients.insert(
                         token,
-                        Client { stream, token, inbuf: Vec::new(), outbuf: Vec::new(), subscriptions: Vec::new() },
+                        Client { stream, token, inbuf: Vec::new(), outbuf: Vec::new(),
+                                 subscriptions: Vec::new(),
+                                 last_active_mono: crate::clock::mono_ms() },
                     );
                     new.push((token, fd));
                 }
@@ -239,7 +298,7 @@ impl IpcServer {
                 }
             }
         }
-        new
+        (new, evicted)
     }
 
     pub fn client(&mut self, token: u64) -> Option<&mut Client> {
@@ -247,7 +306,14 @@ impl IpcServer {
     }
 
     pub fn drop_client(&mut self, token: u64) -> Option<RawFd> {
-        self.clients.remove(&token).map(|c| c.stream.as_raw_fd())
+        // The fd is read while the client is still alive. Reading it from the
+        // removed value took the number *after* the UnixStream had been dropped and
+        // the descriptor closed, leaving the caller to run epoll_ctl(DEL) on a
+        // closed fd -- harmless while nothing else opens one in between, and a
+        // wrong-fd deregistration the moment something does.
+        let fd = self.clients.get(&token).map(|c| c.stream.as_raw_fd());
+        self.clients.remove(&token);
+        fd
     }
 
     /// Push a frame to every client subscribed to `topic`. Returns tokens that failed
@@ -357,7 +423,7 @@ mod tests {
         let d = tmpdir("roundtrip");
         let mut srv = IpcServer::bind(&d).unwrap();
         let mut cli = UnixStream::connect(srv.path()).unwrap();
-        let new = srv.accept();
+        let (new, _) = srv.accept();
         assert_eq!(new.len(), 1);
         let tok = new[0].0;
 
@@ -384,7 +450,7 @@ mod tests {
         let d = tmpdir("pipeline");
         let mut srv = IpcServer::bind(&d).unwrap();
         let mut cli = UnixStream::connect(srv.path()).unwrap();
-        let tok = srv.accept()[0].0;
+        let tok = srv.accept().0[0].0;
         cli.write_all(b"{\"op\":\"ping\"}\n{\"op\":\"coverage\"}\n{\"op\":\"stats\"}\n").unwrap();
         let reqs = srv.client(tok).unwrap().read_requests().unwrap();
         assert_eq!(reqs.len(), 3);
@@ -398,7 +464,7 @@ mod tests {
         let d = tmpdir("partial");
         let mut srv = IpcServer::bind(&d).unwrap();
         let mut cli = UnixStream::connect(srv.path()).unwrap();
-        let tok = srv.accept()[0].0;
+        let tok = srv.accept().0[0].0;
         cli.write_all(b"{\"op\":\"pi").unwrap();
         assert!(srv.client(tok).unwrap().read_requests().unwrap().is_empty());
         cli.write_all(b"ng\"}\n").unwrap();
@@ -414,7 +480,7 @@ mod tests {
         let d = tmpdir("malformed");
         let mut srv = IpcServer::bind(&d).unwrap();
         let mut cli = UnixStream::connect(srv.path()).unwrap();
-        let tok = srv.accept()[0].0;
+        let tok = srv.accept().0[0].0;
         cli.write_all(b"this is not json\n{\"op\":\"ping\"}\n").unwrap();
         let reqs = srv.client(tok).unwrap().read_requests().expect("connection must survive");
         assert_eq!(reqs.len(), 1, "the valid request after the garbage must still arrive");
@@ -427,7 +493,7 @@ mod tests {
         let d = tmpdir("oversize");
         let mut srv = IpcServer::bind(&d).unwrap();
         let mut cli = UnixStream::connect(srv.path()).unwrap();
-        let tok = srv.accept()[0].0;
+        let tok = srv.accept().0[0].0;
         // 128 KiB with no newline: the buffer cap must trip.
         let junk = vec![b'x'; 128 * 1024];
         let _ = cli.write_all(&junk);
@@ -446,7 +512,7 @@ mod tests {
             if let Ok(s) = UnixStream::connect(srv.path()) {
                 held.push(s);
             }
-            srv.accept();
+            let _ = srv.accept();
         }
         assert_eq!(srv.client_count(), MAX_CLIENTS);
         drop(srv);
@@ -461,9 +527,9 @@ mod tests {
         // Take the token accept() actually assigned to `a`. `tokens()` iterates a
         // HashMap, so indexing it would subscribe an arbitrary client and this test
         // would block forever whenever the hash order put `b` first.
-        let tok_a = srv.accept()[0].0;
+        let tok_a = srv.accept().0[0].0;
         let _b = UnixStream::connect(srv.path()).unwrap();
-        let tok_b = srv.accept()[0].0;
+        let tok_b = srv.accept().0[0].0;
         assert_ne!(tok_a, tok_b);
         srv.client(tok_a).unwrap().subscriptions.push("alert".into());
 
@@ -485,7 +551,7 @@ mod tests {
         let d = tmpdir("disconnect");
         let mut srv = IpcServer::bind(&d).unwrap();
         let cli = UnixStream::connect(srv.path()).unwrap();
-        let tok = srv.accept()[0].0;
+        let tok = srv.accept().0[0].0;
         drop(cli);
         assert!(srv.client(tok).unwrap().read_requests().is_err());
         assert!(srv.drop_client(tok).is_some());
@@ -499,10 +565,98 @@ mod tests {
         let d = tmpdir("peercred");
         let mut srv = IpcServer::bind(&d).unwrap();
         let _cli = UnixStream::connect(srv.path()).unwrap();
-        let new = srv.accept();
+        let (new, _) = srv.accept();
         assert_eq!(new.len(), 1, "our own uid must be accepted");
         assert_eq!(peer_uid(new[0].1), Some(unsafe { libc::getuid() }));
         drop(srv);
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_burst_of_small_requests_is_not_mistaken_for_one_huge_one() {
+        // The cap is per line. It used to be measured against the whole read
+        // buffer, so a client that pipelined many perfectly legal requests into one
+        // write was disconnected with "request exceeded 64 KiB".
+        let dir = tmpdir("burst");
+        let mut srv = IpcServer::bind(&dir).unwrap();
+        let mut c = UnixStream::connect(dir.join("sock")).unwrap();
+        let tok = srv.accept().0[0].0;
+
+        let one = format!("{}\n", serde_json::json!({"id": 1, "op": "ping"}));
+        let count = (MAX_LINE / one.len()) + 500;           // comfortably over the cap
+        let burst: String = one.repeat(count);
+        assert!(burst.len() > MAX_LINE, "the burst must exceed the per-line cap");
+        c.write_all(burst.as_bytes()).unwrap();
+        c.flush().unwrap();
+
+        // Read until everything the client sent has been parsed, or give up.
+        let mut got = 0usize;
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let reqs = srv.client(tok).unwrap().read_requests()
+                .expect("a burst of small requests must not disconnect the client");
+            got += reqs.len();
+            if got >= count {
+                break;
+            }
+        }
+        assert_eq!(got, count, "every request in the burst is parsed");
+    }
+
+    #[test]
+    fn one_oversized_line_is_still_refused() {
+        let dir = tmpdir("oversize");
+        let mut srv = IpcServer::bind(&dir).unwrap();
+        let mut c = UnixStream::connect(dir.join("sock")).unwrap();
+        let tok = srv.accept().0[0].0;
+
+        // No newline anywhere: one line, longer than the cap allows.
+        let huge = "x".repeat(MAX_LINE + 4096);
+        let _ = c.write_all(huge.as_bytes());
+        let _ = c.flush();
+
+        let mut refused = false;
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            if srv.client(tok).unwrap().read_requests().is_err() {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "a single line over 64 KiB must drop the connection");
+    }
+
+    #[test]
+    fn an_abandoned_client_is_reclaimed_but_a_subscriber_is_not() {
+        let dir = tmpdir("evict");
+        let mut srv = IpcServer::bind(&dir).unwrap();
+        let mut held = Vec::new();
+        for _ in 0..MAX_CLIENTS {
+            held.push(UnixStream::connect(dir.join("sock")).unwrap());
+        }
+        let toks: Vec<u64> = srv.accept().0.into_iter().map(|(t, _)| t).collect();
+        assert_eq!(toks.len(), MAX_CLIENTS);
+
+        let now = crate::clock::mono_ms();
+        // Everything has been silent for five minutes.
+        for t in &toks {
+            srv.client(*t).unwrap().last_active_mono = now - 300_000;
+        }
+        let victim = srv.idle_victim_at(now).expect("an abandoned client is reclaimable");
+        assert!(toks.contains(&victim));
+
+        // A subscriber is silent by design and must never be chosen.
+        for t in &toks {
+            srv.client(*t).unwrap().subscriptions.push("snapshot".into());
+        }
+        assert!(srv.idle_victim_at(now).is_none(), "subscribers are not idle");
+
+        // Nor is a client that spoke recently.
+        for t in &toks {
+            let c = srv.client(*t).unwrap();
+            c.subscriptions.clear();
+            c.last_active_mono = now - 1_000;
+        }
+        assert!(srv.idle_victim_at(now).is_none(), "a recent request means active");
     }
 }

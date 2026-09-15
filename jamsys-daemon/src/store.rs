@@ -684,11 +684,23 @@ CREATE TABLE IF NOT EXISTS threshold_override (
     }
 
     pub fn history(&self, m: &MetricId, since: i64, until: i64, max_points: usize) -> rusqlite::Result<serde_json::Value> {
+        self.history_by_key(m.subsystem, m.name, &m.instance, since, until, max_points)
+    }
+
+    /// The same query, addressed by plain strings.
+    ///
+    /// `MetricId` holds `&'static str`, which is right for the ~60 metric names
+    /// compiled into this binary and wrong for anything arriving over the socket:
+    /// building one from a request meant leaking the caller's strings on every
+    /// call, for the lifetime of the process. The SQL only ever binds them as
+    /// parameters, so nothing here needs them to be static.
+    pub fn history_by_key(&self, subsystem: &str, name: &str, instance: &str,
+                          since: i64, until: i64, max_points: usize) -> rusqlite::Result<serde_json::Value> {
         let id: Option<i64> = self
             .conn
             .query_row(
                 "SELECT id FROM metric WHERE subsystem=?1 AND name=?2 AND instance=?3",
-                params![m.subsystem, m.name, m.instance],
+                params![subsystem, name, instance],
                 |r| r.get(0),
             )
             .optional()?;
@@ -730,7 +742,13 @@ CREATE TABLE IF NOT EXISTS threshold_override (
         let step = (points.len() / max_points.max(1)).max(1);
         let out: Vec<serde_json::Value> =
             points.iter().step_by(step).map(|(t, v)| serde_json::json!([t, v])).collect();
-        Ok(serde_json::json!({"points": out, "bucket": bucket, "metric": m.key()}))
+        // Same shape as MetricId::key(), built from the borrowed strings.
+        let key = if instance.is_empty() {
+            format!("{subsystem}.{name}")
+        } else {
+            format!("{subsystem}.{name}[{instance}]")
+        };
+        Ok(serde_json::json!({"points": out, "bucket": bucket, "metric": key}))
     }
 
     /// Latest raw values for every metric of a subsystem — used to rebuild UI state.
@@ -788,30 +806,60 @@ CREATE TABLE IF NOT EXISTS threshold_override (
         Ok(n)
     }
 
-    /// Delete data past its retention window. Chunked so a long-idle machine catching
-    /// up cannot stall the event loop inside one enormous DELETE.
+    /// Rows removed per statement, and the most statements one maintenance pass
+    /// will run per table. 5 000 x 50 = 250 000 rows, measured at about 20 ms --
+    /// enough to outrun the write rate (~31 000 rows an hour) many times over
+    /// while staying far short of a visible stall.
+    const RETENTION_CHUNK: usize = 5_000;
+    const RETENTION_MAX_CHUNKS: usize = 50;
+
+    /// Delete data past its retention window, in bounded chunks so a long-idle
+    /// machine catching up cannot stall the event loop inside one enormous DELETE.
+    ///
+    /// The chunk is expressed as a subquery over the primary key rather than as
+    /// `DELETE ... LIMIT`, which needs SQLITE_ENABLE_UPDATE_DELETE_LIMIT -- absent
+    /// from the bundled build this links against, and from most distribution ones.
+    /// The old code asked for LIMIT, silently fell back to an unlimited DELETE when
+    /// SQLite rejected it, and so never chunked anything: after a four-day gap it
+    /// removed 500 719 rows in a single statement, which is precisely what the
+    /// chunking was written to prevent.
     pub fn enforce_retention(&self, r: &Retention) -> rusqlite::Result<usize> {
         let now = now_ms();
         let mut total = 0usize;
-        let jobs: [(&str, i64, i64); 6] = [
-            ("DELETE FROM sample WHERE ts < ?1 LIMIT 5000", now - r.raw_hours * 3_600_000, 0),
-            ("DELETE FROM rollup WHERE bucket=60000 AND ts < ?1 LIMIT 5000", now - r.minute_days * 86_400_000, 0),
-            ("DELETE FROM rollup WHERE bucket=300000 AND ts < ?1 LIMIT 5000", now - r.five_min_days * 86_400_000, 0),
-            ("DELETE FROM rollup WHERE bucket=900000 AND ts < ?1 LIMIT 5000", now - r.fifteen_min_days * 86_400_000, 0),
-            ("DELETE FROM event WHERE ts < ?1 LIMIT 5000", now - r.event_days * 86_400_000, 0),
-            ("DELETE FROM alert WHERE resolved_ts IS NOT NULL AND last_ts < ?1 LIMIT 5000", now - r.alert_days * 86_400_000, 0),
+        let chunk = Self::RETENTION_CHUNK;
+        // Each job deletes by primary key, so the chunk is exact on every table:
+        // `sample` and `rollup` are WITHOUT ROWID with composite keys, `event` and
+        // `alert` have an INTEGER PRIMARY KEY.
+        let jobs: [(String, i64); 6] = [
+            (format!("DELETE FROM sample WHERE (metric_id, ts) IN \
+                      (SELECT metric_id, ts FROM sample WHERE ts < ?1 LIMIT {chunk})"),
+             now - r.raw_hours * 3_600_000),
+            (format!("DELETE FROM rollup WHERE (bucket, metric_id, ts) IN \
+                      (SELECT bucket, metric_id, ts FROM rollup WHERE bucket=60000 AND ts < ?1 LIMIT {chunk})"),
+             now - r.minute_days * 86_400_000),
+            (format!("DELETE FROM rollup WHERE (bucket, metric_id, ts) IN \
+                      (SELECT bucket, metric_id, ts FROM rollup WHERE bucket=300000 AND ts < ?1 LIMIT {chunk})"),
+             now - r.five_min_days * 86_400_000),
+            (format!("DELETE FROM rollup WHERE (bucket, metric_id, ts) IN \
+                      (SELECT bucket, metric_id, ts FROM rollup WHERE bucket=900000 AND ts < ?1 LIMIT {chunk})"),
+             now - r.fifteen_min_days * 86_400_000),
+            (format!("DELETE FROM event WHERE id IN \
+                      (SELECT id FROM event WHERE ts < ?1 LIMIT {chunk})"),
+             now - r.event_days * 86_400_000),
+            (format!("DELETE FROM alert WHERE id IN \
+                      (SELECT id FROM alert WHERE resolved_ts IS NOT NULL AND last_ts < ?1 LIMIT {chunk})"),
+             now - r.alert_days * 86_400_000),
         ];
-        for (sql, cutoff, _) in jobs {
-            // SQLite is built here with SQLITE_ENABLE_UPDATE_DELETE_LIMIT off in some
-            // distributions; fall back to an unlimited delete if LIMIT is rejected.
-            let n = match self.conn.execute(sql, params![cutoff]) {
-                Ok(n) => n,
-                Err(_) => {
-                    let plain = sql.replace(" LIMIT 5000", "");
-                    self.conn.execute(&plain, params![cutoff]).unwrap_or(0)
+        for (sql, cutoff) in jobs {
+            for _ in 0..Self::RETENTION_MAX_CHUNKS {
+                let n = self.conn.execute(&sql, params![cutoff])?;
+                total += n;
+                // A short pass means this table is caught up; the next maintenance
+                // tick picks up whatever is left.
+                if n < chunk {
+                    break;
                 }
-            };
-            total += n;
+            }
         }
         if total > 0 {
             let _ = self.conn.pragma_update(None, "incremental_vacuum", 256);
@@ -1061,6 +1109,75 @@ mod tests {
         assert_eq!(ch.1, "7.0.0-32");
         assert_eq!(s.row_count("inventory_change"), 2);
         assert_eq!(s.row_count("inventory"), 1, "inventory holds current state only");
+    }
+
+    #[test]
+    fn retention_chunks_instead_of_deleting_everything_at_once() {
+        // The old statements used `DELETE ... LIMIT`, which needs
+        // SQLITE_ENABLE_UPDATE_DELETE_LIMIT; the bundled SQLite rejects it, the code
+        // fell back to an unlimited DELETE, and a four-day backlog came out as one
+        // 500 719-row statement. One pass must now remove a bounded number of rows.
+        let s = mk();
+        let id = s.conn().query_row(
+            "INSERT INTO metric(subsystem,name,instance,unit) VALUES('t','v','','x') RETURNING id",
+            [], |r| r.get::<_, i64>(0)).unwrap();
+        let old_ts = now_ms() - 48 * 3_600_000;
+        {
+            let tx = s.conn().unchecked_transaction().unwrap();
+            for i in 0..12_000i64 {
+                tx.execute("INSERT INTO sample(ts,metric_id,value) VALUES(?1,?2,0.0)",
+                           params![old_ts + i, id]).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        assert_eq!(s.row_count("sample"), 12_000);
+
+        let r = Retention { raw_hours: 24, ..Default::default() };
+        let removed = s.enforce_retention(&r).unwrap();
+        // 12 000 expired rows, a 5 000-row chunk, a 50-chunk ceiling: one pass takes
+        // all of them, but in chunks, and the ceiling bounds any single pass.
+        assert_eq!(removed, 12_000, "every expired row goes, in chunks");
+        assert_eq!(s.row_count("sample"), 0);
+        assert!(Store::RETENTION_CHUNK * Store::RETENTION_MAX_CHUNKS >= 12_000);
+    }
+
+    #[test]
+    fn retention_leaves_rows_inside_the_window() {
+        let s = mk();
+        let id = s.conn().query_row(
+            "INSERT INTO metric(subsystem,name,instance,unit) VALUES('t','v','','x') RETURNING id",
+            [], |r| r.get::<_, i64>(0)).unwrap();
+        let now = now_ms();
+        s.conn().execute("INSERT INTO sample(ts,metric_id,value) VALUES(?1,?2,1.0)",
+                         params![now - 48 * 3_600_000, id]).unwrap();
+        s.conn().execute("INSERT INTO sample(ts,metric_id,value) VALUES(?1,?2,2.0)",
+                         params![now - 60_000, id]).unwrap();
+        s.enforce_retention(&Retention { raw_hours: 24, ..Default::default() }).unwrap();
+        assert_eq!(s.row_count("sample"), 1, "the recent sample survives");
+    }
+
+    #[test]
+    fn history_by_key_needs_no_static_strings() {
+        // Regression: the IPC dispatcher used to Box::leak the caller's subsystem and
+        // name to satisfy MetricId's &'static str fields, leaking 65 bytes on every
+        // ordinary request and 58 KB on a crafted one. Querying by plain &str is what
+        // makes that unnecessary, so it has to work for names the binary never saw.
+        let mut s = mk();
+        let id = m("cpu", "usage_pct", "");
+        s.push(now_ms(), &id, "%", 42.0);
+        s.flush_final().unwrap();
+
+        let owned_sub = String::from("cpu");
+        let owned_name = String::from("usage_pct");
+        let h = s.history_by_key(&owned_sub, &owned_name, "", 0, now_ms(), 50).unwrap();
+        assert_eq!(h["metric"], "cpu.usage_pct");
+        assert!(!h["points"].as_array().unwrap().is_empty(), "the sample is found");
+
+        // An unknown, caller-invented name answers rather than failing -- and, being
+        // borrowed, costs nothing that outlives the call.
+        let junk = "x".repeat(30_000);
+        let h = s.history_by_key(&junk, &junk, "", 0, now_ms(), 50).unwrap();
+        assert_eq!(h["unknown_metric"], true);
     }
 
     #[test]

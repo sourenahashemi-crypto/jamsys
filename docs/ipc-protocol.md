@@ -4,8 +4,14 @@ Transport: `SOCK_STREAM` Unix socket at `$XDG_RUNTIME_DIR/jamsys/sock` (mode 060
 0700 directory; peer UID additionally checked via `SO_PEERCRED`).
 
 Framing: **newline-delimited JSON**. One request object per line, one response object per
-line. Max 64 KiB per line. Unsolicited push frames may arrive at any time after
-`subscribe`.
+line. Max 64 KiB per **line** — pipelining many small requests in one write is fine; only a
+single oversized line is refused, and an unparsed backlog above 1 MiB drops the connection.
+Unsolicited push frames may arrive at any time after `subscribe`, and a connection that only
+listens for them is never closed for being quiet.
+
+At most eight clients at once. When the table is full, a peer that holds no subscription and
+has sent nothing for a minute is reclaimed to make room, so idle connections cannot lock the
+window out of its own daemon.
 
 ```jsonc
 // request
