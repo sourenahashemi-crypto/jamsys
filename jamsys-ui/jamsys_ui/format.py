@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import math
+
 SEVERITY = ["INFO", "NOTICE", "WARNING", "CRITICAL"]
 SEV_CSS = ["sv-info", "sv-notice", "sv-warning", "sv-critical"]
 
 
 def human_bytes(b: float) -> str:
     units = ["B", "kB", "MB", "GB", "TB", "PB"]
-    v = abs(float(b))
+    n = _num(b)
+    if n is None:
+        return "—"
+    b, v = n, abs(n)
     i = 0
     while v >= 1024 and i < len(units) - 1:
         v /= 1024.0
@@ -53,13 +58,33 @@ def clock_hm(ts_ms: float) -> str:
     return time.strftime("%H:%M:%S", time.localtime(ts_ms / 1000.0))
 
 
+def _num(v) -> "float | None":
+    """A finite float, or None for anything that is not one.
+
+    These four are called with whatever the daemon sent. It is typed Rust and
+    should only ever send a number or null, but a formatter that raises takes the
+    whole page down with it, and "—" is the honest rendering of a value that is
+    not a number.
+    """
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
 def temp(c) -> str:
-    return "—" if c is None else f"{c:.0f} °C"
+    v = _num(c)
+    return "—" if v is None else f"{v:.0f} °C"
 
 
 def pct(v) -> str:
-    return "—" if v is None else f"{v:.0f}%"
+    n = _num(v)
+    return "—" if n is None else f"{n:.0f}%"
 
 
 def watts(v) -> str:
-    return "—" if v is None else f"{v:.1f} W"
+    n = _num(v)
+    return "—" if n is None else f"{n:.1f} W"

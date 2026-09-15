@@ -12,7 +12,7 @@ Two rules shape this file:
 
 from __future__ import annotations
 
-import shutil
+import os
 import subprocess
 from typing import Optional
 
@@ -43,16 +43,26 @@ PRESETS = [
 ]
 
 
+def _executable(p: str) -> bool:
+    """Present *and* runnable.
+
+    The old test accepted any regular file, so a helper installed without its
+    execute bit reported as available and then failed inside pkexec with a message
+    about permissions rather than the actionable "not installed".
+    """
+    return os.path.isfile(p) and os.access(p, os.X_OK)
+
+
 def helper_path() -> Optional[str]:
     for p in HELPER_PATHS:
-        if shutil.which(p) or _is_file(p):
+        if _executable(p):
             return p
     return None
 
 
 def power_helper_path() -> Optional[str]:
     for p in POWER_HELPER_PATHS:
-        if shutil.which(p) or _is_file(p):
+        if _executable(p):
             return p
     return None
 
@@ -95,11 +105,6 @@ class ChargeLimitControl:
                 self.last_error = (r.stderr or "").strip() or f"exit {r.returncode}"
             return False
         return True
-
-
-def _is_file(p: str) -> bool:
-    import os
-    return os.path.isfile(p)
 
 
 class KeyboardControl:
