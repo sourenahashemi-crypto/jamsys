@@ -67,11 +67,30 @@ CPU 7% · 52° | RAM 18% | GPU — | 11.2W | NET ✓
 **The investigation** — a GTK4 window with a page per subsystem, opened by clicking the
 cluster.
 
+![The Overview page, with the CPU under load and thermal throttling flagged](docs/screenshots/window-overview.png)
+
+Each card carries the current value, the *learned* normal range, a short history and a
+status word — so "44 %" is reported against what this machine usually does, not against
+a number someone picked.
+
 **The controls** — keyboard backlight and RGB, the one thing JamSys can change.
+
+## The per-core matrix
+
+One box per logical CPU, shaded by how busy that CPU is:
+
+![The CPU page: 24 logical CPUs as a heatmap matrix, eight of them pinned](docs/screenshots/window-cpu.png)
+
+It answers a shape question — *is one thread pinned while twenty-three idle, or is the
+work spread?* — which is read at a glance, where a row of bars is read one bar at a
+time. The colour is a sequential ramp and never the green/amber/red status palette: a
+core pinned at 100 % is a machine doing its job, not a machine in trouble. Every box
+prints its own percentage, hovering one names the core and its reading, and the ramp
+inverts in the dark theme so "further from the background" always means "busier".
 
 ## What it watches
 
-CPU (usage, per-core, load, frequency, temperature, throttling, PSI) · memory (usage,
+CPU (usage, per-core matrix, load, frequency, temperature, throttling, PSI) · memory (usage,
 cache, swap, pressure, OOM, per-process leak detection) · Intel and NVIDIA GPUs
 (utilisation, VRAM, temperature, power, P-state, runtime power management, Xid errors)
 · battery and power (charge, watts, voltage, health, cycles, runtime, AC state,
@@ -190,6 +209,8 @@ the order to act on it: the verdict, each open problem with what was measured,
 what was expected, the evidence and what to try, then configuration known to
 cause trouble, then what is *not* being watched — because an absent sensor
 explains a missing alert as much as a present one explains a firing alert.
+
+![The Report page: the verdict, the open problem, and what is not being watched](docs/screenshots/window-report.png)
 
 Copy or save it as Markdown, or produce the same thing without a display:
 
@@ -390,6 +411,15 @@ gjs -m gnome-extension/tests/offline-render-test.js /tmp # offline text bounds +
 gjs -m gnome-extension/tests/live-dbus-test.js   # end-to-end against the live daemon
 gjs -m gnome-extension/tests/render-cluster.js /tmp   # draw every state to PNG
 ./scripts/fault-injection.sh list                # list only; execution needs review
+```
+
+`scripts/render-window.py` draws the window's pages to PNG by driving the real
+application against the real daemon — every window screenshot above came from it, so
+they can be regenerated rather than re-staged:
+
+```bash
+./scripts/render-window.py docs/screenshots               # the set in this README
+./scripts/render-window.py /tmp --pages Network --dark    # any page, either theme
 ```
 
 `render-cluster.js` is how the cluster was designed at all: GNOME will not load a new
