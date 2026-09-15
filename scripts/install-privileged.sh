@@ -28,11 +28,38 @@ ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 # sudo exports SUDO_USER; pkexec exports PKEXEC_UID instead. Handle both, so the
 # script works however it was elevated.
 invoker_home=""
+expect_uid=""
 if [ -n "${SUDO_USER:-}" ]; then
     invoker_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+    expect_uid="$(id -u "$SUDO_USER")"
 elif [ -n "${PKEXEC_UID:-}" ]; then
     invoker_home="$(getent passwd "$PKEXEC_UID" | cut -d: -f6)"
+    expect_uid="$PKEXEC_UID"
 fi
+
+# These binaries become pkexec targets running as root, so where they come from
+# matters. The build directories are owned by the invoking user -- that is the
+# documented workflow on a machine with a staged toolchain -- but a *group- or
+# world-writable* directory or file would let anyone on the system swap the binary
+# and have root run it at the next install. Refuse those.
+safe_to_install() {
+    local f="$1" d
+    d="$(dirname "$f")"
+    local owner perms downer dperms
+    owner="$(stat -c %u "$f")"; perms="$(stat -c %a "$f")"
+    downer="$(stat -c %u "$d")"; dperms="$(stat -c %a "$d")"
+    if [ "$owner" != "0" ] && [ "$owner" != "${expect_uid:-$owner}" ]; then
+        echo "refusing $f: owned by uid $owner, which is neither root nor the invoking user" >&2
+        return 1
+    fi
+    case "$perms" in *[2367]|*[2367]?) echo "refusing $f: group- or world-writable ($perms)" >&2; return 1;; esac
+    case "$dperms" in *[2367]|*[2367]?) echo "refusing $f: its directory $d is group- or world-writable ($dperms)" >&2; return 1;; esac
+    if [ "$downer" != "0" ] && [ "$downer" != "${expect_uid:-$downer}" ]; then
+        echo "refusing $f: directory $d is owned by uid $downer" >&2
+        return 1
+    fi
+    return 0
+}
 
 find_binary() {
     local name="$1" c
@@ -42,7 +69,10 @@ find_binary() {
         ${invoker_home:+"$invoker_home/.cache/jamsys-target/release/$name"} \
         "$HOME/.cache/jamsys-target/release/$name"
     do
-        [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+        [ -x "$c" ] || continue
+        safe_to_install "$c" || continue
+        printf '%s' "$c"
+        return 0
     done
     return 1
 }

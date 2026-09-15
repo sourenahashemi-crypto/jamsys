@@ -8,6 +8,9 @@
 export const pct = v => `${Math.round(v)}%`;
 export const deg = v => `${Math.round(v)}°`;
 export const watt = v => `${Math.abs(v).toFixed(1)}W`;
+/** Signed form: a negative reading is charge going in, not power coming out. */
+export const wattSigned = (v, onBattery) =>
+    onBattery || v >= 0 ? watt(v) : `+${watt(v)}`;
 
 /** The line shown while nothing is wrong. `show` decides which readings appear. */
 export function normalLine(s, show, minimal) {
@@ -31,7 +34,7 @@ export function normalLine(s, show, minimal) {
 export function shortAlert(s) {
     const sub = (s.alert_subsystem || '').toUpperCase();
     switch (s.alert_subsystem) {
-    case 'Power':   return `${sub} ${watt(s.power_w)}`;
+    case 'Power':   return `${sub} ${wattSigned(s.power_w, s.on_battery)}`;
     case 'CPU':     return `${sub} ${pct(s.cpu_pct)} ${deg(s.cpu_temp_c)}`;
     case 'Memory':  return `${sub} ${pct(s.mem_pct)}`;
     case 'GPU':     return `${sub} ${pct(s.gpu_pct)}`;

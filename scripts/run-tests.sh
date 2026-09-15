@@ -53,12 +53,15 @@ echo "Python"
 run "xabove"        python3 jamsys-ui/tests/xabove-test.py
 run "charge-limit"  python3 jamsys-ui/tests/charge-limit-test.py
 run "report"        python3 jamsys-ui/tests/report-test.py
+run "ipc-client"    python3 jamsys-ui/tests/client-test.py
 if [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then
     run "page-refresh (GTK)" python3 jamsys-ui/tests/page-refresh-test.py
     run "core-matrix (GTK)"  python3 jamsys-ui/tests/core-matrix-test.py
+    run "escaping (GTK)"     python3 jamsys-ui/tests/escaping-test.py
 else
     skip_note "page-refresh (GTK)" "no display"
     skip_note "core-matrix (GTK)" "no display"
+    skip_note "escaping (GTK)" "no display"
 fi
 
 echo "JavaScript"

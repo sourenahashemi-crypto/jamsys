@@ -47,6 +47,18 @@ def _self_rss() -> int:
 REFRESH_MS = 2000
 
 
+def _selected(table, dropdown, fallback):
+    """The value behind a GtkDropDown's selection, or `fallback`.
+
+    get_selected() answers GTK_INVALID_LIST_POSITION (0xFFFFFFFF) when nothing is
+    selected, which indexes nothing and raises.
+    """
+    i = dropdown.get_selected()
+    if i == Gtk.INVALID_LIST_POSITION or not 0 <= i < len(table):
+        return fallback
+    return table[i][1]
+
+
 def _has_open_popover(widget) -> bool:
     """Is any popover under this widget currently on screen?
 
@@ -141,6 +153,13 @@ class Page(Gtk.Box):
 
     @staticmethod
     def row(title: str, value: str, subtitle: str = "") -> Adw.ActionRow:
+        """One labelled reading.
+
+        Note the escaping: AdwActionRow titles and subtitles are parsed as Pango
+        markup. Anything from the daemon -- a process name, a unit description, a
+        mount path -- must be escaped, or an ampersand makes the whole title render
+        as nothing and a tag styles it.
+        """
         r = Adw.ActionRow(title=GLib.markup_escape_text(title))
         if subtitle:
             r.set_subtitle(GLib.markup_escape_text(subtitle))
@@ -754,7 +773,7 @@ class StoragePage(Page):
                        f"{st.get('hidden_mounts', 0)} pseudo, read-only and snap mounts are hidden — "
                        "they are always full by design and would drown out real warnings.")
         for f in st.get("filesystems", []):
-            row = Adw.ActionRow(title=f["mount"],
+            row = Adw.ActionRow(title=GLib.markup_escape_text(f["mount"]),
                                 subtitle=f"{f['fstype']} on {f['device']} · {human_bytes(f['free_bytes'])} free of {human_bytes(f['total_bytes'])}")
             bar = Gtk.LevelBar(min_value=0, max_value=100, value=f["used_pct"])
             bar.set_size_request(140, 8)
@@ -918,7 +937,8 @@ class ServicesPage(Page):
         if not failed:
             g.add(self.row("Status", "no failed units"))
         for u in failed:
-            row = Adw.ActionRow(title=u["name"], subtitle=u.get("description", ""))
+            row = Adw.ActionRow(title=GLib.markup_escape_text(u["name"]),
+                                subtitle=GLib.markup_escape_text(u.get("description", "")))
             ic = Gtk.Image.new_from_icon_name("dialog-warning-symbolic")
             ic.add_css_class("sv-attention")
             row.add_prefix(ic)
@@ -966,7 +986,9 @@ class ProcessPage(Page):
                     # it can legitimately exceed one second per second on a GPU with
                     # several engines busy. Showing it as a percentage would look wrong.
                     sub += f" · gpu {q['gpu_ns_per_s']/1e9:.2f} engine-s/s"
-                row = Adw.ActionRow(title=f"{q['name']}  ({q['pid']})", subtitle=GLib.markup_escape_text(sub))
+                row = Adw.ActionRow(
+                    title=GLib.markup_escape_text(f"{q['name']}  ({q['pid']})"),
+                    subtitle=GLib.markup_escape_text(sub))
                 val = Gtk.Label(label=f"{q['cpu_pct']:.1f}%" if key == "top_cpu" else human_bytes(q["rss_bytes"]))
                 val.add_css_class("dim-label")
                 row.add_suffix(val)
@@ -1272,11 +1294,11 @@ class HardwarePage(Page):
         self._push_rgb(control)
 
     def _on_mode(self, row, _p, control):
-        self._mode = MODES[row.get_selected()][1]
+        self._mode = _selected(MODES, row, self._mode)
         self._push_rgb(control)
 
     def _on_speed(self, row, _p, control):
-        self._speed = SPEEDS[row.get_selected()][1]
+        self._speed = _selected(SPEEDS, row, self._speed)
         self._push_rgb(control)
 
     def _on_state(self, _row, _p, control):
@@ -1322,7 +1344,7 @@ class ReportPage(Page):
         }[s["verdict"]]
 
         top = self.group("Verdict")
-        row = Adw.ActionRow(title=headline[0])
+        row = Adw.ActionRow(title=GLib.markup_escape_text(headline[0]))
         icon = Gtk.Image.new_from_icon_name(
             "emblem-ok-symbolic" if s["verdict"] == "healthy"
             else "dialog-warning-symbolic")
@@ -1801,7 +1823,8 @@ class MainWindow(Adw.ApplicationWindow):
                 sub = f"{c['tier']} tier · {c['runs']} runs · {c['avg_us']} µs average"
                 if detail:
                     sub = detail + " · " + sub
-                row = Adw.ActionRow(title=c["name"], subtitle=GLib.markup_escape_text(sub))
+                row = Adw.ActionRow(title=GLib.markup_escape_text(c["name"]),
+                                    subtitle=GLib.markup_escape_text(sub))
                 icon, css = labels.get(lab, labels["Unavailable"])
                 ic = Gtk.Image.new_from_icon_name(icon)
                 ic.add_css_class(css)
@@ -1863,7 +1886,8 @@ class MainWindow(Adw.ApplicationWindow):
                 sub = f"{s['scope']} · " + ("permanent" if not until else f"until {clock_hm(until)}")
                 if s.get("reason"):
                     sub += f" · {s['reason']}"
-                r = Adw.ActionRow(title=s["pattern"], subtitle=sub)
+                r = Adw.ActionRow(title=GLib.markup_escape_text(s["pattern"]),
+                                  subtitle=GLib.markup_escape_text(sub))
                 b = Gtk.Button(label="Remove", valign=Gtk.Align.CENTER)
                 b.add_css_class("flat")
                 b.connect("clicked", lambda _w, i=s["id"]: self._unsuppress(i))

@@ -46,27 +46,41 @@ class Client:
         self._on_push = on_push
         self._on_state = on_state
         self._connected = False
+        self._announced: Optional[bool] = None
         self._stop = threading.Event()
         self._pushq: "queue.Queue[tuple[str, dict]]" = queue.Queue(maxsize=512)
         self._reader: Optional[threading.Thread] = None
         self._pending: dict[int, queue.Queue] = {}
+        self._connect_lock = threading.Lock()
 
     # -- connection ------------------------------------------------------
 
     def connect(self) -> bool:
-        with self._lock:
-            if self._sock is not None:
-                return True
-            p = socket_path()
-            try:
-                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                s.settimeout(5.0)
-                s.connect(p)
-                self._sock = s
-                self._file = s.makefile("rwb")
-            except OSError as e:
-                self._set_state(False, f"Cannot reach the monitoring service: {e.strerror or e}")
-                return False
+        # One connect at a time, and nobody sees a half-built connection.
+        #
+        # The old code published self._sock as soon as it was open and then did the
+        # ping outside the lock, so a second thread could look up, see a socket, and
+        # start writing requests while the first thread was still reading the ping
+        # reply inline -- two threads reading one file object, with _read_until
+        # discarding any line that was not its own.
+        with self._connect_lock:
+            with self._lock:
+                if self._sock is not None:
+                    return True
+                p = socket_path()
+                try:
+                    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    # A deadline for the connect and the handshake only.
+                    s.settimeout(5.0)
+                    s.connect(p)
+                    self._sock = s
+                    self._file = s.makefile("rwb")
+                except OSError as e:
+                    self._set_state(False, f"Cannot reach the monitoring service: {e.strerror or e}")
+                    return False
+            return self._handshake()
+
+    def _handshake(self) -> bool:
         # Verify the protocol before trusting anything else it says.
         try:
             r = self.call("ping")
@@ -80,13 +94,33 @@ class Client:
                             f"The monitoring service speaks protocol {r['schema']} but this "
                             f"interface understands {SCHEMA}. Update the desktop app.")
             return False
+        # Reads from here on are blocking, not timed.
+        #
+        # The 5-second connect timeout was inherited by the file object, so an idle
+        # readline() raised TimeoutError -- an OSError subclass -- the reader thread
+        # took its `break`, and the client announced "The monitoring service
+        # disconnected" five seconds after connecting to a perfectly healthy daemon.
+        # The main window hid it by polling every two seconds; anything relying on
+        # the documented push stream saw the connection drop over and over.
+        # Liveness is the per-call queue timeout, which does not need this one.
+        with self._lock:
+            if self._sock is not None:
+                self._sock.settimeout(None)
         self._set_state(True, f"Connected to jamsysd {r.get('version','?')}")
         self._start_reader()
         return True
 
     def _set_state(self, ok: bool, msg: str) -> None:
-        if ok == self._connected and ok:
+        # Announce a *change*, in either direction.
+        #
+        # Suppressing only repeat successes meant every failed reconnect re-fired
+        # the error banner, once per retry. Comparing against _connected alone is
+        # not enough either: it starts False, so the first failure would look like
+        # no change and never be announced at all. `_announced` starts as None, so
+        # the first state of any kind is always reported.
+        if ok == self._announced:
             return
+        self._announced = ok
         self._connected = ok
         if self._on_state:
             GLib.idle_add(self._on_state, ok, msg)
@@ -177,6 +211,9 @@ class Client:
         while not self._stop.is_set() and f is not None:
             try:
                 line = f.readline()
+            except TimeoutError:
+                # Belt and braces: a timeout is silence, not a closed socket.
+                continue
             except OSError:
                 break
             if not line:
