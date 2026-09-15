@@ -442,6 +442,49 @@ of rows, each expandable to the full explanation.
 | **Diagnostics** | what the monitoring application itself costs: daemon CPU, memory, wakeups, events processed and dropped, database size, in-memory buffer, repaints pushed, UI memory |
 | **Settings** | tiers, retention, thresholds, suppressions, notifications, per-collector enable |
 
+## The per-core matrix
+
+The CPU page draws one box per logical CPU, filled from how busy that CPU is:
+
+```
+┌──────┐┌──────┐┌──────┐┌──────┐┌──────┐┌──────┐┌──────┐┌──────┐
+│ cpu0 ││ cpu1 ││ cpu2 ││ cpu3 ││ cpu4 ││ cpu5 ││ cpu6 ││ cpu7 │
+│ 100% ││ 100% ││ 100% ││ 100% ││   4% ││  21% ││   4% ││   2% │
+└──────┘└──────┘└──────┘└──────┘└──────┘└──────┘└──────┘└──────┘
+   ██      ██      ██      ██      ░░      ▒▒      ░░      ░░
+                                       idle 0% ▁▂▃▄▅▆▇ 100% busy
+```
+
+The grid replaced a row of level bars because the question it answers is a shape
+question — *is one thread pinned while twenty-three idle, or is the load spread?* —
+and a shape is read at a glance, where a row of bars is read one bar at a time.
+
+Four rules make it honest:
+
+* **Colour is a sequential ramp, not the status palette.** A core pinned at 100 %
+  is a machine doing its job, not a machine in trouble, so the boxes are shaded
+  along a single blue ramp (light → dark). Green/amber/red stays reserved for
+  things that are actually wrong; if it appeared here, every compile would look
+  like an incident.
+* **Every box prints its own percentage.** Colour is a second reading of the
+  number, never the only carrier of it — the same rule the status pills follow.
+  Hovering a box gives the core and its reading to one decimal; a screen reader
+  gets the summary sighted users get from the shape ("busiest cpu7 at 93 percent").
+* **The ramp inverts with the theme.** On a light surface idle is the palest step
+  and recedes into the card; on a dark surface idle is the darkest. "More ink than
+  the surface" means "busier" in both, rather than the scale reversing meaning when
+  the theme changes.
+* **The grid stays a grid.** Column count is chosen to divide the core count, so
+  the last row is never a stub, and is capped so a wide window adds columns rather
+  than stretching eight boxes into letterboxes. Its minimum width is a four-column
+  grid: allowing a single column would let GTK ask for the height of a 24-row stack
+  and impose that as the window's minimum height.
+
+Drawing note: the boxes are path fills with a stroked hairline, not
+`Gsk.RoundedRect` nodes. `push_rounded_clip` and `append_border` render *nothing*
+on this stack — the cells come out invisible except for their text — so anything
+rounded here is built with `Gsk.PathBuilder`.
+
 ## The network event timeline
 
 Exactly as the brief asks, because "when did it break" is the actual question:

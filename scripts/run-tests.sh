@@ -55,8 +55,10 @@ run "charge-limit"  python3 jamsys-ui/tests/charge-limit-test.py
 run "report"        python3 jamsys-ui/tests/report-test.py
 if [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then
     run "page-refresh (GTK)" python3 jamsys-ui/tests/page-refresh-test.py
+    run "core-matrix (GTK)"  python3 jamsys-ui/tests/core-matrix-test.py
 else
     skip_note "page-refresh (GTK)" "no display"
+    skip_note "core-matrix (GTK)" "no display"
 fi
 
 echo "JavaScript"

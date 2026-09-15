@@ -27,7 +27,8 @@ from .hardware import (CHARGE_LIMITS, MODES, PRESETS, SPEEDS, ChargeLimitControl
                        ints_to_rgba, rgba_to_ints)
 from .format import (SEVERITY, clock_hm, human_ago, human_bps, human_bytes,
                      human_duration, pct, temp, watts)
-from .widgets import CSS, MetricCard, Sparkline, StatusPill, severity_row
+from .widgets import (CSS, CoreMatrix, MetricCard, Sparkline, StatusPill,
+                      core_usage_legend, severity_row)
 
 APP_ID = "org.jamsys.Monitor"
 
@@ -566,23 +567,20 @@ class CpuPage(Page):
 
         cores = c.get("per_core_pct", [])
         if cores:
-            cg = self.group("Per-core usage")
-            box = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True,
-                              min_children_per_line=4, max_children_per_line=8,
-                              row_spacing=6, column_spacing=6)
-            box.set_margin_top(8)
-            for i, v in enumerate(cores):
-                cell = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-                lab = Gtk.Label(label=f"cpu{i}", xalign=0.5)
-                lab.add_css_class("caption")
-                lab.add_css_class("dim-label")
-                bar = Gtk.LevelBar(min_value=0, max_value=100, value=v)
-                bar.set_size_request(-1, 8)
-                val = Gtk.Label(label=f"{v:.0f}%", xalign=0.5)
-                val.add_css_class("caption")
-                cell.append(lab); cell.append(bar); cell.append(val)
-                box.append(cell)
-            cg.add(box)
+            hot = max(range(len(cores)), key=lambda i: cores[i])
+            spread = max(cores) - min(cores)
+            cg = self.group(
+                "Per-core usage",
+                f"One box per logical CPU · busiest cpu{hot} at {cores[hot]:.0f}% · "
+                + ("work is spread evenly" if spread < 25
+                   else f"{spread:.0f} points between the busiest and the quietest"))
+            holder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            holder.set_margin_top(8)
+            matrix = CoreMatrix()
+            matrix.set_values(cores)
+            holder.append(matrix)
+            holder.append(core_usage_legend())
+            cg.add(holder)
             self.body.append(cg)
 
         self.body.append(self.win.chart("cpu", "usage_pct", "", "CPU usage", "%"))
