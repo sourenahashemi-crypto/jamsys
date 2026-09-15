@@ -29,7 +29,8 @@ if not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")):
 
 Adw.init()
 
-from jamsys_ui.format import human_bytes, pct, temp, watts  # noqa: E402
+from jamsys_ui.format import (UNKNOWN, clock_hm, human_ago, human_bps,  # noqa: E402
+                               human_bytes, human_duration, pct, temp, watts)
 
 passed = failed = 0
 
@@ -91,11 +92,25 @@ check("no unescaped daemon value reaches a row title", not offenders,
       "; ".join(offenders))
 
 print("\nformatters answer for values they were not promised")
+ONE_ARG = (temp, pct, watts, human_bytes, human_bps, human_duration, clock_hm)
 for bad in [None, "n/a", float("nan"), float("inf"), True, [], {}]:
-    ok = all(isinstance(f(bad), str) for f in (temp, pct, watts, human_bytes))
+    ok = all(isinstance(f(bad), str) for f in ONE_ARG) \
+        and isinstance(human_ago(bad, 0), str) and isinstance(human_ago(0, bad), str)
     check(f"{bad!r} formats without raising", ok)
+check("an unknown rate carries no unit", human_bps(None) == UNKNOWN,
+      f"got {human_bps(None)!r} — an em dash with /s after it reads as a value")
+check("an unknown duration and time say so",
+      human_duration(None) == UNKNOWN and clock_hm(None) == UNKNOWN
+      and human_ago(None, 0) == UNKNOWN)
 check("and a real number still formats", temp(55) == "55 °C" and pct(42) == "42%"
-      and watts(11.24) == "11.2 W" and human_bytes(1536) == "1.5 kB")
+      and watts(11.24) == "11.2 W" and human_bytes(1536) == "1.5 kB"
+      and human_bps(1536) == "1.5 kB/s" and human_duration(3600) == "1h")
+check("a rounding artefact does not invent a minus sign",
+      pct(-0.4) == "0%" and temp(-0.2) == "0 °C" and watts(-0.04) == "0.0 W",
+      f"{pct(-0.4)} {temp(-0.2)} {watts(-0.04)}")
+check("but a real negative keeps its sign",
+      watts(-38.2) == "-38.2 W" and human_bytes(-1536) == "-1.5 kB",
+      f"{watts(-38.2)} {human_bytes(-1536)}")
 check("nonsense reads as unknown, not as zero", temp(float("nan")) == "—"
       and pct("n/a") == "—", f"{temp(float('nan'))} {pct('n/a')}")
 

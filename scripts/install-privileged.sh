@@ -39,23 +39,48 @@ fi
 
 # These binaries become pkexec targets running as root, so where they come from
 # matters. The build directories are owned by the invoking user -- that is the
-# documented workflow on a machine with a staged toolchain -- but a *group- or
-# world-writable* directory or file would let anyone on the system swap the binary
-# and have root run it at the next install. Refuse those.
+# documented workflow on a machine with a staged toolchain -- so user ownership is
+# expected and fine. What is not fine is anyone *else* being able to swap the file
+# before root runs it. So: never world-writable, and group-writable only when the
+# group is private to the owner (the usual "user private group" layout, which is
+# what cargo's 0775 under a 002 umask produces).
+writable_by_others() {
+    local path="$1" perms gid members
+    perms="$(stat -c %a "$path")"
+    gid="$(stat -c %g "$path")"
+    if [ $((0$perms & 0002)) -ne 0 ]; then
+        echo "world-writable ($perms)"
+        return 0
+    fi
+    if [ $((0$perms & 0020)) -ne 0 ]; then
+        members="$(getent group "$gid" | cut -d: -f4)"
+        if [ -n "$members" ] && [ "$members" != "$(id -un "$(stat -c %u "$path")" 2>/dev/null)" ]; then
+            echo "group-writable ($perms) and group $gid has other members: $members"
+            return 0
+        fi
+    fi
+    return 1
+}
+
 safe_to_install() {
-    local f="$1" d
+    local f="$1" d why
     d="$(dirname "$f")"
-    local owner perms downer dperms
-    owner="$(stat -c %u "$f")"; perms="$(stat -c %a "$f")"
-    downer="$(stat -c %u "$d")"; dperms="$(stat -c %a "$d")"
+    local owner downer
+    owner="$(stat -c %u "$f")"; downer="$(stat -c %u "$d")"
     if [ "$owner" != "0" ] && [ "$owner" != "${expect_uid:-$owner}" ]; then
         echo "refusing $f: owned by uid $owner, which is neither root nor the invoking user" >&2
         return 1
     fi
-    case "$perms" in *[2367]|*[2367]?) echo "refusing $f: group- or world-writable ($perms)" >&2; return 1;; esac
-    case "$dperms" in *[2367]|*[2367]?) echo "refusing $f: its directory $d is group- or world-writable ($dperms)" >&2; return 1;; esac
     if [ "$downer" != "0" ] && [ "$downer" != "${expect_uid:-$downer}" ]; then
-        echo "refusing $f: directory $d is owned by uid $downer" >&2
+        echo "refusing $f: its directory $d is owned by uid $downer" >&2
+        return 1
+    fi
+    if why="$(writable_by_others "$f")"; then
+        echo "refusing $f: $why -- anyone in that set could swap the binary root is about to run" >&2
+        return 1
+    fi
+    if why="$(writable_by_others "$d")"; then
+        echo "refusing $f: its directory $d is $why" >&2
         return 1
     fi
     return 0
