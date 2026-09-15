@@ -36,11 +36,27 @@ Never "anomaly detected".
 tachometer dials, a redline, machined bezels, a segmented power strip and dashboard
 telltales that stay dark until they have something to say.
 
-![Instrument cluster, idle](docs/screenshots/cluster-idle.png)
+![Instrument cluster, idle — dials cut out onto the wallpaper](docs/screenshots/cluster-idle.png)
 
-When something is wrong it says so, in the header and on the instruments:
+When something needs attention it says which subsystem, and what:
+
+![Instrument cluster with a power warning in the header](docs/screenshots/cluster-warn.png)
+
+And when something is wrong it says so in the header and on the instruments — the
+telltales light, the redline is crossed, the battery strip goes red:
 
 ![Instrument cluster, critical](docs/screenshots/cluster-critical.png)
+
+That is the **cut-out** face, which is what ships. There is a panelled **housing** face
+too, for anyone who would rather the instruments sat in a box than on the wallpaper —
+`style` in the extension's preferences, `jamsys-cluster --housing` for the window:
+
+![The same cluster in its housing](docs/screenshots/cluster-housing-idle.png)
+
+If the daemon is not running, the cluster says that instead of leaving three-minute-old
+numbers on screen looking live, and gives you the command that fixes it:
+
+![The cluster with no daemon: JamSys — waiting for monitoring](docs/screenshots/cluster-offline.png)
 
 It does not poll. The daemon pushes an update only when a displayed value has changed
 enough for a human to notice, so nothing repaints for sensor noise and nothing animates.

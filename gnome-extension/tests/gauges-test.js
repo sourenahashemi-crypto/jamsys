@@ -7,6 +7,7 @@
  *
  *   gjs -m gnome-extension/tests/gauges-test.js
  */
+import GLib from 'gi://GLib';
 import {norm, readings, rate, A0, SWEEP, CLUSTER_W, CLUSTER_H,
         BARE_W, BARE_H, BARE_DIALS, bareHitRegions}
     from '../jamsys@jamsys.org/gauges.js';
@@ -143,6 +144,34 @@ eq(rate(1.5e9).u, 'GB/s', 'and gigabytes above that');
 ok(rate(NaN).n === '0' && rate(-5).n === '0',
    'nonsense reads as zero rather than NaN on the gadget');
 ok(rate(12345).n.length <= 3, 'never more than three digits, so the strip cannot grow');
+
+print('the documented face is the face that ships');
+/* The README's cluster screenshots showed the housing for months after the cut-out
+ * became the default, because nothing tied the two together. A reader comparing the
+ * page to their own screen saw a different gadget. If a default moves, this fails and
+ * the screenshots get regenerated with it:
+ *     gjs -m gnome-extension/tests/render-cluster.js docs/screenshots
+ */
+const readFile = path => {
+    const [got, bytes] = GLib.file_get_contents(path);
+    if (!got) throw new Error(`cannot read ${path}`);
+    return new TextDecoder().decode(bytes);
+};
+const here = GLib.path_get_dirname(import.meta.url.replace('file://', ''));
+const schema = readFile(`${here}/../jamsys@jamsys.org/schemas/org.gnome.shell.extensions.jamsys.gschema.xml`);
+const styleDefault = /<key name="style"[\s\S]*?<default>'([a-z]+)'<\/default>/.exec(schema);
+ok(styleDefault && styleDefault[1] === 'cutout',
+   `the Shell extension defaults to the cut-out face (got ${styleDefault && styleDefault[1]})`);
+
+const standalone = readFile(`${here}/../jamsys@jamsys.org/standalone.js`);
+ok(/bare:\s*saved\.bare\s*\?\?\s*true/.test(standalone),
+   'and so does the standalone window');
+
+const harness = readFile(`${here}/render-cluster.js`);
+ok(/render\('idle', base\);/.test(harness) && /face = 'cutout'/.test(harness),
+   "so render-cluster.js writes the cut-out under the README's plain names");
+for (const name of ['idle', 'warn', 'critical', 'offline', 'housing-idle'])
+    ok(harness.includes(`'${name}'`), `and still renders the ${name} face`);
 
 print(`\n${failures === 0 ? 'ALL PASS' : failures + ' FAILURE(S)'}`);
 imports.system.exit(failures === 0 ? 0 : 1);
