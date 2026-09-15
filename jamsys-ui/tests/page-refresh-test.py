@@ -66,8 +66,13 @@ def pump(until, seconds=5.0):
     ctx = GLib.MainContext.default()
     deadline = time.monotonic() + seconds
     while True:
-        while ctx.pending():
+        # Bounded: a page stuck in a render loop keeps the queue permanently
+        # non-empty, and an unbounded drain would spin here forever instead of
+        # timing out and reporting it.
+        drained = 0
+        while ctx.pending() and drained < 200:
             ctx.iteration(False)
+            drained += 1
         if until():
             return True
         if time.monotonic() >= deadline:
@@ -151,6 +156,62 @@ if moved > 0.0:
     check("scroll position is restored after a refresh",
           abs(adj.get_value() - moved) < 2.0,
           f"was {moved:.1f}, now {adj.get_value():.1f}")
+
+print("\nthe Report page fetches on a schedule, not in a loop")
+# render() calls _fetch(); _fetch's completion calls render(). _pending is
+# already cleared by then, so before the age check this recursed as fast as the
+# daemon could answer -- 1101 renders in five seconds, a core held busy for as
+# long as the page was open, and a page GTK could never finish allocating.
+from jamsys_ui.app import REFRESH_MS, ReportPage  # noqa: E402
+
+
+class StubClient:
+    connected = True
+
+    def __init__(self):
+        self.calls = 0
+
+    def call(self, op, **kw):
+        self.calls += 1
+        return {"alerts": [], "collectors": [], "events": [], "items": []}
+
+
+class StubWin:
+    def __init__(self):
+        self.client = StubClient()
+        self.last_snapshot = {"snapshot": {}}
+        self.page = None
+
+    def current_page(self):
+        return self.page
+
+
+stub = StubWin()
+report_page = ReportPage(stub)
+stub.page = report_page
+report_page.render(stub.last_snapshot)
+pump(lambda: stub.client.calls > 0, seconds=5.0)
+first = stub.client.calls
+check("the first render fetches", first > 0, f"calls={first}")
+
+# Two seconds is one refresh interval: a page that re-fetches per render would
+# be into the hundreds by now.
+start = time.monotonic()
+pump(lambda: False, seconds=2.0)
+elapsed = time.monotonic() - start
+per_refresh = len(("alerts", "coverage", "events", "stats", "inventory"))
+budget = first + per_refresh * (elapsed / (REFRESH_MS / 1000.0) + 2)
+check("and it does not re-fetch on every re-render",
+      stub.client.calls <= budget,
+      f"{stub.client.calls} IPC calls in {elapsed:.1f}s, budget {budget:.0f}")
+
+# The throttle must not become a freeze: after the interval, a render fetches again.
+before = stub.client.calls
+pump(lambda: False, seconds=REFRESH_MS / 1000.0 + 0.2)
+report_page.render(stub.last_snapshot)
+pump(lambda: stub.client.calls > before, seconds=5.0)
+check("a render after the interval fetches fresh data",
+      stub.client.calls > before, f"stuck at {before}")
 
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

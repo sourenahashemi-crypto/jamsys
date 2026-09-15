@@ -1302,6 +1302,7 @@ class ReportPage(Page):
         self._summary = None
         self._extra = {"alerts": [], "coverage": [], "events": [], "stats": {}}
         self._pending = False
+        self._fetched_at = 0.0
 
     def render(self, snap):
         self.clear()
@@ -1391,10 +1392,26 @@ class ReportPage(Page):
     # -- data ---------------------------------------------------------
 
     def _fetch(self):
-        """Pull the extra views the report needs, then re-render once."""
+        """Pull the extra views the report needs, then re-render once.
+
+        "Once" needs enforcing. The re-render at the end of a fetch calls
+        straight back into here, and `_pending` is already False by then, so
+        without an age check this is an unbounded loop: render, fetch, render,
+        fetch, as fast as the daemon can answer. Measured at 1101 renders in
+        five seconds -- a busy core, held for as long as the page is open, on
+        the one page whose job is to tell you what is using your machine. It
+        also never lets the page finish being laid out.
+
+        So: no more often than the window refreshes anyway. A failed fetch
+        leaves `_summary` None and is retried immediately.
+        """
         if self._pending or not self.win.client.connected:
             return
+        if (self._summary is not None
+                and time.monotonic() - self._fetched_at < REFRESH_MS / 1000.0):
+            return
         self._pending = True
+        self._fetched_at = time.monotonic()
 
         def work():
             c = self.win.client
