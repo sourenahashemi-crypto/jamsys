@@ -18,6 +18,7 @@ let watchCount = 0;
 let retryCb = null;
 let retrySource = 0;
 const proxies = [];
+const messages = [];
 class Proxy {
     // Strict, like the house stubs. A zero-argument constructor let a wrong bus
     // type, bus name and object path all pass unnoticed.
@@ -74,7 +75,7 @@ const glib = {
         },
     },
 };
-const harness = new Function('Gio', 'GLib', 'Proxy', `
+const harness = new Function('Gio', 'GLib', 'Proxy', 'printerr', `
     const BUS_NAME = 'org.jamsys.Daemon', OBJECT_PATH = '/org/jamsys/Daemon';
     const RECONNECT_S = 10;
     let proxy = null, state = null;
@@ -83,7 +84,7 @@ const harness = new Function('Gio', 'GLib', 'Proxy', `
     ${daemonCode}
     return {connectDaemon, stopDaemon, getState: () => state,
             isConnected: () => proxy !== null};
-`)(gio, glib, Proxy);
+`)(gio, glib, Proxy, message => messages.push(message));
 harness.connectDaemon();
 proxies[0].reply([JSON.stringify({health: 'healthy', cpu_pct: 77})], null);
 ok(harness.getState()?.cpu_pct === 77, 'the initial reading arrives');
@@ -91,6 +92,8 @@ ok(vanished !== null, 'the window watches for the daemon disappearing');
 vanished?.();
 ok(harness.getState() === null, 'daemon loss clears old readings immediately');
 ok(proxies[0].disconnected, 'old signal subscription is disconnected');
+ok(messages.some(m => m.includes('jamsysd went away')),
+    'a real daemon loss is reported');
 proxies[0].reply([JSON.stringify({cpu_pct: 88})], null);
 ok(harness.getState() === null, 'an old reply cannot restore stale readings');
 appeared();
@@ -107,8 +110,11 @@ try {
 } catch (e) {
     ok(false, `a failed initial call must not throw: ${e.message}`);
 }
+const messagesBeforeClose = messages.length;
 harness.stopDaemon();
 ok(unwatched && proxies[2].disconnected, 'closing the window releases watch and signal');
+ok(messages.length === messagesBeforeClose,
+    'closing the window does not falsely report daemon loss');
 proxies[2].signal(null, null, [JSON.stringify({cpu_pct: 99})]);
 ok(harness.getState() === null, 'queued callbacks after close are ignored');
 
@@ -135,6 +141,9 @@ ok(harness.getState() === null, 'queued callbacks after close are ignored');
     harness.stopDaemon();
     ok(retryCb === null, 'and closing the window cancels the retry');
 }
+
+ok(source.includes('popover?.popdown();') && source.includes('popover?.unparent();'),
+    'closing the window detaches its popover before GTK finalizes the drawing area');
 
 print(`${failures} failure(s)`);
 imports.system.exit(failures ? 1 : 0);
