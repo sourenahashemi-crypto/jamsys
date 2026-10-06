@@ -303,7 +303,9 @@ root-privileged parser reachable from unprivileged code. See
 sudo apt install build-essential rustc cargo python3-gi gir1.2-gtk-4.0 gir1.2-adw-1
 ```
 
-Rust 1.75 or newer. The UI needs no build step.
+Rust 1.85 or newer (the locked dependencies use the 2024 edition). If your
+distribution ships an older Rust, use a current Rust toolchain before building.
+The UI needs GTK 4.14 or newer and libadwaita 1.4 or newer, with no build step.
 
 ### Uninstall
 
