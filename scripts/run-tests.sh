@@ -54,6 +54,10 @@ run "xabove"        python3 jamsys-ui/tests/xabove-test.py
 run "charge-limit"  python3 jamsys-ui/tests/charge-limit-test.py
 run "report"        python3 jamsys-ui/tests/report-test.py
 run "ipc-client"    python3 jamsys-ui/tests/client-test.py
+run "ipc-lifecycle" python3 jamsys-ui/tests/client-lifecycle-test.py
+run "process-filter" python3 jamsys-ui/tests/processes-test.py
+run "window-lifecycle" python3 jamsys-ui/tests/window-lifecycle-test.py
+run "package-layout" python3 scripts/packaging-test.py
 if [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then
     run "page-refresh (GTK)" python3 jamsys-ui/tests/page-refresh-test.py
     run "core-matrix (GTK)"  python3 jamsys-ui/tests/core-matrix-test.py

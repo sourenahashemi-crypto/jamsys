@@ -14,6 +14,15 @@ ran the automated suites, read the already-running daemon over D-Bus, rendered t
 new offline face, and built the package. It did not install changes or exercise
 hardware controls. See [the verification report](verification-2026-09-10.md).
 
+The **2026-10-05 review** fixed client lifecycle, incomplete-report handling,
+request framing and package creation, and added process filtering and a
+window-wide connection banner. It ran in a constrained Ubuntu 24.04 container,
+not on the target laptop. The release package built successfully; tests needing
+real devices, listening sockets, a display or a live daemon were not validated
+there. No installation or hardware writes occurred. New window layout and
+interaction remain **unverified on hardware**. See the exact results and remaining
+checks in [the new verification report](verification-2026-10-05.md).
+
 ---
 
 ## 1. Fully working

@@ -7,6 +7,9 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$HERE")"
+# Each crate otherwise defaults to its own target directory, but packaging reads
+# all four executables from one place. Do not depend on a sourced dev shell.
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/build/cargo-target}"
 VERSION="$(grep -m1 '^version' "$ROOT/jamsys-daemon/Cargo.toml" | cut -d'"' -f2)"
 ARCH="$(dpkg --print-architecture)"
 STAGE="${BUILD_DIR:-$ROOT/build}/jamsys_${VERSION}_${ARCH}"
@@ -73,7 +76,7 @@ Priority: optional
 Architecture: ${ARCH}
 Maintainer: JamSys <jamsys@localhost>
 Installed-Size: ${SIZE}
-Depends: libc6, python3 (>= 3.10), python3-gi, gir1.2-gtk-4.0, gir1.2-adw-1, systemd, policykit-1 | polkitd, libx11-6
+Depends: libc6, python3 (>= 3.10), python3-gi, gir1.2-gtk-4.0 (>= 4.14), gir1.2-adw-1 (>= 1.4), systemd, policykit-1 | polkitd, libx11-6
 Recommends: libnotify-bin, gnome-shell (>= 48), gjs
 Suggests: nvidia-utils-535 | libnvidia-ml1
 Description: Lightweight local system-health monitor
@@ -171,4 +174,6 @@ chmod 0755 "$STAGE/DEBIAN/postinst" "$STAGE/DEBIAN/prerm" "$STAGE/DEBIAN/postrm"
 OUT="${BUILD_DIR:-$ROOT/build}/jamsys_${VERSION}_${ARCH}.deb"
 dpkg-deb --root-owner-group --build "$STAGE" "$OUT"
 echo "==> $OUT"
-dpkg-deb --info "$OUT" | head -20
+# Drain the producer: head can give dpkg-deb SIGPIPE under pipefail after a
+# successful build, making packaging intermittently exit 141.
+dpkg-deb --info "$OUT" | sed -n '1,20p'
