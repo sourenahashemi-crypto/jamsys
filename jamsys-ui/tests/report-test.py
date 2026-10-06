@@ -42,7 +42,7 @@ check("None yields an empty list", report.rows(None) == [])
 check("a scalar yields an empty list", report.rows(42) == [])
 
 print("\nverdict")
-base = {"snapshot": {}}
+base = {"snapshot": {"cpu": {"usage_pct": 2.0}}}
 s = report.summarise(base, [], {}, [], {})
 check("no alerts reads as healthy", s["verdict"] == "healthy")
 s = report.summarise(base, [{"severity": 2, "title": "x", "resolved_ts": None}], {}, [], {})
@@ -127,6 +127,33 @@ for bad in ({}, {"snapshot": None}, {"snapshot": {"power": None}}):
         check(f"survives {bad}", True)
     except Exception as e:  # noqa: BLE001
         check(f"survives {bad}", False, repr(e))
+
+print("\nincomplete data cannot imply healthy monitoring")
+s = report.summarise({}, None, None, None, {})
+check("missing readings and alerts are unknown", s["verdict"] == "unknown")
+md = report.to_markdown(s)
+check("unavailable alerts are not called absent", "Unknown — alert data" in md)
+check("missing sections are named", all(k in s["missing"] for k in ("snapshot", "alerts", "coverage")))
+
+def partial(op, **params):
+    if op == "alerts":
+        raise RuntimeError("service restarted")
+    return base if op == "snapshot" else {}
+
+s = report.collect(partial)
+check("failed alert fetch is not replaced with success", s["verdict"] == "unknown")
+check("error reason survives export", "service restarted" in report.to_markdown(s))
+critical = report.summarise(base, [{"severity": 3, "title": "Hot"}], None, [], {})
+check("partial data retains known critical alerts", critical["verdict"] == "critical")
+check("critical report still explains missing coverage", "coverage" in critical["missing"])
+s = report.summarise({**base, "collectors_usable": 0}, [], {}, [], {})
+check("zero usable collectors cannot be healthy", s["verdict"] == "unknown")
+
+long_text = "Read this complete diagnostic explanation " * 8 + "IMPORTANT_END"
+s = report.summarise(base, [{"severity": 2, "title": "Issue",
+                            "detail": {"what": long_text}}], {}, [], {})
+check("terminal reports wrap instead of discarding long explanations",
+      "IMPORTANT_END" in report.to_plain(s))
 
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

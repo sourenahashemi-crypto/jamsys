@@ -37,23 +37,13 @@ if "--report" in sys.argv:
               file=sys.stderr)
         raise SystemExit(1)
 
-    def _call(op, **kw):
-        try:
-            return c.call(op, **kw)
-        except DaemonError:
-            return None
-
-    summary = _report.summarise(
-        _call("snapshot") or {},
-        _report.rows(_call("alerts", open_only=True, limit=50), "alerts"),
-        _call("coverage"),
-        _call("events", limit=15),
-        _call("stats") or {},
-        _call("inventory"),
-    )
+    try:
+        summary = _report.collect(c.call)
+    finally:
+        c.shutdown()
     plain = "--markdown" not in sys.argv and sys.stdout.isatty()
     print(_report.to_plain(summary) if plain else _report.to_markdown(summary))
-    raise SystemExit(0)
+    raise SystemExit(1 if summary.get("missing") else 0)
 
 # `--charge-limit <N>` sets the battery charge-stop threshold without opening the
 # window, so it can go in a script or a login hook. It goes through the same
