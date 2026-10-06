@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import os
 import socket
+import select
+import time
 import threading
 import queue
 from typing import Any, Callable, Optional
@@ -30,11 +32,10 @@ class DaemonError(Exception):
 
 
 class Client:
-    """Connects lazily and reconnects on failure.
+    """A connection is published only after its handshake and retired by identity.
 
-    The UI must survive the daemon being restarted underneath it — that is the whole
-    point of separating them — so every call path treats a dropped socket as a normal
-    condition rather than an error to show the user.
+    One reader owns each socket. A retiring reader must never close the socket
+    that replaced it, and closing the window must wake blocked reads and calls.
     """
 
     def __init__(self, on_push: Optional[Callable[[str, dict], None]] = None,
@@ -42,199 +43,223 @@ class Client:
         self._sock: Optional[socket.socket] = None
         self._file = None
         self._lock = threading.Lock()
+        self._write_lock = threading.Lock()
+        self._connect_lock = threading.Lock()
         self._next_id = 1
         self._on_push = on_push
         self._on_state = on_state
         self._connected = False
         self._announced: Optional[bool] = None
         self._stop = threading.Event()
-        self._pushq: "queue.Queue[tuple[str, dict]]" = queue.Queue(maxsize=512)
         self._reader: Optional[threading.Thread] = None
         self._pending: dict[int, queue.Queue] = {}
-        self._connect_lock = threading.Lock()
-
-    # -- connection ------------------------------------------------------
 
     def connect(self) -> bool:
-        # One connect at a time, and nobody sees a half-built connection.
-        #
-        # The old code published self._sock as soon as it was open and then did the
-        # ping outside the lock, so a second thread could look up, see a socket, and
-        # start writing requests while the first thread was still reading the ping
-        # reply inline -- two threads reading one file object, with _read_until
-        # discarding any line that was not its own.
         with self._connect_lock:
             with self._lock:
+                if self._stop.is_set():
+                    return False
                 if self._sock is not None:
                     return True
-                p = socket_path()
-                try:
-                    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                    # A deadline for the connect and the handshake only.
-                    s.settimeout(5.0)
-                    s.connect(p)
-                    self._sock = s
-                    self._file = s.makefile("rwb")
-                except OSError as e:
-                    self._set_state(False, f"Cannot reach the monitoring service: {e.strerror or e}")
-                    return False
-            return self._handshake()
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            stream = None
+            try:
+                sock.settimeout(5.0)
+                sock.connect(socket_path())
+                stream = sock.makefile("rb")
+                sock.sendall(b'{"id":0,"op":"ping","params":{}}\n')
+                # The deadline applies to the whole handshake, including pushes
+                # or malformed frames arriving before the ping response.
+                deadline = time.monotonic() + 5.0
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise DaemonError("The monitoring service did not complete its handshake")
+                    sock.settimeout(remaining)
+                    line = stream.readline()
+                    if not line:
+                        raise DaemonError("The monitoring service closed the connection")
+                    reply = self._decode(line)
+                    if reply is not None and reply.get("id") == 0:
+                        break
+                data = self._result(reply)
+                if not isinstance(data, dict) or not isinstance(data.get("schema"), int):
+                    raise DaemonError("The monitoring service sent an invalid handshake")
+                if data["schema"] != SCHEMA:
+                    raise DaemonError(
+                        f"The monitoring service speaks protocol {data['schema']} but this "
+                        f"interface understands {SCHEMA}. Update JamSys.")
+                sock.settimeout(None)
+            except (OSError, ValueError, DaemonError) as err:
+                sock.close()
+                if stream:
+                    stream.close()
+                with self._lock:
+                    if not self._stop.is_set():
+                        self._set_state(False, f"Cannot reach the monitoring service: {err}")
+                return False
 
-    def _handshake(self) -> bool:
-        # Verify the protocol before trusting anything else it says.
-        try:
-            r = self.call("ping")
-        except DaemonError as e:
-            self._close()
-            self._set_state(False, str(e))
-            return False
-        if r.get("schema", 0) > SCHEMA:
-            self._close()
-            self._set_state(False,
-                            f"The monitoring service speaks protocol {r['schema']} but this "
-                            f"interface understands {SCHEMA}. Update the desktop app.")
-            return False
-        # Reads from here on are blocking, not timed.
-        #
-        # The 5-second connect timeout was inherited by the file object, so an idle
-        # readline() raised TimeoutError -- an OSError subclass -- the reader thread
-        # took its `break`, and the client announced "The monitoring service
-        # disconnected" five seconds after connecting to a perfectly healthy daemon.
-        # The main window hid it by polling every two seconds; anything relying on
-        # the documented push stream saw the connection drop over and over.
-        # Liveness is the per-call queue timeout, which does not need this one.
-        with self._lock:
-            if self._sock is not None:
-                self._sock.settimeout(None)
-        self._set_state(True, f"Connected to jamsysd {r.get('version','?')}")
-        self._start_reader()
-        return True
+            with self._lock:
+                if self._stop.is_set():
+                    stream.close()
+                    sock.close()
+                    return False
+                self._sock, self._file = sock, stream
+                self._reader = threading.Thread(target=self._read_loop, args=(sock, stream),
+                                                daemon=True, name="jamsys-ipc")
+                self._set_state(True, f"Connected to jamsysd {data.get('version', '?')}")
+                self._reader.start()
+            return True
 
     def _set_state(self, ok: bool, msg: str) -> None:
-        # Announce a *change*, in either direction.
-        #
-        # Suppressing only repeat successes meant every failed reconnect re-fired
-        # the error banner, once per retry. Comparing against _connected alone is
-        # not enough either: it starts False, so the first failure would look like
-        # no change and never be announced at all. `_announced` starts as None, so
-        # the first state of any kind is always reported.
+        # Call while holding _lock so queued state changes follow socket order.
+        self._connected = ok
         if ok == self._announced:
             return
         self._announced = ok
-        self._connected = ok
-        if self._on_state:
-            GLib.idle_add(self._on_state, ok, msg)
+        if self._on_state and not self._stop.is_set():
+            GLib.idle_add(self._deliver_state, ok, msg)
 
-    def _close(self) -> None:
+    def _deliver_state(self, ok, msg):
+        if not self._stop.is_set():
+            self._on_state(ok, msg)
+        return False
+
+    def _close(self, expected=None, message="The monitoring service disconnected. Retrying…"):
         with self._lock:
+            if expected is not None and self._sock is not expected:
+                return
+            sock, stream = self._sock, self._file
+            self._sock = self._file = None
+            pending, self._pending = self._pending, {}
+            self._set_state(False, message)
+        for q in pending.values():
             try:
-                if self._file:
-                    self._file.close()
+                q.put_nowait(DaemonError(message))
+            except queue.Full:
+                pass
+        # BufferedReader.close() alone waits for readline()'s lock forever.
+        # shutdown first wakes that read; close outside _lock lets it retire.
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
+            sock.close()
+        if stream is not None:
             try:
-                if self._sock:
-                    self._sock.close()
+                stream.close()
             except OSError:
                 pass
-            self._sock = None
-            self._file = None
 
     @property
     def connected(self) -> bool:
         return self._connected
 
-    # -- requests --------------------------------------------------------
+    @staticmethod
+    def _decode(line):
+        try:
+            value = json.loads(line)
+        except (ValueError, UnicodeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    @staticmethod
+    def _result(reply):
+        if reply.get("ok") is not True:
+            err = reply.get("error")
+            raise DaemonError(err.get("message", "unknown error")
+                              if isinstance(err, dict) else "invalid response")
+        return reply.get("data") if reply.get("data") is not None else {}
 
     def call(self, op: str, **params) -> dict:
         """Synchronous request. Must not be called from the GTK main thread."""
         with self._lock:
-            if self._file is None:
+            sock = self._sock
+            if sock is None or self._stop.is_set():
                 raise DaemonError("not connected")
             rid = self._next_id
             self._next_id += 1
             q: queue.Queue = queue.Queue(maxsize=1)
             self._pending[rid] = q
+        try:
             try:
-                self._file.write((json.dumps({"id": rid, "op": op, "params": params}) + "\n").encode())
-                self._file.flush()
-            except OSError as e:
-                self._pending.pop(rid, None)
-                raise DaemonError(f"write failed: {e}") from e
-            reader_running = self._reader is not None and self._reader.is_alive()
-
-        if reader_running:
+                payload = (json.dumps({"id": rid, "op": op, "params": params},
+                                      allow_nan=False) + "\n").encode()
+            except (ValueError, TypeError) as err:
+                raise DaemonError(f"invalid request: {err}") from err
+            if len(payload) - 1 > 64 * 1024:
+                raise DaemonError("request exceeded 64 KiB")
             try:
-                resp = q.get(timeout=10)
+                # Separate read and write buffers: a blocking readline must not
+                # hold the lock needed to send the request it is waiting for.
+                with self._write_lock:
+                    deadline = time.monotonic() + 10.0
+                    view = memoryview(payload)
+                    while view:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0 or not select.select([], [sock], [], remaining)[1]:
+                            raise OSError("request write timed out")
+                        try:
+                            sent = sock.send(view, socket.MSG_DONTWAIT)
+                        except BlockingIOError:
+                            continue
+                        if not sent:
+                            raise OSError("connection closed during write")
+                        view = view[sent:]
+            except (OSError, ValueError) as err:
+                self._close(sock)
+                raise DaemonError(f"write failed: {err}") from err
+            try:
+                response = q.get(timeout=10)
             except queue.Empty:
+                self._close(sock, "The monitoring service did not answer in time. Retrying…")
+                raise DaemonError("the monitoring service did not answer in time") from None
+            if isinstance(response, DaemonError):
+                raise response
+            return self._result(response)
+        finally:
+            with self._lock:
                 self._pending.pop(rid, None)
-                raise DaemonError("the monitoring service did not answer in time")
-        else:
-            # Before the reader thread starts (the initial ping) read inline.
-            resp = self._read_until(rid)
-        self._pending.pop(rid, None)
-        if not resp.get("ok"):
-            err = resp.get("error") or {}
-            raise DaemonError(err.get("message", "unknown error"))
-        return resp.get("data") or {}
-
-    def _read_until(self, rid: int) -> dict:
-        while True:
-            line = self._file.readline()
-            if not line:
-                raise DaemonError("the monitoring service closed the connection")
-            try:
-                d = json.loads(line)
-            except ValueError:
-                continue
-            if "push" in d:
-                continue
-            if d.get("id") == rid:
-                return d
 
     def subscribe(self, topics: list[str]) -> None:
+        self.call("subscribe", topics=topics)
+
+    def _deliver_push(self, sock, topic, data):
+        if not self._stop.is_set() and self._sock is sock:
+            self._on_push(topic, data)
+        return False
+
+    def _read_loop(self, sock, stream) -> None:
         try:
-            self.call("subscribe", topics=topics)
-        except DaemonError:
+            while not self._stop.is_set():
+                line = stream.readline()
+                if not line:
+                    break
+                reply = self._decode(line)
+                if reply is None:
+                    continue
+                if "push" in reply:
+                    if self._on_push and isinstance(reply["push"], str):
+                        GLib.idle_add(self._deliver_push, sock, reply["push"],
+                                      reply.get("data") or {})
+                    continue
+                rid = reply.get("id")
+                if not isinstance(rid, int):
+                    continue
+                with self._lock:
+                    if self._sock is not sock:
+                        break
+                    q = self._pending.get(rid)
+                if q is not None:
+                    try:
+                        q.put_nowait(reply)
+                    except queue.Full:
+                        pass
+        except (OSError, ValueError):
             pass
-
-    # -- push stream -----------------------------------------------------
-
-    def _start_reader(self) -> None:
-        if self._reader and self._reader.is_alive():
-            return
-        self._reader = threading.Thread(target=self._read_loop, daemon=True, name="jamsys-ipc")
-        self._reader.start()
-
-    def _read_loop(self) -> None:
-        f = self._file
-        while not self._stop.is_set() and f is not None:
-            try:
-                line = f.readline()
-            except TimeoutError:
-                # Belt and braces: a timeout is silence, not a closed socket.
-                continue
-            except OSError:
-                break
-            if not line:
-                break
-            try:
-                d = json.loads(line)
-            except ValueError:
-                continue
-            if "push" in d:
-                if self._on_push:
-                    GLib.idle_add(self._on_push, d["push"], d.get("data") or {})
-                continue
-            rid = d.get("id")
-            q = self._pending.get(rid)
-            if q is not None:
-                try:
-                    q.put_nowait(d)
-                except queue.Full:
-                    pass
-        self._close()
-        self._set_state(False, "The monitoring service disconnected. Retrying…")
+        finally:
+            self._close(sock)
 
     def shutdown(self) -> None:
         self._stop.set()
