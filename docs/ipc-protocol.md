@@ -9,6 +9,12 @@ single oversized line is refused, and an unparsed backlog above 1 MiB drops the 
 Unsolicited push frames may arrive at any time after `subscribe`, and a connection that only
 listens for them is never closed for being quiet.
 
+The 64 KiB limit applies before whitespace trimming, to both complete lines and
+unterminated tails. A newline in the final read chunk cannot reset that check.
+The desktop client validates its handshake before exposing a connection and has
+one reader per socket. Disconnect releases pending calls; a timed-out request
+retires the connection so the window can retry. Client shutdown is terminal.
+
 At most eight clients at once. When the table is full, a peer that holds no subscription and
 has sent nothing for a minute is reclaimed to make room, so idle connections cannot lock the
 window out of its own daemon.

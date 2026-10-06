@@ -109,6 +109,11 @@ impl Client {
             self.last_active_mono = crate::clock::mono_ms();
         }
         while let Some(pos) = self.inbuf.iter().position(|&b| b == b'\n') {
+            // A newline arriving in the last read chunk resets the tail to zero.
+            // Check complete lines too, before trimming or parsing them.
+            if pos > MAX_LINE {
+                return Err("a single request exceeded 64 KiB".into());
+            }
             let line: Vec<u8> = self.inbuf.drain(..=pos).collect();
             let text = String::from_utf8_lossy(&line[..line.len() - 1]);
             let text = text.trim();
@@ -363,6 +368,31 @@ fn peer_uid(fd: RawFd) -> Option<u32> {
 mod tests {
     use super::*;
     use std::io::BufRead;
+
+    fn paired_client() -> (Client, UnixStream) {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        set_nonblocking(stream.as_raw_fd()).unwrap();
+        (Client { stream, token: TOK_CLIENT_BASE, inbuf: Vec::new(), outbuf: Vec::new(),
+                  subscriptions: Vec::new(), last_active_mono: crate::clock::mono_ms() }, peer)
+    }
+
+    #[test]
+    fn a_newline_cannot_hide_an_oversized_complete_request() {
+        let (mut client, mut peer) = paired_client();
+        let mut line = vec![b' '; MAX_LINE + 1];
+        line.push(b'\n');
+        peer.write_all(&line).unwrap();
+        assert!(client.read_requests().is_err(), "complete lines need the same size limit as tails");
+    }
+
+    #[test]
+    fn a_large_batch_of_short_complete_requests_remains_valid() {
+        let (mut client, mut peer) = paired_client();
+        let batch = b"{\"op\":\"ping\"}\n".repeat(6000);
+        assert!(batch.len() > MAX_LINE);
+        peer.write_all(&batch).unwrap();
+        assert_eq!(client.read_requests().unwrap().len(), 6000);
+    }
 
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("jamsys-ipc-{tag}-{}", std::process::id()));
