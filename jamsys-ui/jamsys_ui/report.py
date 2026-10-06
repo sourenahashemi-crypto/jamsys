@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime
 import shutil
+import textwrap
 from typing import Any
 
 
@@ -66,7 +67,8 @@ def rows(value: Any, *keys: str) -> list:
 
 
 def summarise(snapshot: dict, alerts: list[dict], coverage: list[dict],
-              events: list[dict], stats: dict, inventory: Any = None) -> dict:
+              events: list[dict], stats: dict, inventory: Any = None,
+              failures: dict | None = None) -> dict:
     """Reduce the raw data to the few things worth acting on.
 
     Returns a dict rather than text so the page can render it as widgets and
@@ -74,6 +76,15 @@ def summarise(snapshot: dict, alerts: list[dict], coverage: list[dict],
     of judgement, two presentations.
     """
     snap = snapshot.get("snapshot", snapshot) or {}
+    missing = dict(failures or {})
+    if not snap:
+        missing.setdefault("snapshot", "No current readings were received")
+    if alerts is None:
+        missing.setdefault("alerts", "Open alerts could not be checked")
+    if coverage is None:
+        missing.setdefault("coverage", "Monitoring coverage could not be checked")
+    if snapshot.get("collectors_usable") == 0:
+        missing.setdefault("coverage", "No collectors are currently usable")
 
     open_alerts = [a for a in (alerts or []) if a.get("resolved_ts") is None]
     open_alerts.sort(key=lambda a: (-(a.get("severity") or 0), -(a.get("last_ts") or 0)))
@@ -97,9 +108,12 @@ def summarise(snapshot: dict, alerts: list[dict], coverage: list[dict],
         verdict = "critical"
     elif open_alerts:
         verdict = "attention"
+    elif missing:
+        verdict = "unknown"
 
     return {
         "verdict": verdict,
+        "missing": missing,
         "alerts": open_alerts,
         "risks": risks,
         "gaps": gaps,
@@ -107,6 +121,29 @@ def summarise(snapshot: dict, alerts: list[dict], coverage: list[dict],
         "events": rows(events, "events", "rows")[:15],
         "machine": _machine(snapshot, snap, stats, inventory),
     }
+
+
+def collect(call) -> dict:
+    """Fetch a report without disguising a failed request as an empty result.
+
+    Used by both the window and CLI. Partial reports retain any known problems
+    and explicitly name each unavailable section.
+    """
+    data, failures = {}, {}
+    for op, params in (("snapshot", {}), ("alerts", {"open_only": True, "limit": 50}),
+                       ("coverage", {}), ("events", {"limit": 15}),
+                       ("stats", {}), ("inventory", {})):
+        try:
+            value = call(op, **params)
+            if value is None:
+                raise ValueError("No data returned")
+            data[op] = value
+        except Exception as err:
+            failures[op] = str(err)
+    return summarise(data.get("snapshot") or {},
+                     rows(data["alerts"], "alerts") if "alerts" in data else None,
+                     data.get("coverage"), data.get("events"),
+                     data.get("stats") or {}, data.get("inventory"), failures)
 
 
 def _machine(envelope: dict, snap: dict, stats: dict, inventory: Any) -> dict:
@@ -145,12 +182,21 @@ def to_markdown(s: dict) -> str:
     add("")
 
     headline = {
-        "healthy": "Everything is normal.",
+        "healthy": "No open alerts in available monitoring data.",
         "attention": f"{len(s['alerts'])} thing(s) need attention.",
         "critical": f"{len(s['alerts'])} thing(s) need attention, including a critical one.",
+        "unknown": "Report incomplete — system health could not be confirmed.",
     }[s["verdict"]]
     add(f"**{headline}**")
     add("")
+
+    if s.get("missing"):
+        add("## Unavailable data")
+        add("")
+        add("This report is incomplete. Retry when the monitoring service is available.")
+        for section, reason in s["missing"].items():
+            add(f"- {section}: {reason}")
+        add("")
 
     add("## Machine")
     add("")
@@ -199,7 +245,8 @@ def to_markdown(s: dict) -> str:
     else:
         add("## Open problems")
         add("")
-        add("None.")
+        add("Unknown — alert data was unavailable." if "alerts" in s.get("missing", {})
+            else "None in the available alert data.")
         add("")
 
     if s["risks"]:
@@ -256,5 +303,8 @@ def to_plain(s: dict) -> str:
             line = line[3:].upper()
         elif line.startswith("# "):
             line = line[2:].upper()
-        lines.append(line[:width])
+        lines.extend(textwrap.wrap(line, width=width, break_long_words=False,
+                                   break_on_hyphens=False,
+                                   subsequent_indent="  " if line.startswith("- ") else "")
+                     or [""])
     return "\n".join(lines)

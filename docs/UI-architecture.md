@@ -567,7 +567,7 @@ Notification actions map to Snooze 1 h and Open. No sound by default.
 
 ## Refreshing without fighting the user
 
-Every page rebuilds its whole body from scratch on each two-second refresh.
+Most pages rebuild their whole body from scratch on each two-second refresh.
 That is fine for text and hostile for anything interactive: an open dropdown was
 destroyed under the pointer and the scroll position snapped back to the top,
 so the page appeared to jump and a list could be neither scrolled nor picked
@@ -599,3 +599,48 @@ returns `{"alerts": […]}`, and others return a bare list. Assuming one shape
 produced a report that looked complete while silently dropping whole sections,
 which is the worst failure mode for something whose entire job is to tell you
 what is wrong. `rows()` normalises them and is tested against each shape.
+
+The window and CLI now use the same `report.collect()` request path. Failed
+requests are named under **Unavailable data**, rather than silently replaced
+with empty lists. Known critical alerts still lead the report when other data
+is missing; otherwise an incomplete report has an unknown verdict. A successful
+report says **No open alerts in available monitoring data**, not that every
+possible subsystem is healthy. `jamsys --report` returns status 1 for incomplete
+reports and wraps long terminal lines without truncating diagnostic text.
+
+Fetch throttling starts when a request finishes, so a slow service cannot cause
+an immediate fetch/re-render loop. Completion uses `Page.update()` to respect
+open menus and scroll position.
+
+## Connection lifecycle and stale readings
+
+Connecting and subscribing both run on a worker; subscription is a blocking IPC
+request and must not run inside the GTK completion callback. Only one connection
+attempt and one overview-event fetch may be in flight at a time. Closing the
+window removes its retry timer and permanently closes that client.
+
+The socket client completes its handshake before publishing a connection, gives
+each reader ownership of one socket, and retires it by identity. Disconnect wakes
+pending calls immediately. Shutdown interrupts the socket **before** closing the
+buffered file, avoiding a deadlock with its blocking reader. Malformed JSON shapes
+are ignored without terminating that reader; request timeouts retire the connection
+so the next refresh can reconnect.
+
+A banner above every page names an unavailable service and offers **Retry**. The
+header shows the time of the last successful snapshot and marks it offline after
+disconnect. Cached readings remain available for inspection. A reconnect keeps
+the banner visible until a fresh snapshot arrives. **Ctrl+R** and **F5** refresh
+the current readings; the refresh button is disabled while that request is pending.
+
+## Finding a process
+
+The Processes page combines the daemon's top CPU and memory samples, deduplicated
+by PID, with a persistent name/PID filter and CPU, memory or name sorting. The
+description explicitly states that these are top samples, not the full process
+table. No new polling or privileged process control is added. Search and sort
+widgets survive refreshes; only result rows are rebuilt. CPU usage is per core
+and may legitimately exceed 100%.
+
+These 2026-10-05 UI changes have headless scheduling and selection coverage.
+Actual window appearance, focus and interaction on GNOME remain unverified in
+this review; see `verification-2026-10-05.md`.

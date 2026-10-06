@@ -21,6 +21,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
 from . import report
+from .processes import select_processes
 from .client import Client, DaemonError, run_async
 from .hardware import (CHARGE_LIMITS, MODES, PRESETS, SPEEDS, ChargeLimitControl,
                        KeyboardControl, helper_path,
@@ -967,38 +968,72 @@ class ServicesPage(Page):
 class ProcessPage(Page):
     title, icon = "Processes", "utilities-system-monitor-symbolic"
 
+    def __init__(self, win):
+        super().__init__(win)
+        self._sample = {}
+        # Keep controls outside the rebuilt results so typing, selection and
+        # keyboard focus survive incoming snapshots.
+        tools = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.search = Gtk.SearchEntry(placeholder_text="Filter top processes by name or PID",
+                                      hexpand=True)
+        self.search.set_tooltip_text("Search the top CPU and memory samples reported by the daemon")
+        self.search.connect("search-changed", self._filter_changed)
+        tools.append(self.search)
+        self.sort = Gtk.DropDown.new_from_strings(["CPU usage", "Memory usage", "Name"])
+        self.sort.set_tooltip_text("Sort processes")
+        self.sort.connect("notify::selected", self._filter_changed)
+        tools.append(self.sort)
+        self.body.append(tools)
+        self.results = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        self.body.append(self.results)
+
+    def is_interacting(self):
+        # The search entry is persistent. It can keep focus while readings update.
+        return _has_open_popover(self)
+
+    def _filter_changed(self, *_):
+        self._scroller.get_vadjustment().set_value(0)
+        self._render_results()
+
     def render(self, snap):
-        s = snap.get("snapshot", {})
-        p = s.get("process", {})
-        self.clear()
-        hdr = self.group("Processes",
-                         f"{p.get('total', 0)} running. I/O and GPU figures are available for your own "
-                         "processes; JamSys does not need root to show this.")
-        self.body.append(hdr)
-        for label, key in [("By CPU", "top_cpu"), ("By memory", "top_mem")]:
-            g = self.group(label)
-            for q in p.get(key, []):
-                sub = f"{human_bytes(q['rss_bytes'])} · {q['threads']} threads"
-                if q.get("read_bps") or q.get("write_bps"):
-                    sub += f" · io ↓{human_bps(q['read_bps'])} ↑{human_bps(q['write_bps'])}"
-                if q.get("gpu_ns_per_s"):
-                    # DRM fdinfo reports engine time per engine; this is their sum, so
-                    # it can legitimately exceed one second per second on a GPU with
-                    # several engines busy. Showing it as a percentage would look wrong.
-                    sub += f" · gpu {q['gpu_ns_per_s']/1e9:.2f} engine-s/s"
-                row = Adw.ActionRow(
-                    title=GLib.markup_escape_text(f"{q['name']}  ({q['pid']})"),
-                    subtitle=GLib.markup_escape_text(sub))
-                val = Gtk.Label(label=f"{q['cpu_pct']:.1f}%" if key == "top_cpu" else human_bytes(q["rss_bytes"]))
-                val.add_css_class("dim-label")
-                row.add_suffix(val)
-                if q.get("flag"):
-                    ic = Gtk.Image.new_from_icon_name("dialog-warning-symbolic")
-                    ic.add_css_class("sv-attention")
-                    ic.set_tooltip_text(q["flag"])
-                    row.add_prefix(ic)
-                g.add(row)
-            self.body.append(g)
+        self._sample = (snap.get("snapshot") or {}).get("process") or {}
+        self._render_results()
+
+    def _render_results(self):
+        child = self.results.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            self.results.remove(child)
+            child = nxt
+        sort = ("cpu", "memory", "name")[min(self.sort.get_selected(), 2)]
+        rows = select_processes(self._sample, self.search.get_text(), sort)
+        total = self._sample.get("total")
+        g = self.group("Top processes",
+                       f"{len(rows)} shown · {total if total is not None else '?'} total. "
+                       "Combined top CPU and memory samples; this is not the full process list. "
+                       "CPU is per core and can exceed 100%.")
+        self.results.append(g)
+        if not rows:
+            g.add(self.row("No matching processes" if self.search.get_text().strip()
+                           else "No process samples available", "",
+                           "Try another name or PID." if self.search.get_text().strip()
+                           else "Check that the process collector is enabled on Coverage."))
+        for q in rows:
+            sub = (f"PID {q['pid']} · {q.get('threads', '?')} threads · "
+                   f"CPU {q.get('cpu_pct', 0):.1f}% · {human_bytes(q.get('rss_bytes', 0))}")
+            if q.get("read_bps") or q.get("write_bps"):
+                sub += f" · I/O ↓{human_bps(q.get('read_bps', 0))} ↑{human_bps(q.get('write_bps', 0))}"
+            if q.get("gpu_ns_per_s"):
+                sub += f" · GPU {q['gpu_ns_per_s']/1e9:.2f} engine-s/s"
+            row = self.row(str(q.get("name", "?")),
+                           human_bytes(q.get("rss_bytes", 0)) if sort == "memory"
+                           else f"{q.get('cpu_pct', 0):.1f}%", sub)
+            if q.get("flag"):
+                ic = Gtk.Image.new_from_icon_name("dialog-warning-symbolic")
+                ic.add_css_class("sv-attention")
+                ic.set_tooltip_text(q["flag"])
+                row.add_prefix(ic)
+            g.add(row)
 
 
 def _repo_script(name: str) -> str:
@@ -1322,7 +1357,6 @@ class ReportPage(Page):
     def __init__(self, win):
         super().__init__(win)
         self._summary = None
-        self._extra = {"alerts": [], "coverage": [], "events": [], "stats": {}}
         self._pending = False
         self._fetched_at = 0.0
 
@@ -1337,10 +1371,11 @@ class ReportPage(Page):
             return
 
         headline = {
-            "healthy": ("Everything is normal", "sv-healthy"),
+            "healthy": ("No open alerts in available monitoring data", "sv-healthy"),
             "attention": (f"{len(s['alerts'])} thing(s) need attention", "sv-warn"),
             "critical": (f"{len(s['alerts'])} thing(s) need attention, "
                          "including a critical one", "sv-critical"),
+            "unknown": ("Report incomplete — health could not be confirmed", "dim-label"),
         }[s["verdict"]]
 
         top = self.group("Verdict")
@@ -1361,6 +1396,12 @@ class ReportPage(Page):
         top.add(self.row("Machine", f"{m['model']}", f"kernel {m['kernel']}"))
         top.add(self.row("Collectors usable", m["collectors"]))
         self.body.append(top)
+
+        if s.get("missing"):
+            g = self.group("Unavailable data", "This report is incomplete. Retry when monitoring is available.")
+            for section, reason in s["missing"].items():
+                g.add(self.row(section, "", reason))
+            self.body.append(g)
 
         if s["alerts"]:
             g = self.group("Open problems",
@@ -1436,37 +1477,18 @@ class ReportPage(Page):
         self._fetched_at = time.monotonic()
 
         def work():
-            c = self.win.client
-            out = {}
-            for key, op, params in (("alerts", "alerts", {"open_only": True, "limit": 50}),
-                                    ("coverage", "coverage", {}),
-                                    ("events", "events", {"limit": 15}),
-                                    ("stats", "stats", {}),
-                                    ("inventory", "inventory", {})):
-                try:
-                    out[key] = c.call(op, **params)
-                except Exception:  # noqa: BLE001 — a missing view must not blank the page
-                    out[key] = [] if key != "stats" else {}
-            return out
+            return report.collect(self.win.client.call)
 
         def done(res, err):
             self._pending = False
-            if err or not res:
+            if getattr(self.win, "_closed", False) or err or not res:
                 return
-            self._extra = {
-                "alerts": report.rows(res.get("alerts"), "alerts"),
-                "coverage": res.get("coverage"),
-                "events": res.get("events"),
-                "stats": res.get("stats") or {},
-                "inventory": res.get("inventory"),
-            }
-            self._summary = report.summarise(
-                self.win.last_snapshot or {}, self._extra["alerts"],
-                self._extra["coverage"], self._extra["events"],
-                self._extra["stats"], self._extra["inventory"])
-            # Only now is there anything to draw.
+            self._summary = res
+            # Throttle from completion, otherwise a slow fetch immediately
+            # starts another fetch when its result is rendered.
+            self._fetched_at = time.monotonic()
             if self.win.current_page() is self:
-                self.render(self.win.last_snapshot or {})
+                self.update(self.win.last_snapshot or {})
 
         run_async(work, done)
 
@@ -1607,6 +1629,10 @@ class MainWindow(Adw.ApplicationWindow):
         self._alert_cache: list[dict] = []
         self._charts: dict[str, Sparkline] = {}
         self._busy = False
+        self._connecting = False
+        self._events_busy = False
+        self._closed = False
+        self._last_updated = None
 
         self.split = Adw.NavigationSplitView()
         self.set_content(self.split)
@@ -1648,37 +1674,82 @@ class MainWindow(Adw.ApplicationWindow):
         self.content_head = Adw.HeaderBar()
         self.content_title = Adw.WindowTitle(title="Overview")
         self.content_head.set_title_widget(self.content_title)
-        refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Refresh now")
-        refresh.connect("clicked", lambda *_: self.refresh())
-        self.content_head.pack_end(refresh)
+        self.refresh_button = Gtk.Button(icon_name="view-refresh-symbolic",
+                                         tooltip_text="Refresh now (Ctrl+R)")
+        self.refresh_button.connect("clicked", lambda *_: self.refresh())
+        self.content_head.pack_end(self.refresh_button)
+        action = Gio.SimpleAction.new("refresh", None)
+        action.connect("activate", lambda *_: self.refresh())
+        self.add_action(action)
+        app.set_accels_for_action("win.refresh", ["<Control>r", "F5"])
         self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE,
                                transition_duration=120)
         for t, p in self.pages.items():
             self.stack.add_named(p, t)
         cbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         cbox.append(self.content_head)
+        self.connection_banner = Adw.Banner(title="Connecting to the monitoring service…",
+                                           button_label="Retry", revealed=True, use_markup=False)
+        self.connection_banner.connect("button-clicked", lambda *_: self._connect_async())
+        self.connection_banner.set_tooltip_text("Start the service: systemctl --user start jamsysd")
+        cbox.append(self.connection_banner)
         self.toasts = Adw.ToastOverlay()
         self.toasts.set_child(self.stack)
         cbox.append(self.toasts)
         self.split.set_content(Adw.NavigationPage(child=cbox, title="Overview"))
 
         self.listbox.select_row(self.listbox.get_row_at_index(0))
-        GLib.timeout_add(REFRESH_MS, self._tick)
+        self._tick_source = GLib.timeout_add(REFRESH_MS, self._tick)
+        self.connect("close-request", self._on_close)
         self._connect_async()
 
     # -- connection ------------------------------------------------------
 
     def _connect_async(self):
+        if self._connecting or self._closed:
+            return
+        self._connecting = True
+
+        def work():
+            if not self.client.connect():
+                return False
+            # subscribe waits for IPC; it must not run in the GTK completion callback.
+            self.client.subscribe(["alert", "event"])
+            return True
+
         def done(ok, err):
+            self._connecting = False
+            if self._closed:
+                return
             if ok:
-                self.client.subscribe(["alert", "event"])
                 self.refresh()
-        run_async(self.client.connect, done)
+            elif err:
+                self._on_state(False, str(err))
+        run_async(work, done)
+
+    def _on_close(self, *_):
+        self._closed = True
+        if self._tick_source:
+            GLib.source_remove(self._tick_source)
+            self._tick_source = None
+        self.client.shutdown()
+        return False
 
     def _on_state(self, ok: bool, msg: str):
+        if self._closed:
+            return False
         self.conn_pill.set("healthy" if ok else "critical",
                            "Connected" if ok else "Service unavailable")
+        self.refresh_button.set_sensitive(ok and not self._busy)
+        self.connection_banner.set_revealed(True)
+        self.connection_banner.set_title(
+            "Connected — waiting for fresh readings…" if ok else
+            "Monitoring is offline. Start it with: systemctl --user start jamsysd")
+        self.connection_banner.set_tooltip_text(msg)
         if not ok:
+            self.content_title.set_subtitle(
+                f"Last update {self._last_updated} · offline" if self._last_updated
+                else "No live readings")
             self.pages["Overview"].banner_text.set_text("Cannot reach the monitoring service")
             self.pages["Overview"].banner_sub.set_text(
                 msg + "\nStart it with:  systemctl --user start jamsysd")
@@ -1688,6 +1759,8 @@ class MainWindow(Adw.ApplicationWindow):
         return False
 
     def _on_push(self, topic: str, data: dict):
+        if self._closed:
+            return False
         if topic == "alert":
             # The daemon only pushes a frame for a genuinely new or escalated alert, so
             # this cannot repeat for a condition the user has already seen.
@@ -1700,6 +1773,8 @@ class MainWindow(Adw.ApplicationWindow):
         return False
 
     def _tick(self):
+        if self._closed:
+            return False
         if self.client.connected:
             self.refresh()
         else:
@@ -1709,18 +1784,29 @@ class MainWindow(Adw.ApplicationWindow):
     # -- data ------------------------------------------------------------
 
     def refresh(self):
-        if self._busy or not self.client.connected:
+        if self._closed or self._busy or not self.client.connected:
             return
         self._busy = True
+        self.refresh_button.set_sensitive(False)
 
         def work():
             return self.client.call("snapshot")
 
         def done(res, err):
             self._busy = False
+            if self._closed:
+                return
+            self.refresh_button.set_sensitive(self.client.connected)
             if err or res is None:
+                self.connection_banner.set_title(f"Could not refresh readings: {err}")
+                self.connection_banner.set_revealed(True)
+                return
+            if not self.client.connected:
                 return
             self.last_snapshot = res
+            self._last_updated = datetime.datetime.now().strftime("%H:%M:%S")
+            self.content_title.set_subtitle(f"Updated {self._last_updated}")
+            self.connection_banner.set_revealed(False)
             page = self.current_page()
             if page:
                 try:
@@ -1733,8 +1819,10 @@ class MainWindow(Adw.ApplicationWindow):
 
     def refresh_events(self):
         page = self.current_page()
-        if not isinstance(page, OverviewPage) or not self.client.connected:
+        if (self._closed or self._events_busy or not isinstance(page, OverviewPage)
+                or not self.client.connected):
             return
+        self._events_busy = True
 
         def work():
             alerts = self.client.call("alerts", open_only=False, limit=25).get("alerts", [])
@@ -1742,7 +1830,8 @@ class MainWindow(Adw.ApplicationWindow):
             return alerts, events
 
         def done(res, err):
-            if err or not res:
+            self._events_busy = False
+            if self._closed or err or not res:
                 return
             alerts, events = res
             self._alert_cache = alerts

@@ -199,7 +199,7 @@ check("the first render fetches", first > 0, f"calls={first}")
 start = time.monotonic()
 pump(lambda: False, seconds=2.0)
 elapsed = time.monotonic() - start
-per_refresh = len(("alerts", "coverage", "events", "stats", "inventory"))
+per_refresh = len(("snapshot", "alerts", "coverage", "events", "stats", "inventory"))
 budget = first + per_refresh * (elapsed / (REFRESH_MS / 1000.0) + 2)
 check("and it does not re-fetch on every re-render",
       stub.client.calls <= budget,
