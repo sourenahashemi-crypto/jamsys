@@ -23,6 +23,12 @@ there. No installation or hardware writes occurred. New window layout and
 interaction remain **unverified on hardware**. See the exact results and remaining
 checks in [the new verification report](verification-2026-10-05.md).
 
+A later **2026-10-05 target-machine follow-up** installed that build, ran the complete
+desktop test entry point, exercised daemon loss/recovery in the GTK window and
+standalone cluster, and enabled the packaged read-only helper. RAPL and NVMe SMART are
+therefore hardware-verified below. GNOME Shell itself still needs a logout/login to load
+the installed module; it is not promoted on the strength of the standalone window.
+
 ---
 
 ## 1. Fully working
@@ -54,6 +60,8 @@ Wired, running, and observed producing correct values on this machine.
 | All hwmon temperatures, keyed by driver + label | ~30 channels across 9 devices |
 | Fan speeds | `cpu_fan` 2 400, `gpu_fan` 2 500 rpm |
 | NVMe temperature | 39.9 → 41.9 °C after a 3 GB write |
+| NVMe SMART health through the optional helper | Live ioctl result from `nvme0`: 0 critical warnings, 100% spare, 0% used, 0 media errors; ingested by the daemon after one storage sampling interval |
+| CPU package power through RAPL | Optional helper returned 9.29 W live; the unprivileged daemon ingested the same value after restart |
 | Filesystems, free space, inodes | 73 pseudo/snap mounts correctly hidden |
 | Disk throughput, IOPS, utilisation, service time | 53.9 MB/s observed |
 | ext4 error counters | read; 0 on this machine |
@@ -122,11 +130,11 @@ Wired, running, and observed producing correct values on this machine.
 | **Floating placement (Shell extension)** | `Main.layoutManager.addChrome()`, the same mechanism as OSD popups — an in-Shell actor, not a window pretending to be one. | Inherently a desktop gadget: floats above the wallpaper, can overlap a dock, hidden by fullscreen windows. Stated in the preferences dialog rather than left to be discovered. |
 | **Window placement (`jamsys-cluster`)** | Stacking is solved: always-on-top and all-workspaces work over XWayland (see §1). Drag from anywhere on the face. | **Position cannot be set by the application.** Wayland gives a window no control over where it opens, and that is true on XWayland here too — the compositor places it and you drag it to the corner you want. The Shell extension has no such limit, which is why it stays the primary surface. |
 | **Click-through gaps** | The earlier audit observed six input-region rectangles with `XShapeGetRectangles`. | The handover and UI architecture document lost focus and missing clicks on Mutter even inside those rectangles. Region geometry does **not** prove usable pointer behaviour. Opt-in and off by default; not retested in this review. |
-| **Daemon loss/reconnect on both UI surfaces** | Callback regressions cover subscription cleanup, stale replies, restart and close/disable. The shared offline face has 24 real-Cairo checks and was inspected on light/dark grounds. | Live Shell and standalone restart behaviour with these changes is not yet manually verified. No service was stopped or restarted in this review. |
+| **Daemon loss/reconnect on both cluster surfaces** | Callback regressions cover subscription cleanup, stale replies, restart and close/disable. The standalone cluster remained running through a real target-machine daemon restart and recovered beyond its 10-second retry boundary. The main GTK window also survived a live restart. | The installed Shell module still has not been loaded after a logout/login, so live Shell-actor recovery remains unverified. |
 | **Bluetooth** | Per-device state from BlueZ over the system bus: name, address, type, paired, connected, and battery where the device publishes `org.bluez.Battery1`. Connect/disconnect transitions are **event-driven** — BlueZ signals wake the collector, so a flap shorter than the sampling interval is still caught. Disconnects raise a notice naming the device; three in fifteen minutes escalate to a flapping warning. | No device battery on hardware that does not publish it (this machine's headset does not). **Disconnect *reason* is not available**: the kernel exposes no HCI reason to an unprivileged process, so the app reports the observable context and names a cause only when a precondition held, otherwise says the reason is not observable. 802.11 power save is behind nl80211 and is not read; only the wireless device's runtime-PM setting is. |
 | **Audio** | Service state, sound cards, restart detection via PID change. | No default sink/source names, no per-stream detail. `libpipewire-0.3` headers are not installed, so the native API cannot be linked; the alternative is spawning `pw-dump` on a timer, which the specification rules out. |
-| **NVMe SMART** | Temperature, unprivileged, via hwmon. | Wear, spare blocks, media errors need the helper. See §3. |
-| **CPU package power** | Whole-system draw on battery via `power_now`. | RAPL is `0400 root`. On AC there is currently no system-wide power figure at all. |
+| **NVMe SMART** | Temperature is unprivileged via hwmon; wear, spare blocks and error counts now work through the installed read-only helper. | The helper is optional and must be explicitly enabled. |
+| **CPU package power** | RAPL package power now works through the installed read-only helper; whole-system draw works on battery via `power_now`. | RAPL is CPU-package power, not total laptop power. On AC there is still no whole-system figure. |
 | **Intel GPU** | Frequency, RC6 residency, throttle reasons, per-client engine time. | No single "busy %". `i915` exposes none without `i915_perf` and `CAP_PERFMON`. RC6 is reported as the honest inverse proxy and labelled as such. |
 | **Per-process network** | Aggregate established TCP count. | Not attributed per process: needs socket-inode matching across every `/proc/<pid>/fd`, roughly doubling the cost of the most expensive collector. |
 | **Journal severity** | Warning and above (`-p 4`). | Info-level filtered at the source. Suspend markers are info-level, which is why suspend detection uses the clock difference instead. |
@@ -139,8 +147,6 @@ never executed.
 
 | Item | Why not | Confidence |
 |---|---|---|
-| **NVMe SMART ioctl** (log page 0x02) | `/dev/nvme0` is `0600 root`. The 512-byte parser is tested against synthetic buffers including a failing-drive case. | Follows NVMe 1.4. Medium-high, unproven. |
-| **RAPL energy reading** | `energy_uj` is `0400 root`. Wrap arithmetic is unit-tested. | High — a file read and a delta. |
 | **Keyboard modes beyond the recorded static colours** | The historical audit records static red/green/white and brightness 1/3, not every firmware mode or power-state combination. | Parser tests pass; other modes remain hardware-unverified. Keyboard and battery Polkit writes themselves have historical evidence in §1. |
 | **udev alternative** | Cannot install to `/etc/udev/rules.d`. | The daemon's `direct` detection path is code-complete and the UI honours it. |
 | **A real suspend/resume** | Suspending ends the session running the tests. `BOOTTIME − MONOTONIC` was 0 throughout, as expected for a machine that never slept. | Detection is arithmetic over two clocks, unit-tested with an 8-hour synthetic sleep. High. |

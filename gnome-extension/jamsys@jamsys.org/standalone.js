@@ -450,6 +450,13 @@ app.connect('activate', () => {
     writePidFile();
     win.connect('close-request', () => {
         stopDaemon();
+        // GtkPopover is parented directly to the drawing area. GTK does not
+        // remove that relationship when the window goes away, so leaving it
+        // attached produces "finalizing ... with children left" and retains
+        // the menu until process teardown.
+        popover?.popdown();
+        popover?.unparent();
+        popover = null;
         removePidFile();
         return false;   // let the close proceed
     });
@@ -817,7 +824,7 @@ function armRetry() {
     });
 }
 
-function disconnectDaemon() {
+function disconnectDaemon(reportLoss = true) {
     const wasConnected = proxy !== null;
     daemonGeneration++;
     if (proxy && daemonSignal) proxy.disconnectSignal(daemonSignal);
@@ -825,7 +832,7 @@ function disconnectDaemon() {
     proxy = null;
     state = null;
     area?.queue_draw();
-    if (wasConnected) {
+    if (wasConnected && reportLoss) {
         // Say it on stderr too. The on-screen face is invisible to anyone
         // running this from a terminal or reading a log, and this used to be
         // the only place the systemctl hint appeared.
@@ -839,7 +846,8 @@ function stopDaemon() {
     daemonWatch = 0;
     if (daemonRetry) GLib.Source.remove(daemonRetry);
     daemonRetry = 0;
-    disconnectDaemon();
+    // This is local teardown, not evidence that the service disappeared.
+    disconnectDaemon(false);
 }
 
 function daemonAppeared() {

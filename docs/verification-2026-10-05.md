@@ -64,3 +64,38 @@ no assertions or test gates were weakened to make the runner green.
 4. Validate the installed package and normal monitoring on the target machine.
    No new claims are made about NVMe SMART, RAPL, GPU wake behaviour, battery or
    keyboard controls, or live GNOME Shell rendering.
+
+## Target-machine follow-up
+
+The same release was subsequently checked from the target GNOME/Wayland desktop on
+2026-10-05. This follow-up changed the status of the first, third and fourth items
+above; visual interaction details in item 2 and the live Shell actor remain pending.
+
+- Fast-forwarded the checkout to `9b16eba`, built the amd64 package, verified every
+  packaged checksum, parsed all maintainer scripts, compiled the extension schema in
+  strict dry-run mode, and installed both the per-user build and the `.deb`.
+- `scripts/run-tests.sh --all` passed **21 suites, 0 failed, 0 skipped** on the target
+  session. This included 297 daemon checks, all three GTK display suites and the live
+  D-Bus push suite. The result was repeated after the teardown fix below.
+- The installed daemon's executable hash matched the file on disk. The CLI snapshot,
+  report and stats calls worked against it, and the standalone cluster remained active
+  through a real daemon restart and beyond its 10-second reconnect interval. The main
+  GTK window was closed, reopened and left connected through another service restart.
+- A normal standalone shutdown falsely printed that the daemon had disappeared and
+  left its `GtkPopoverMenu` parented while the drawing area finalized. Teardown now
+  suppresses the false service-loss message and detaches the popover. The lifecycle
+  suite covers both contracts.
+- The packaged optional helper timer was enabled and executed successfully. It returned
+  live RAPL package power of 9.29 W and NVMe log page data for the WD drive: 0 critical
+  warnings, 100% available spare, 0% used, 0 media errors and 0 error-log entries. The
+  unprivileged daemon reported `helper: true`, ingested the RAPL value, and exposed the
+  SMART fields when storage collection was temporarily enabled. The original saved
+  preference, `storage = false`, was restored afterward.
+- Keyboard mode/state sysfs attributes are write-only even to an authenticated read
+  attempt on this kernel, so additional modes were not changed: their original state
+  could not be captured for reliable restoration. Wi-Fi/driver fault injection,
+  suspend, OOM and disk-full scenarios were not run because they would disconnect or
+  damage the active working session.
+- The installed extension file is newer than the running GNOME Shell process. GNOME
+  still reports the cached module in `ERROR`; only logout/login can load the installed
+  code. No live Shell rendering claim is made by this follow-up.
