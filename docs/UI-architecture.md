@@ -98,11 +98,26 @@ application is a bug, not a feature. Opening is now deliberate.
 
 | Gesture | Effect |
 |---|---|
-| Left drag | move it anywhere (`Clutter.DragAction`) |
-| Left click | nothing — the event propagates so the drag action can have it |
-| Double click | open the main window |
+| Left drag | move it anywhere (`Clutter.PanGesture`) |
+| Left click | nothing — the event propagates so the gestures can have it |
+| Double click | open the main window (`Clutter.ClickGesture`, two clicks) |
 | Right click | the widget's own menu: Open JamSys, Bigger, Smaller, Reset, Preferences |
 | Scroll | resize |
+
+**This table was fiction until 2026-11-24.** The handlers were written against
+`Clutter.DragAction` and `event.get_click_count()`, both removed in Clutter 18
+(GNOME 50). The constructor threw, and GNOME Shell reported the extension as
+`State: ERROR` without drawing anything — while every test passed, because the
+Clutter stub still modelled the removed API. Separately, `position = 'custom'` was
+not a value the schema allowed, so a drop could never have been remembered. The
+gestures above are the current API; `tests/real-api-test.js` now checks every Clutter
+name the extension and its stubs rely on against the installed typelib, and writes
+the settings the extension writes to the real compiled schema. None of it has been
+seen working in a live Shell yet: that needs a logout.
+
+What moves during a drag is the chrome container, not the cluster actor inside it,
+and the corner logic stands down while a drag is in progress (moving the container
+changes its allocation, which would otherwise snap it back on every motion event).
 
 Dragging stores the drop point in `custom-x`/`custom-y` and switches `position` to
 `custom`; the coordinates are written first, because `position` is a rebuild key.
@@ -127,6 +142,9 @@ repositions -- a corner-anchored widget that changes size has to move too. Its c
 duplicates the gschema range on purpose: GSettings silently clamps an out-of-range
 write, so a handler that let the value drift past the limit would look like a widget
 that had stopped responding for no visible reason.
+
+A wheel notch is 8 %. A smooth-scroll event resizes in proportion to its delta, so a
+touchpad swipe — dozens of small events — is no longer dozens of notches.
 
 It handles `SMOOTH` as well as `UP`/`DOWN`, which is not optional: Wayland only ever
 sends smooth scroll, so a handler written against the discrete directions alone does
@@ -261,7 +279,19 @@ instruments to a corner of their own housing looks like a bug.
 
 Size, opacity, decoration and stacking are remembered in
 `~/.config/jamsys/cluster.json`, written debounced one second after the last change so
-a scroll gesture does not write the file on every tick.
+a scroll gesture does not write the file on every tick, and flushed when the window
+closes (including on the SIGTERM that `--quit` sends) so the last change is not lost.
+
+**A command-line flag applies to that run only.** `--scale 1.9` to try a size, or
+`--housing` for a screenshot, used to be written to the file by the first unrelated
+change and became the permanent setting. What is remembered is what you change in the
+window itself, or `--reset`. Click-through is never remembered at all: it can make the
+gadget unclickable, and the documented way out (`jamsys-cluster --quit`) is no way
+out if the setting is waiting in the file for the next launch. An unknown flag, or
+`--scale` with no number after it, is an error rather than being ignored.
+
+`--quit` only signals a process whose argv is `gjs … /standalone.js`. It used to match
+any command line containing the file name, which included shells and editors.
 
 #### Two ways it used to break when resized
 
@@ -364,6 +394,17 @@ CPU 7% · 52° | RAM 18% | GPU — | 11.2W | NET ✓        ← compact
 
 Same rules: pushed, not polled; the abnormal state replaces the readings rather than
 being appended to them.
+
+The line always lives in the top panel, whatever corner is selected (a bottom corner
+uses the same end of the panel). It used to "float" for a bottom position by putting
+the panel button inside an `St.Bin`; a panel button already has a parent, so that box
+was empty — and "Hide the cluster" from a bottom corner, which switches to a line
+mode, left nothing on screen to bring the cluster back with. Hide now switches to the
+compact single line.
+
+The extension's D-Bus proxy is created asynchronously and without loading
+properties. The synchronous constructor blocks on a round trip to a single-threaded
+daemon, and it ran inside the compositor.
 
 ## 3. The full window
 
@@ -535,7 +576,11 @@ Every alert row has an overflow menu with precisely the four actions in the brie
 * **Mute** this alert (stop notifying, keep tracking)
 * **Snooze** — 1 h / 8 h / 24 h
 * **Ignore this rule** / **Ignore this device or service** (writes a `suppression` row)
-* **Change threshold…** — a spin row pre-filled with the threshold currently in force
+* **Change threshold…** — one spin row per threshold the rule really has, pre-filled
+  with the value in force and bounded by its allowed range, with "Use defaults".
+  (This line described that for months while the dialog was two blank text boxes and
+  a key you had to know. A mistyped key was stored, changed nothing, and was reported
+  as a success.) The same list is on the Settings page with a per-row reset.
 
 Suppressions are listed and reversible in Settings, with the reason and who set it. A
 muted alert still shows in the UI with a muted badge — hiding it entirely is how people
@@ -565,6 +610,14 @@ screen). Body text is the first two lines of the explanation, always with real n
 Notification actions map to Snooze 1 h and Open. No sound by default.
 
 
+## Unknown is not zero, on the gadget too
+
+A discrete-GPU figure is a measurement only while the card is `active`. The dial
+used to dim only for `suspended`, so a machine with no NVIDIA card, or a card that
+was resuming, showed a lit `0 %`. It now shows a dash and names the state. The Intel
+dial does the same when there is neither a busy figure nor a clock. A state object
+with fields missing prints dashes, never `NaN`.
+
 ## Refreshing without fighting the user
 
 Most pages rebuild their whole body from scratch on each two-second refresh.
@@ -581,7 +634,36 @@ from.
   children have been allocated and the adjustment's bounds mean something.
 
 Data is at most one tick stale while a menu is open, which nobody can perceive
-and everybody prefers to a list that moves as they reach for it. Page switches
+and everybody prefers to a list that moves as they reach for it.
+
+That guard turned out to cover less than it claimed, and three things slipped past it
+until 2026-11-24:
+
+- **Pages that fetch for themselves** (Events, Coverage, Settings, Diagnostics)
+  cleared first and filled in when the reply arrived. The scroll offset was restored
+  while the page was still empty, so it snapped to the top every two seconds and a
+  long event list could not be read past its first screen. `AsyncPage` reverses the
+  order: fetch, and only touch the widgets once the reply is in hand — and not even
+  then if nothing the page shows has changed.
+- **The Overview's event list** is rebuilt outside `update()`, with no guard at all:
+  an alert's open menu closed under the pointer.
+- **Expanded rows.** A rebuilt row is a new, collapsed widget, so an alert's
+  explanation folded away while it was being read. `update()` now records which rows
+  are open and reopens them, with animations suppressed for the duration so they do
+  not visibly slide open again.
+
+Charts and event timelines are cached for ten seconds per series. Each rebuild used
+to create an empty plot and query an hour of history for it.
+
+The Hardware page is rebuilt only when something it is built from changes; the
+brightness reading is updated in place. Rebuilding it every two seconds replaced the
+slider mid-drag, discarded the colour button while its dialog was open, and put the
+power-state switches back to their defaults. Helper writes are serialised per kind
+with the newest request winning, and the charge-limit write no longer runs on the main
+thread, where it froze the window behind the password prompt.
+
+A page that fails to draw now says so on the page, with the error, instead of
+printing to a terminal and leaving a half-built page that reads as "nothing here". Page switches
 and explicit filter clicks still call `render()` directly, because those are
 user intent rather than a background refresh.
 

@@ -137,7 +137,7 @@ that collector and nothing else.
 | Link speed | `speed` | file read | — | poll | 2 s | −1 on a down link → omitted |
 | Default route and gateway | `/proc/net/route` | little-endian hex decode | — | poll | 2 s | No default route → `None` |
 | Established TCP count | `/proc/net/tcp{,6}` state 01 | line count, cached 30 s | — | poll | 30 s | **Counts only. No payload is ever read.** |
-| Gateway / DNS / internet reachable | `connect()` to gateway:53/80, resolver:53, configured probe | bare TCP, **zero bytes sent** | — | poll | 60 s | Disable with `reachability = false` |
+| Gateway / DNS / internet reachable | `connect()` to gateway:53/80, resolver:53, configured probe | bare TCP, **zero bytes sent** | — | poll | 60 s | Disable with `[network] reachability = false` |
 | Link / address / route changes | `NETLINK_ROUTE` `RTMGRP_LINK`/`_IFADDR`/`_ROUTE` | netlink socket | — | **event** | — | Socket fails → falls back to polling, logged |
 
 ## Devices — collector `devices`, slow tier, 3.4 ms/run

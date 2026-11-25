@@ -112,7 +112,9 @@ because `runtime_status` *is* that signal.
 **Verified: 0 ms of dGPU wake time attributable to JamSys over 90 seconds**, by the
 kernel's own `runtime_active_time` accounting.
 
-The same principle governs elsewhere: reachability probes run at most once a minute;
+The same principle governs elsewhere: reachability probes run once a minute, brought forward after a link change but never
+closer than ten seconds apart (a link change used to trigger one immediately, every
+time rtnetlink spoke);
 interface addresses and TCP connection counts are cached for 30 s; hwmon channels are
 resolved once at probe rather than rediscovered per run.
 

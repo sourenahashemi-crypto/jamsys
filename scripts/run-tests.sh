@@ -62,14 +62,16 @@ if [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then
     run "page-refresh (GTK)" python3 jamsys-ui/tests/page-refresh-test.py
     run "core-matrix (GTK)"  python3 jamsys-ui/tests/core-matrix-test.py
     run "escaping (GTK)"     python3 jamsys-ui/tests/escaping-test.py
+    run "refresh-state (GTK)" python3 jamsys-ui/tests/refresh-state-test.py
 else
     skip_note "page-refresh (GTK)" "no display"
     skip_note "core-matrix (GTK)" "no display"
     skip_note "escaping (GTK)" "no display"
+    skip_note "refresh-state (GTK)" "no display"
 fi
 
 echo "JavaScript"
-for t in format-test gauges-test shell-api-test offline-render-test \
+for t in format-test gauges-test conf-test shell-api-test real-api-test offline-render-test \
          standalone-lifecycle-test; do
     run "$t" gjs -m "gnome-extension/tests/$t.js"
 done

@@ -29,6 +29,15 @@ standalone cluster, and enabled the packaged read-only helper. RAPL and NVMe SMA
 therefore hardware-verified below. GNOME Shell itself still needs a logout/login to load
 the installed module; it is not promoted on the strength of the standalone window.
 
+The **2026-11-24 review** ran on the target laptop against the installed build. It
+found that several claims below were wrong *as installed*, and corrects them here.
+The fixes pass their tests and the build was then installed with
+`scripts/install-user.sh`: the daemon is running it, and per-process I/O was confirmed
+non-zero on the installed service. **GNOME Shell has not been restarted**, so the
+extension is still the old module and still in `ERROR`; its fix is unseen. Read §5a
+before trusting anything in §1 that it names. See
+[the verification report](verification-2026-11-24.md).
+
 ---
 
 ## 1. Fully working
@@ -52,7 +61,7 @@ Wired, running, and observed producing correct values on this machine.
 | NVIDIA runtime power state and awake/suspended time | the gate everything else depends on |
 | NVIDIA utilisation, VRAM, temperature, power, P-state, clocks | 6 %, 6.8 W, 47 °C observed under an offloaded render |
 | NVIDIA wake/sleep transition events | `dgpu_wake` / `dgpu_sleep` recorded |
-| Per-process GPU engine time | Xwayland 1.08, gnome-shell 0.27 engine-s/s |
+| Per-process GPU engine time | Xwayland 1.08, gnome-shell 0.27 engine-s/s in the 2026-09-09 audit. **Zero for every process**, before and after the 2026-11-24 fix — see §5a.1 and the verification report; cause not found |
 | Battery charge, status, voltage, energy, cycles | 16.87 V, 55.6/91.2 Wh |
 | Battery health against design capacity | 101.3 % — reported above 100 rather than clamped |
 | System power draw | 72.1 W charging, 21.7 W discharging observed |
@@ -77,7 +86,8 @@ Wired, running, and observed producing correct values on this machine.
 | systemd failed units | detected the injected unit within one slow tick |
 | Journal ingestion and classification | caught the same failure independently |
 | Hardware inventory and change log | 40+ keys |
-| Process table: CPU, RSS, threads, I/O | 564 processes, no root |
+| Process table: CPU, RSS, threads | 564 processes, no root |
+| Process table: I/O | Was zero for every process under the previous unit (§5a.1). With the corrected unit installed, 3 of 15 top processes showed non-zero write rates on the running service |
 | Keyboard backlight brightness readback | 3 of 3 |
 | Keyboard RGB capability detection | reports the kernel's own field order |
 
@@ -126,7 +136,7 @@ Wired, running, and observed producing correct values on this machine.
 
 | Capability | What works | What does not, and why |
 |---|---|---|
-| **GNOME Shell cluster** | Everything short of being on screen: the full Cairo drawing (rendered to PNG in seven states and reviewed, including live against the running daemon), value mapping (22 tests), D-Bus proxy, live `StateChanged`, JSON parse, placement arithmetic, preferences, and `enable()`/`disable()` run for real against strict stubs of GNOME 50's own API contracts in every mode and corner. | **It has never been displayed on the desktop.** GNOME Shell was, however, made to *load* it, which surfaced a genuine defect — `addChrome({affectsInputRegion})`, a key GNOME 50 rejects outright. That is fixed, and `tests/shell-api-test.js` now enforces the real parameter sets. The fix itself cannot be confirmed live: GJS caches the module, `ReloadExtension` is a stub, so it needs a logout. |
+| **GNOME Shell cluster** | **As installed it does not load at all** (`State: ERROR`, §5a.2). What follows describes the code, not the desktop. Everything short of being on screen: the full Cairo drawing (rendered to PNG in seven states and reviewed, including live against the running daemon), value mapping (22 tests), D-Bus proxy, live `StateChanged`, JSON parse, placement arithmetic, preferences, and `enable()`/`disable()` run for real against strict stubs of GNOME 50's own API contracts in every mode and corner. | **It has never been displayed on the desktop.** GNOME Shell was, however, made to *load* it, which surfaced a genuine defect — `addChrome({affectsInputRegion})`, a key GNOME 50 rejects outright. That is fixed, and `tests/shell-api-test.js` now enforces the real parameter sets. The fix itself cannot be confirmed live: GJS caches the module, `ReloadExtension` is a stub, so it needs a logout. |
 | **Floating placement (Shell extension)** | `Main.layoutManager.addChrome()`, the same mechanism as OSD popups — an in-Shell actor, not a window pretending to be one. | Inherently a desktop gadget: floats above the wallpaper, can overlap a dock, hidden by fullscreen windows. Stated in the preferences dialog rather than left to be discovered. |
 | **Window placement (`jamsys-cluster`)** | Stacking is solved: always-on-top and all-workspaces work over XWayland (see §1). Drag from anywhere on the face. | **Position cannot be set by the application.** Wayland gives a window no control over where it opens, and that is true on XWayland here too — the compositor places it and you drag it to the corner you want. The Shell extension has no such limit, which is why it stays the primary surface. |
 | **Click-through gaps** | The earlier audit observed six input-region rectangles with `XShapeGetRectangles`. | The handover and UI architecture document lost focus and missing clicks on Mutter even inside those rectangles. Region geometry does **not** prove usable pointer behaviour. Opt-in and off by default; not retested in this review. |
@@ -195,6 +205,77 @@ never executed.
 8. **`db_bytes ÷ uptime` overstates growth**, because the database predates the current
    run. Measure a delta instead; the acceptance script does.
 
+## 5a. Found on 2026-11-24
+
+Each was confirmed on this machine, not inferred. "Fixed" means fixed with a
+regression test. The daemon and window fixes are installed and running; the Shell
+extension's are installed on disk but not loaded until the next login.
+
+**Fixed**
+
+1. **Per-process I/O and GPU time were zero for every process.** The user unit set
+   `PrivateTmp`, `ProtectSystem`, `ProtectHome`, `ProtectKernelTunables` and
+   `ProtectControlGroups`. Each makes a user manager put the service in a user
+   namespace, from which the kernel refuses `/proc/<pid>/io` and `fdinfo` for every
+   other process. The running daemon was in a separate user namespace but the host's
+   mount namespace, so none of the five protected anything either. Tested one
+   directive at a time with `systemd-run --user`: each alone reproduces it; the
+   seccomp-based ones do not. Coverage said `process: Full` throughout. The directives
+   are removed, and the collector now reports Partial with the reason if it finds
+   itself in a user namespace.
+2. **The Shell extension could not load.** `gnome-extensions info` reports
+   `State: ERROR`: `Clutter.DragAction` and `event.get_click_count()` do not exist in
+   Clutter 18. Ported to `PanGesture`/`ClickGesture`; `position = 'custom'` added to
+   the schema, without which a drag could never be saved. Still unseen in a live Shell.
+3. **A reply over about 214 KiB was truncated and never completed.** Reproduced on the
+   running daemon with `alerts limit=2000`: exactly 219 264 bytes, then silence. The
+   Events page's own query is around 204 KiB.
+4. **Recurring false "is dropping packets" warnings on Wi-Fi.** `rx_dropped` was
+   counted as errors. The live alert list held these up to id 220, with 0 errors and
+   −45 dBm. Only errors count now, above a minimum packet count.
+5. **Stale dwell timers.** A rule that stopped evaluating a key left its timer armed,
+   so a second isolated spike hours later fired at once claiming hours of duration.
+6. **`suspend.drain` could never fire**: it compared the pre-sleep snapshot with a copy
+   of itself.
+7. **Three ways to pin a core at 100 %**: the journal follower exiting, the session bus
+   going away, and BlueZ signalling while the Bluetooth collector was off or
+   quarantined. Each left a permanently-ready descriptor in a level-triggered loop.
+8. **A mount point with a non-ASCII name was never monitored** (UTF-8 mangled to
+   Latin-1 when unescaping `mountinfo`), so no disk-full alert for it.
+9. **Config values the daemon cannot run with were accepted** (`fast_ms = 0`, negative
+   retention, infinite multiplier); now clamped and logged. `set_threshold` accepted
+   any key and any number.
+10. **A second `jamsysd` stole the first one's socket**, and deleted it on exit.
+11. **"Expected device" learning was cumulative and permanent**, so anything plugged in
+    for ten minutes in total was later reported missing until a restart.
+12. **dGPU reported as 0 W / 0 %** in every non-active state, not only `suspended`.
+13. **The event log filled with "Network configuration changed"** every few minutes on
+    a stable connection, and each such event also forced an outbound probe.
+14. In the window: menus and expanded rows destroyed by every refresh, four pages that
+    blinked and lost their scroll position, a Hardware page that reset its own
+    controls, a charge-limit write that froze the window, and a threshold dialog that
+    required knowing an undocumented key. In the cluster window: one-off flags that
+    became permanent, click-through that survived `--quit`, and `--quit` able to signal
+    an unrelated process.
+
+**Found and not fixed** — these are real and still present:
+
+| Defect | Effect |
+|---|---|
+| Learned baselines are never persisted | The learned rules (`power.idle_high`, `thermal.unusual`, `net.traffic_spike`) are blind for the warm-up after every daemon start. On a laptop restarted daily, the battery-idle baseline may never warm up. |
+| A notification that is rate-limited or fails to send is never retried | An alert raised while the notification service is restarting stays open but silent. The documented 180 s / 300 s cooldown is also dead code. |
+| A disabled or quarantined collector leaves its last readings in the snapshot | Disabling `storage` while `disk.full` is open keeps the alert open until the daemon restarts. |
+| Unclassified journal errors are stored with no deduplication | A service logging errors in a loop grows the event table for 90 days. |
+| Reachability probes block the daemon's only thread | Up to 2 s per target (several with a silent gateway) during which IPC and sampling stall. They now run far less often, which reduces but does not remove this. |
+| `gpu.idle_awake` ignores that the dGPU may be driving the panel | Not currently firing here; it would if the compute-process list were empty. |
+| A failed battery `capacity` read becomes 0 % | Could raise `battery.critical` from one bad read. Not observed. |
+| hwmon channels are pinned to the `hwmonN` index found at probe | A driver re-registering under a new index loses its sensors until restart. Not observed. |
+| `AckTopAlert` may acknowledge a different alert from the one the widget shows | Oldest of the top severity versus newest. |
+| `prerm` in the .deb uses `runuser -u "#uid"`, which is sudo syntax | The user daemon keeps running after `apt remove`. Not executed. |
+| The cluster's alert pill cannot draw non-Latin text | A Bluetooth device named in a non-Latin script renders as empty boxes: Cairo's toy text API has no font fallback or shaping. Needs PangoCairo. |
+| Cluster menus are pointer-only and nothing has an accessible name | No keyboard route to opacity, face or stacking on either surface. |
+| No localisation | The interface is English only; nothing is marked for translation and RTL has not been checked. |
+
 ## 6. Resource usage
 
 | | Measured |
@@ -233,7 +314,27 @@ matters: the dGPU draws 6.8 W awake, and the gate keeps JamSys from causing that
 
 ## 8. Tests
 
-Repository review on 2026-09-10: all suites below passed. Rust counts are tests;
+On 2026-11-24, `./scripts/run-tests.sh` on the target machine: 23 suites passed, none
+failed (live D-Bus skipped; it tests the installed daemon, not this build).
+
+```
+jamsys-daemon   291 unit + 2 (binary) + 20 integration   (was 280 + 17 before this review)
+jamsys-helper     5      jamsys-kbd  12      jamsys-power  7
+Python           34 xabove, 19 charge-limit, 46 report, 13 ipc-client,
+                 12 page-refresh, 36 core-matrix, 28 escaping,
+                 30 refresh-state (new), plus four unittest suites
+JavaScript       format, gauges, shell-api, offline-render, standalone-lifecycle,
+                 conf (new), real-api (new: stubs checked against the real typelib)
+```
+
+Two things about what these numbers do not mean. They passed, in full, while the
+Shell extension could not load and while every per-process I/O figure was zero: a
+suite is evidence about what it exercises, and both defects lived in the gap between
+a stub and the real system. And `refresh-state`, `conf` and `real-api` drive widgets
+and functions, not a person with a pointer — the window's new behaviour has been
+rendered and read, not used.
+
+Earlier record, repository review on 2026-09-10: all suites below passed. Rust counts are tests;
 Python/GJS counts are the harnesses' checks, not equivalent unit-test totals.
 
 ```

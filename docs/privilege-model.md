@@ -131,7 +131,10 @@ line closes that connection only.
   outbound connection except the optional reachability probe, which is a bare TCP
   `connect()` to the default gateway, the configured DNS server, and one configurable
   host — with **zero bytes sent** — and can be disabled entirely
-  (`[collectors] reachability = false`).
+  (`[network] reachability = false` in `config.toml`, then
+  `systemctl --user reload jamsysd`). Earlier versions of this document gave the
+  key as `[collectors] reachability`; that section only names collectors, so the
+  setting was accepted and did nothing.
 * Everything is stored under `~/.local/share/jamsys/`. Deleting that directory deletes
   all history.
 

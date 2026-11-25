@@ -15,6 +15,20 @@ The desktop client validates its handshake before exposing a connection and has
 one reader per socket. Disconnect releases pending calls; a timed-out request
 retires the connection so the window can retry. Client shutdown is terminal.
 
+A reply of any size is delivered in full: output the socket would not take is kept
+and written when the peer reads (the loop watches for writability only while a
+backlog exists). A client that sends a request and then closes its sending side is
+still answered. Before 2026-11-24 a reply larger than the socket buffer (about
+214 KiB here) was cut off and never completed, and a half-closed client was dropped
+with its request unread.
+
+`set_threshold` and `set_collector` write `config.toml` atomically, and refuse to
+write at all while the file on disk failed to parse — the daemon is then running on
+defaults, and saving those would erase what the user had written.
+
+Only one daemon serves the socket. A second `jamsysd` refuses to start while the
+first still answers, rather than replacing its socket.
+
 At most eight clients at once. When the table is full, a peer that holds no subscription and
 has sent nothing for a minute is reclaimed to make room, so idle connections cannot lock the
 window out of its own daemon.
@@ -25,7 +39,7 @@ window out of its own daemon.
 // response
 {"id": 7, "ok": true, "data": { ... }}
 // error
-{"id": 7, "ok": false, "error": {"code": "unsupported", "message": "..."}}
+{"id": 7, "ok": false, "error": {"code": "unknown_op", "message": "..."}}
 // push (id is absent)
 {"push": "alert", "data": { ... }}
 ```
@@ -39,15 +53,16 @@ window out of its own daemon.
 | `history` | `{subsystem, name, instance?, since_ms, until_ms?, max_points?}` | downsampled series, auto-selecting raw/1m/5m/15m by span |
 | `alerts` | `{open_only?, limit?}` | alert list with explanation + evidence |
 | `events` | `{since_ms?, limit?, subsystem?}` | event list |
-| `processes` | `{sort?, limit?}` | process table with anomaly flags |
+| `processes` | — | top CPU and memory samples with anomaly flags (`sort`/`limit` are accepted and ignored) |
 | `coverage` | — | per-metric support state + reason + quarantine info |
 | `inventory` | `{changes?}` | current inventory or the change log |
 | `ack` | `{alert_id}` | mark acknowledged |
 | `mute` | `{fingerprint, until_ms?}` | mute/snooze |
 | `suppress` | `{scope, pattern, until_ms?, reason?}` | ignore rule/instance |
 | `unsuppress` | `{id}` | remove a suppression |
-| `set_threshold` | `{rule_id, key, value}` | override an L1 threshold |
-| `set_collector` | `{name, enabled}` | enable/disable a collector at runtime |
+| `thresholds` | — | every adjustable threshold: `{rule_id, key, applies_to, label, unit, default, min, max, value}` |
+| `set_threshold` | `{rule_id, key, value}` | override a threshold. `not_found` for a key no rule reads, `out_of_range` outside `min..max`; setting the default removes the override |
+| `set_collector` | `{name, enabled}` | enable/disable a collector at runtime; the reply's `persisted` says whether it was also written to `config.toml` |
 | `subscribe` | `{topics: ["alert","event","tick"]}` | begin push frames |
 | `stats` | — | daemon self-metrics (CPU, RSS, wakeups, DB size) |
 

@@ -9,7 +9,8 @@ rm -f "$HOME/.config/systemd/user/jamsysd.service"
 systemctl --user daemon-reload 2>/dev/null || true
 
 echo "==> removing user-installed files"
-rm -f  "$PREFIX/bin/jamsysd" "$PREFIX/bin/jamsys" "$PREFIX/bin/jamsys-cluster"
+rm -f  "$PREFIX/bin/jamsysd" "$PREFIX/bin/jamsys" "$PREFIX/bin/jamsys-cluster" \
+       "$PREFIX/bin/jamsys-xabove"
 rm -rf "$PREFIX/lib/jamsys_ui"
 rm -f  "$PREFIX/share/applications/org.jamsys.Monitor.desktop"
 rm -f  "$PREFIX/share/applications/org.jamsys.Cluster.desktop"

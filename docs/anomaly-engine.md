@@ -27,8 +27,7 @@ considers "normal", because some things are never normal.
 | `disk.full` | filesystem ≥ 95 % (real filesystems only) | CRITICAL |
 | `disk.filling` | filesystem ≥ 90 % | WARNING |
 | `disk.inodes` | inode use ≥ 90 % | WARNING |
-| `disk.fs_errors` | `ext4 errors_count` increased | CRITICAL |
-| `nvme.temp` | composite ≥ `temp1_crit` − 10 °C | WARNING |
+| `nvme.temp` | composite ≥ 70 °C (fixed; not derived from `temp1_crit`) | WARNING |
 | `nvme.smart` | `critical_warning != 0`, or media errors increased | CRITICAL |
 | `nvme.spare` | `available_spare` < `available_spare_threshold` | CRITICAL |
 | `nvme.wear` | `percentage_used` ≥ 90 | WARNING |
@@ -39,21 +38,35 @@ considers "normal", because some things are never normal.
 | `thermal.fan_stalled` | fan = 0 rpm while its zone ≥ 70 °C for 60 s | CRITICAL |
 | `battery.health` | `energy_full / energy_full_design` < 70 % | WARNING |
 | `battery.critical` | ≤ 5 % and discharging | CRITICAL |
-| `net.iface_down` | a previously-up managed iface goes down unexpectedly | WARNING |
-| `net.flapping` | ≥ 3 up/down transitions in 300 s | WARNING |
 | `net.errors` | error+drop rate > 1 % of packets over 60 s | WARNING |
 | `net.dns_fail` | DNS unreachable while gateway reachable | WARNING |
 | `net.no_internet` | gateway reachable, internet not, for 120 s | NOTICE |
 | `service.failed` | a systemd unit enters `failed` | WARNING |
-| `service.flapping` | ≥ 5 restarts in 600 s | WARNING |
 | `bt.controller_error` | Bluetooth controller error in journal | WARNING |
 | `audio.service_down` | PipeWire or WirePlumber not active | WARNING |
 | `device.missing` | a learned internal device disappears | WARNING |
 | `suspend.failed` | suspend aborted, or resume with device errors | WARNING |
 | `suspend.drain` | > 2 %/h battery drain while suspended | NOTICE |
 
-Every threshold is overridable per rule from the UI (`threshold_override` table); the
-alert text always shows the threshold actually in force.
+Every threshold is overridable from the UI, and the alert text always shows the value
+actually in force. Overrides are stored in `[alerts.thresholds]` in `config.toml` (the
+`threshold_override` table in the database is created but unused). The full list, with
+the default, the allowed range and the alert each one governs, is `config::THRESHOLDS`;
+the `thresholds` IPC operation returns it and a test keeps it in step with the rules.
+A value outside its range, or a key no rule reads, is refused.
+
+**Not implemented.** Earlier versions of this table listed `disk.fs_errors`,
+`net.iface_down`, `net.flapping` and `service.flapping`. No code raises them. The ext4
+error counters, interface transitions and unit restart counts are collected and shown,
+but nothing alerts on them.
+
+### What "sustained" means
+
+A dwell is "continuously true for N seconds", and continuity needs the rule to keep
+saying so. Several rules only evaluate while a precondition holds — the machine is
+idle, the process is still top of the list, the fan reads zero. If a rule goes quiet
+for more than five minutes its timer starts again: two isolated spikes hours apart
+are two spikes, not one condition that has held for hours.
 
 ### Xid handling
 
@@ -154,13 +167,18 @@ each is handled explicitly:
 | Rule id | Fires when | Level |
 |---|---|---|
 | `power.idle_high` | `power.system_w` z > 3.5 ∧ Δ ≥ 5 W ∧ activity = idle ∧ 600 s | NOTICE |
-| `power.discharge_high` | discharge > p95 ∧ Δ ≥ 8 W ∧ 300 s | NOTICE |
 | `mem.leak` | one process' RSS monotonically ↑ over 30 min with slope ≥ 100 MB/h and total growth ≥ 1 GB | NOTICE |
-| `mem.growth` | `mem.used_bytes` z > 3.5 ∧ Δ ≥ 2 GB ∧ 600 s | NOTICE |
 | `net.traffic_spike` | rx or tx > max(p95 × 4, 5 MB/s) for 120 s | NOTICE |
 | `thermal.unusual` | temp z > 3.5 ∧ Δ ≥ 10 °C ∧ 300 s | NOTICE |
 | `gpu.idle_awake` | dGPU `runtime_status = active` ∧ util = 0 % ∧ no GPU process ∧ 300 s | NOTICE |
-| `disk.write_spike` | write throughput > p95 × 5 ∧ ≥ 50 MB/s ∧ 300 s | NOTICE |
+
+`power.discharge_high`, `mem.growth` and `disk.write_spike` appeared here previously
+and are **not implemented**.
+
+**Baselines do not survive a restart.** `save_baseline`/`load_baselines` exist in the
+store but nothing calls them, so every daemon start begins the warm-up (120 samples
+per context) again. The learned rules are therefore blind for the first part of every
+session. This is a known defect, not a design decision.
 
 Note `mem.leak` is a **trend** test (Theil–Sen slope over the 30-minute window), not a
 z-score — a leak is defined by monotone growth, not by being far from the median.
