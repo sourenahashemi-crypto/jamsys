@@ -157,21 +157,25 @@ pub fn parse_mountinfo(text: &str) -> Vec<MountEntry> {
 }
 
 fn unescape_octal(s: &str) -> String {
+    // Bytes, not chars. Pushing each byte as a `char` re-encoded a UTF-8 mount
+    // point as Latin-1 ("Données" -> "DonnÃ©es", and any non-Latin label likewise),
+    // statvfs then failed on a path that does not exist, and the volume was
+    // silently left out: no usage figure and no disk-full alert for it.
     let b = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'\\' && i + 3 < b.len() {
+        if b[i] == b'\\' && i + 3 < b.len() && b[i + 1..i + 4].iter().all(u8::is_ascii_digit) {
             if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 4], 8) {
-                out.push(v as char);
+                out.push(v);
                 i += 4;
                 continue;
             }
         }
-        out.push(b[i] as char);
+        out.push(b[i]);
         i += 1;
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Should this mount be monitored, or is it kernel/snap plumbing?
@@ -490,6 +494,18 @@ mod tests {
         }
         assert!(!s.nvme.is_empty(), "NVMe controller not found");
         assert!(s.nvme[0].temp_c.is_some(), "NVMe temperature should be readable unprivileged");
+    }
+
+    #[test]
+    fn a_non_ascii_mount_point_survives_unescaping() {
+        assert_eq!(unescape_octal("/media/ronin/Données"), "/media/ronin/Données");
+        assert_eq!(unescape_octal("/media/ronin/Sauvegarde été"), "/media/ronin/Sauvegarde été");
+        assert_eq!(unescape_octal("/media/ronin/Ελληνικά"), "/media/ronin/Ελληνικά");
+        // The kernel escapes space, tab, newline and backslash; mixed with UTF-8.
+        assert_eq!(unescape_octal("/mnt/Mes\\040Données"), "/mnt/Mes Données");
+        // And an escaped high byte pair is reassembled into one character.
+        assert_eq!(unescape_octal("/mnt/caf\\303\\251"), "/mnt/café");
+        assert_eq!(unescape_octal("/mnt/back\\134slash"), "/mnt/back\\slash");
     }
 
     #[test]

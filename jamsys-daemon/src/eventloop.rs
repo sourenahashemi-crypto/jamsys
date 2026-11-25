@@ -30,6 +30,8 @@ pub struct Ready {
     pub token: u64,
     pub readable: bool,
     pub hangup: bool,
+    /// Only ever set for a descriptor that asked for it with `want_writable`.
+    pub writable: bool,
 }
 
 impl EventLoop {
@@ -51,6 +53,22 @@ impl EventLoop {
         // non-null pointer is passed for compatibility with pre-2.6.9 behaviour.
         let mut ev = libc::epoll_event { events: 0, u64: 0 };
         let r = unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_DEL, fd, &mut ev) };
+        if r < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    }
+
+    /// Start or stop being woken when `fd` can take more output.
+    ///
+    /// Level-triggered, so this must be switched off again as soon as the
+    /// backlog is gone: an idle socket is always writable, and leaving the
+    /// interest set would spin the loop.
+    pub fn want_writable(&self, fd: RawFd, token: u64, want: bool) -> io::Result<()> {
+        let mut ev = libc::epoll_event {
+            events: (libc::EPOLLIN | libc::EPOLLRDHUP
+                     | if want { libc::EPOLLOUT } else { 0 }) as u32,
+            u64: token,
+        };
+        // SAFETY: `ev` outlives the call; `fd` is owned by the caller.
+        let r = unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_MOD, fd, &mut ev) };
         if r < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
     }
 
@@ -85,6 +103,7 @@ impl EventLoop {
                 token: ev.u64,
                 readable: ev.events & (libc::EPOLLIN as u32) != 0,
                 hangup: ev.events & ((libc::EPOLLHUP | libc::EPOLLERR | libc::EPOLLRDHUP) as u32) != 0,
+                writable: ev.events & (libc::EPOLLOUT as u32) != 0,
             });
         }
         Ok(())

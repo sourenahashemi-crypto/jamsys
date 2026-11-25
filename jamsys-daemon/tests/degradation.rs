@@ -493,3 +493,70 @@ fn a_daemon_restart_does_not_duplicate_or_re_notify_open_alerts() {
     assert!(mgr2.is_open("cpu.temp.critical"));
     assert_eq!(store.row_count("alert"), 1);
 }
+
+#[test]
+fn a_switched_off_collector_still_drains_its_own_socket() {
+    // An event-driven collector owns a socket the daemon watches. Disabled,
+    // nothing read it: `dispatch_event` skips unusable collectors, the bytes
+    // stayed queued, and a level-triggered epoll returned immediately for ever.
+    // This drives a real pipe through a real epoll loop.
+    use jamsys::collectors::{ExternalEvent, Registry};
+    use jamsys::eventloop::EventLoop;
+    use std::os::unix::io::RawFd;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Signalled { fd: RawFd, seen: Arc<AtomicUsize> }
+    impl Collector for Signalled {
+        fn name(&self) -> &'static str { "signalled" }
+        fn tier(&self) -> Tier { Tier::Slow }
+        fn probe(&mut self) -> Support { Support::Full }
+        fn collect(&mut self, _ctx: &mut Ctx) -> CResult<()> { Ok(()) }
+        fn event_fd(&self) -> Option<RawFd> { Some(self.fd) }
+        fn on_event(&mut self, ev: &ExternalEvent, ctx: &mut Ctx) -> CResult<()> {
+            if let ExternalEvent::CollectorReadable { name: "signalled" } = ev {
+                let mut b = [0u8; 64];
+                // SAFETY: reading into a stack buffer from a pipe this test owns.
+                unsafe { libc::read(self.fd, b.as_mut_ptr() as *mut libc::c_void, b.len()) };
+                self.seen.fetch_add(1, Ordering::SeqCst);
+                ctx.g("test", "signal", "", 1.0);
+            }
+            Ok(())
+        }
+    }
+
+    let mut fds = [0 as RawFd; 2];
+    // SAFETY: a valid two-element array for pipe2.
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) }, 0);
+    let seen = Arc::new(AtomicUsize::new(0));
+    let cfg = Config::default();
+    let mut r = Registry::new();
+    r.add(Box::new(Signalled { fd: fds[0], seen: seen.clone() }), &cfg);
+    let el = EventLoop::new().unwrap();
+    el.add(fds[0], 100).unwrap();
+
+    assert!(r.set_enabled("signalled", false));
+    assert!(!r.is_usable("signalled"));
+    // SAFETY: writing one byte from a live buffer to the pipe's write end.
+    assert_eq!(unsafe { libc::write(fds[1], b"x".as_ptr() as *const libc::c_void, 1) }, 1);
+
+    let mut ready = Vec::new();
+    el.wait(&mut ready, 500).unwrap();
+    assert_eq!(ready.len(), 1, "the queued byte wakes the loop");
+
+    // What the daemon used to do: nothing reads, so the wakeup repeats.
+    let mut x = ctx();
+    r.dispatch_event(&ExternalEvent::CollectorReadable { name: "signalled" }, &mut x);
+    assert_eq!(seen.load(Ordering::SeqCst), 0, "a disabled collector is skipped by dispatch");
+    el.wait(&mut ready, 100).unwrap();
+    assert_eq!(ready.len(), 1, "which leaves the socket ready: the spin this test is about");
+
+    // What it does now.
+    let mut scratch = ctx();
+    r.drain_event("signalled", &ExternalEvent::CollectorReadable { name: "signalled" }, &mut scratch);
+    assert_eq!(seen.load(Ordering::SeqCst), 1, "the owner reads its own socket");
+    el.wait(&mut ready, 100).unwrap();
+    assert!(ready.is_empty(), "and the loop goes back to sleep");
+
+    // SAFETY: closing descriptors this test opened.
+    unsafe { libc::close(fds[0]); libc::close(fds[1]); }
+}

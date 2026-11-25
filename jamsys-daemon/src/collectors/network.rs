@@ -80,6 +80,11 @@ pub struct NetCollector {
     /// Recent up/down transition timestamps per interface.
     transitions: HashMap<String, Vec<i64>>,
     last_reach_ms: i64,
+    /// When the next reachability probe may run.
+    reach_due_ms: i64,
+    /// rtnetlink reported something; collect() decides whether it mattered.
+    route_dirty: bool,
+    last_signature: Option<String>,
     /// Addresses and connection count are refreshed on a slow cadence, or immediately
     /// when rtnetlink reports a change. Both are expensive relative to a counter read
     /// and neither changes between two-second ticks in normal operation.
@@ -97,6 +102,9 @@ impl NetCollector {
             last_carrier: HashMap::new(),
             transitions: HashMap::new(),
             last_reach_ms: 0,
+            reach_due_ms: 0,
+            route_dirty: false,
+            last_signature: None,
             addr_cache: HashMap::new(),
             last_addr_ms: 0,
             conn_count: 0,
@@ -373,11 +381,15 @@ impl Collector for NetCollector {
                     i.tx_bps = c.tx_bytes.saturating_sub(p.tx_bytes) as f64 / dt;
                     let dpk = (c.rx_packets.saturating_sub(p.rx_packets)
                         + c.tx_packets.saturating_sub(p.tx_packets)) as f64;
+                    // Errors only. `rx_dropped` also counts frames the stack
+                    // chose not to keep (an unhandled protocol, a full backlog),
+                    // which a healthy Wi-Fi link does all day: with drops folded
+                    // in, a -45 dBm link with zero errors raised "is dropping
+                    // packets ... move closer to the access point" hundreds of
+                    // times. Drops are still reported, as their own counters.
                     let derr = (c.rx_errors.saturating_sub(p.rx_errors)
-                        + c.tx_errors.saturating_sub(p.tx_errors)
-                        + c.rx_dropped.saturating_sub(p.rx_dropped)
-                        + c.tx_dropped.saturating_sub(p.tx_dropped)) as f64;
-                    i.error_rate_pct = if dpk > 0.0 { 100.0 * derr / (dpk + derr) } else { 0.0 };
+                        + c.tx_errors.saturating_sub(p.tx_errors)) as f64;
+                    i.error_rate_pct = error_rate_pct(dpk, derr);
                 }
             }
             self.prev.insert(name.clone(), (c, ctx.ts_ms));
@@ -413,8 +425,24 @@ impl Collector for NetCollector {
 
         // Reachability is the only outbound activity in the daemon, runs at most once
         // a minute, sends nothing, and can be switched off entirely.
-        if cfg.network.reachability && ctx.ts_ms - self.last_reach_ms > 60_000 {
+        if self.route_dirty {
+            self.route_dirty = false;
+            let sig = config_signature(&st);
+            if self.last_signature.as_ref().is_some_and(|prev| *prev != sig) {
+                ctx.event(Event::new("network", "route_change", match &st.default_route {
+                    Some(gw) => format!("Network configuration changed: default route via {gw} on {}",
+                                        st.default_iface.as_deref().unwrap_or("?")),
+                    None => "Network configuration changed: no default route".to_string(),
+                }, Severity::Info));
+            }
+            self.last_signature = Some(sig);
+        } else if self.last_signature.is_none() {
+            self.last_signature = Some(config_signature(&st));
+        }
+
+        if cfg.network.reachability && ctx.ts_ms >= self.reach_due_ms {
             self.last_reach_ms = ctx.ts_ms;
+            self.reach_due_ms = ctx.ts_ms + 60_000;
             let to = Duration::from_millis(cfg.network.probe_timeout_ms);
             let mut r = Reachability { checked_ms: ctx.ts_ms, ..Default::default() };
             if let Some(gw) = &st.default_route {
@@ -443,17 +471,59 @@ impl Collector for NetCollector {
             // A link change invalidates the cached reachability verdict and the
             // address cache; refresh both on the next tick rather than reporting
             // stale values.
-            self.last_reach_ms = 0;
+            // Brought forward, not zeroed. rtnetlink speaks on every Wi-Fi scan,
+            // roam and address refresh; zeroing meant an outbound probe (and up
+            // to several seconds of blocked event loop) for each of them,
+            // against a documented "at most once a minute".
+            self.reach_due_ms = self.reach_due_ms.min(self.last_reach_ms + REPROBE_SPACING_MS);
             self.last_addr_ms = 0;
-            ctx.event(Event::new("network", "route_change", "Network configuration changed", Severity::Info));
+            // The event is recorded by collect(), and only if something a person
+            // would call the network configuration actually changed. Recording
+            // one per datagram filled the event log with an identical line every
+            // few minutes on a perfectly stable connection.
+            self.route_dirty = true;
+            let _ = ctx;
         }
         Ok(())
     }
 }
 
+/// The soonest a link change may trigger another reachability probe.
+const REPROBE_SPACING_MS: i64 = 10_000;
+
+/// What "the network configuration" means for the purpose of logging a change:
+/// the default route and each interface's link state and addresses. Counters
+/// and signal strength are deliberately not part of it.
+fn config_signature(st: &NetState) -> String {
+    let mut s = format!("{:?}|{:?}", st.default_route, st.default_iface);
+    for i in &st.ifaces {
+        s.push_str(&format!("|{}:{}:{:?}:{:?}", i.name, i.carrier, i.ipv4, i.ipv6));
+    }
+    s
+}
+
+/// Share of packets in one interval that failed, as a percentage.
+///
+/// Below a minimum packet count the answer is zero: three packets of which one
+/// errored is not a 25% error rate worth alerting on.
+pub(crate) fn error_rate_pct(packets: f64, errors: f64) -> f64 {
+    const MIN_PACKETS: f64 = 200.0;
+    if packets + errors < MIN_PACKETS {
+        return 0.0;
+    }
+    100.0 * errors / (packets + errors)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_near_idle_link_has_no_error_rate() {
+        assert_eq!(error_rate_pct(3.0, 1.0), 0.0);
+        assert_eq!(error_rate_pct(0.0, 0.0), 0.0);
+        assert!((error_rate_pct(9_900.0, 100.0) - 1.0).abs() < 1e-9);
+    }
     use crate::config::Config;
     use std::sync::Arc;
 

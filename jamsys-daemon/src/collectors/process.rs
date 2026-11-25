@@ -151,6 +151,19 @@ impl Collector for ProcCollector {
         if !exists("/proc/self/io") {
             return Support::Partial { detail: "per-process I/O counters unavailable".into() };
         }
+        // /proc/self/io being readable proves nothing about anyone else's. From
+        // inside a user namespace the kernel refuses /proc/<pid>/io and fdinfo
+        // for every other process, including the user's own -- which is where a
+        // sandboxed user unit ends up. That state used to be reported as Full
+        // while every I/O and GPU figure on the Processes page was zero.
+        if in_child_user_namespace(read_str("/proc/self/uid_map").as_deref()) {
+            return Support::Partial {
+                detail: "running inside a user namespace, so per-process I/O and GPU time \
+                         cannot be read (zero is shown). Remove PrivateTmp/Protect* from \
+                         jamsysd.service, then: systemctl --user daemon-reload && \
+                         systemctl --user restart jamsysd".into(),
+            };
+        }
         Support::Full
     }
 
@@ -270,9 +283,28 @@ impl Collector for ProcCollector {
     }
 }
 
+/// Whether `/proc/self/uid_map` describes a namespace other than the initial
+/// one. The initial namespace maps the whole id range onto itself; anything
+/// narrower is a child. Unknown (unreadable) is treated as "not a child", so a
+/// kernel without user namespaces is never mislabelled.
+fn in_child_user_namespace(uid_map: Option<&str>) -> bool {
+    let Some(map) = uid_map else { return false };
+    let f: Vec<u64> = map.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+    !(f.len() == 3 && f[0] == 0 && f[1] == 0 && f[2] == 4_294_967_295)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sandboxed_user_unit_is_recognised_as_a_user_namespace() {
+        // The initial namespace, as read on the host.
+        assert!(!in_child_user_namespace(Some("         0          0 4294967295\n")));
+        // What the daemon saw under PrivateTmp/ProtectSystem as a user unit.
+        assert!(in_child_user_namespace(Some("      1000       1000          1\n")));
+        assert!(!in_child_user_namespace(None));
+    }
     use crate::config::Config;
     use std::sync::Arc;
 

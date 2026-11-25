@@ -221,10 +221,11 @@ impl RuleEngine {
         let hot = cfg.threshold("thermal.fan_stalled", "celsius", 70.0);
         let hottest = s.thermal.max_temp_c.unwrap_or(0.0);
         for f in &s.thermal.fans {
+            let key = format!("thermal.fan_stalled:{}", f.key);
             if f.value > 0.0 {
+                self.dwell.clear(&key);
                 continue;
             }
-            let key = format!("thermal.fan_stalled:{}", f.key);
             if let Some(held) = self.dwell.update(&key, hottest >= hot, now, 60) {
                 self.fire(out, Alert::new("thermal.fan_stalled", &f.key, Severity::Critical,
                     format!("{} is not spinning while the system is hot", f.label),
@@ -437,7 +438,7 @@ impl RuleEngine {
             if let Some(held) = self.dwell.update(&format!("net.errors:{}", i.name), i.error_rate_pct >= err_thresh, now, 60) {
                 self.fire(out, Alert::new("net.errors", &i.name, Severity::Warning,
                     format!("{} is dropping packets", i.name),
-                    Explanation::new(format!("{} shows a {:.2}% error and drop rate.", i.name, i.error_rate_pct))
+                    Explanation::new(format!("{:.2}% of packets on {} are failing with errors.", i.error_rate_pct, i.name))
                         .expected(format!("below {err_thresh:.1}%"))
                         .since(held)
                         .evidence("RX errors / drops", format!("{} / {}", i.rx_errors, i.rx_dropped))
@@ -731,10 +732,16 @@ impl RuleEngine {
             for (dir, bps) in [("rx", i.rx_bps), ("tx", i.tx_bps)] {
                 let metric = format!("network.{dir}_bps[{}]", i.name);
                 let ctx = s.context_at(crate::clock::now_ms(), self.tod);
-                if let Verdict::Deviating { p95, median, .. } = self.baselines.evaluate(&metric, ctx, bps) {
+                let key = format!("net.traffic_spike:{}:{dir}", i.name);
+                let verdict = self.baselines.evaluate(&metric, ctx, bps);
+                if !matches!(verdict, Verdict::Deviating { .. }) {
+                    self.dwell.clear(&key);
+                }
+                if let Verdict::Deviating { p95, median, .. } = verdict {
                     // An absolute floor as well: 4x a tiny baseline is still tiny.
-                    if bps > (p95 * 4.0).max(5e6) {
-                        let key = format!("net.traffic_spike:{}:{dir}", i.name);
+                    if bps <= (p95 * 4.0).max(5e6) {
+                        self.dwell.clear(&key);
+                    } else {
                         if let Some(held) = self.dwell.update(&key, true, now, 120) {
                             self.fire(out, Alert::new("net.traffic_spike", &format!("{}:{dir}", i.name), Severity::Notice,
                                 format!("Unusually heavy {} traffic on {}", if dir == "rx" { "download" } else { "upload" }, i.name),
@@ -863,8 +870,14 @@ mod tests {
     }
 
     fn fire_until(e: &mut RuleEngine, s: &Snapshot, c: &Config, start: i64, secs: i64) -> Vec<Alert> {
-        // Two passes: one to start the dwell, one after it has elapsed.
-        e.evaluate(s, c, start);
+        // Evaluated the way the daemon does it: repeatedly. Two calls ten
+        // minutes apart are two isolated observations, not a sustained
+        // condition, and the dwell tracker now tells them apart.
+        let mut t = start;
+        while t < start + secs * 1000 {
+            e.evaluate(s, c, t);
+            t += 30_000;
+        }
         e.evaluate(s, c, start + secs * 1000).alerts
     }
 

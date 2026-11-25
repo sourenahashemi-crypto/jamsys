@@ -283,14 +283,20 @@ impl Collector for GpuCollector {
                     }
                 }
             } else {
-                // Suspended: report the truth without paying to learn it.
-                g.power_w = Some(0.0);
-                g.util_pct = Some(0.0);
-                ctx.sample("gpu", "power_w", "nvidia", "W", 0.0);
-                ctx.sample("gpu", "util_pct", "nvidia", "%", 0.0);
+                // Suspended: report the truth without paying to learn it. Only
+                // when it really is suspended -- this branch also covers
+                // "resuming", "suspending" and an unreadable status file, where
+                // the card is powered or its state is unknown and a stored 0 W
+                // would be an invented measurement.
+                if g.runtime_status == "suspended" {
+                    g.power_w = Some(0.0);
+                    g.util_pct = Some(0.0);
+                    ctx.sample("gpu", "power_w", "nvidia", "W", 0.0);
+                    ctx.sample("gpu", "util_pct", "nvidia", "%", 0.0);
+                }
                 // Name/driver come from sysfs and /proc, which never wake the device.
                 if g.name.is_empty() {
-                    g.name = read_str("/sys/class/drm/card2/device/label")
+                    g.name = read_str(card.join("device/label"))
                         .unwrap_or_else(|| "NVIDIA discrete GPU".into());
                 }
                 if let Some(v) = read_str("/proc/driver/nvidia/version") {

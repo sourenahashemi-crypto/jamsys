@@ -319,6 +319,28 @@ impl Registry {
         }
     }
 
+    /// Deliver an event to one collector whatever its state, discarding
+    /// anything it produces.
+    ///
+    /// For a collector that owns a socket (BlueZ signals). `dispatch_event`
+    /// skips a disabled or quarantined collector, which left nobody reading
+    /// that socket; with data waiting on it the level-triggered event loop
+    /// returned immediately for ever -- a core at 100% from switching the
+    /// Bluetooth collector off, or from bluetoothd being stopped for a while.
+    /// Letting the owner consume its own stream keeps the framing intact for
+    /// when it is usable again.
+    pub fn drain_event(&mut self, name: &str, ev: &ExternalEvent, scratch: &mut Ctx) {
+        for e in self.entries.iter_mut().filter(|e| e.c.name() == name) {
+            if catch_unwind(AssertUnwindSafe(|| e.c.on_event(ev, scratch))).is_err() {
+                crate::log_error!("collector {} panicked draining an event — isolated", e.c.name());
+            }
+        }
+    }
+
+    pub fn is_usable(&self, name: &str) -> bool {
+        self.entries.iter().any(|e| e.c.name() == name && e.support.is_usable())
+    }
+
     pub fn set_enabled(&mut self, name: &str, enabled: bool) -> bool {
         for e in self.entries.iter_mut() {
             if e.c.name() == name {

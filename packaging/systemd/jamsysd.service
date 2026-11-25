@@ -20,13 +20,18 @@ TasksMax=32
 
 # Hardening. This is a user unit, so it already has no privileges to drop; these
 # further reduce what a compromised daemon could reach.
+#
+# Deliberately absent: PrivateTmp, ProtectSystem, ProtectHome, ReadWritePaths,
+# ProtectKernelTunables and ProtectControlGroups. Each needs a mount namespace,
+# which an unprivileged user manager can only get by first putting the service
+# in a *user* namespace. Measured on Ubuntu 26.04 with
+# kernel.apparmor_restrict_unprivileged_userns=1: the user namespace was created
+# and the mount namespace was not, so none of the six protected anything (/ was
+# still writable) -- while from inside that namespace the kernel refuses
+# /proc/<pid>/io and /proc/<pid>/fdinfo for every process but our own. The price
+# of protection that was not there was every per-process I/O and GPU figure
+# reading zero. Everything below is seccomp or a prctl and needs no namespace.
 NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=%h/.local/share/jamsys %h/.config/jamsys
-ProtectKernelTunables=yes
-ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 RestrictRealtime=yes
 LockPersonality=yes

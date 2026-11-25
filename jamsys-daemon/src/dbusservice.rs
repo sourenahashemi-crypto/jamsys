@@ -219,6 +219,9 @@ pub struct DbusService {
     pub name_acquired: bool,
     pub calls_served: u64,
     pub signals_emitted: u64,
+    /// Set once the connection has failed. The service is finished: drop it and
+    /// build a new one.
+    pub broken: bool,
 }
 
 /// What the caller should do after `handle`.
@@ -250,7 +253,8 @@ impl DbusService {
             return None;
         }
         crate::log_info!("D-Bus service listening on {BUS_NAME} {OBJECT_PATH}");
-        Some(DbusService { conn, last_sent: None, name_acquired: true, calls_served: 0, signals_emitted: 0 })
+        Some(DbusService { conn, last_sent: None, name_acquired: true, calls_served: 0, signals_emitted: 0,
+                           broken: false })
     }
 
     pub fn fd(&self) -> std::os::unix::io::RawFd {
@@ -276,6 +280,7 @@ impl DbusService {
             }
             Err(e) => {
                 crate::log_warn!("failed to emit StateChanged: {e}");
+                self.broken = true;
                 false
             }
         }
@@ -286,7 +291,10 @@ impl DbusService {
         let msgs = match self.conn.try_read_messages() {
             Ok(m) => m,
             Err(e) => {
+                // Usually the bus going away. The socket then reads as ready for
+                // ever; the owner must stop watching it and reconnect later.
                 crate::log_warn!("bus read failed: {e}");
+                self.broken = true;
                 return Vec::new();
             }
         };

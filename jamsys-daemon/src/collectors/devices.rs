@@ -56,6 +56,8 @@ pub struct DeviceCollector {
     /// USB stick once does not create a permanent false alarm.
     expected: BTreeSet<String>,
     sightings: std::collections::HashMap<String, u32>,
+    /// Consecutive ticks each expected device has been missing.
+    absent: std::collections::HashMap<String, u32>,
     learn_ticks: u32,
     prev_pipewire_pid: Option<String>,
     restarts: u32,
@@ -66,6 +68,7 @@ impl DeviceCollector {
         DeviceCollector {
             expected: BTreeSet::new(),
             sightings: Default::default(),
+            absent: Default::default(),
             learn_ticks: 0,
             prev_pipewire_pid: None,
             restarts: 0,
@@ -75,6 +78,9 @@ impl DeviceCollector {
     /// Seen on at least this many consecutive slow ticks (~10 min) to count as
     /// permanently attached.
     const LEARN_THRESHOLD: u32 = 10;
+    /// Slow ticks of continuous absence after which a device stops being
+    /// expected: an hour at the default cadence.
+    const FORGET_AFTER: u32 = 60;
 
     pub fn expected_devices(&self) -> &BTreeSet<String> {
         &self.expected
@@ -266,9 +272,23 @@ impl Collector for DeviceCollector {
 
         // ---- learned expectations ---------------------------------------------
         self.learn_ticks += 1;
+        // Consecutive sightings, as documented. The count used to be cumulative
+        // and for ever: a USB stick used for ten minutes in total, across any
+        // number of sessions, became "expected" and was then reported missing
+        // (as a Warning that "will clear itself") until the daemon restarted.
+        self.sightings.retain(|d, _| present_now.contains(d));
         for d in &present_now {
             *self.sightings.entry(d.clone()).or_insert(0) += 1;
         }
+        // And expectation lapses: something absent for a long stretch has been
+        // unplugged on purpose, not lost.
+        for d in &self.expected {
+            let n = self.absent.entry(d.clone()).or_insert(0);
+            *n = if present_now.contains(d) { 0 } else { *n + 1 };
+        }
+        let absent = &self.absent;
+        self.expected.retain(|d| absent.get(d).copied().unwrap_or(0) < Self::FORGET_AFTER);
+        self.absent.retain(|d, _| self.expected.contains(d));
         for (d, n) in &self.sightings {
             if *n >= Self::LEARN_THRESHOLD {
                 self.expected.insert(d.clone());

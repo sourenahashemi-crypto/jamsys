@@ -95,6 +95,16 @@ pub struct Daemon {
     dbus: Option<DbusService>,
     sched: Scheduler,
     suspend: clock::SuspendWatch,
+    /// Battery percent before a sleep and how long it lasted, held until the
+    /// power collector has produced a reading from after it.
+    pending_drain: Option<(f64, i64)>,
+    /// config.toml exists but could not be parsed, so the daemon is running on
+    /// defaults. The file must not be rewritten from them.
+    cfg_unparsed: bool,
+    /// Whether each optional event source worked at startup, i.e. whether it is
+    /// worth trying to bring back after it is lost.
+    journal_wanted: bool,
+    dbus_wanted: bool,
     dedup: journal::Deduper,
     snap: Snapshot,
     cpu_recent: f64,
@@ -121,6 +131,7 @@ impl Daemon {
     pub fn new() -> Result<Daemon, String> {
         let cfg_path = Config::default_path();
         let (cfg, cfg_err) = Config::load_or_create(&cfg_path);
+        let cfg_unparsed = cfg_err.is_some();
         if let Some(e) = cfg_err {
             log_warn!("using defaults, config could not be parsed: {e}");
         }
@@ -210,6 +221,8 @@ impl Daemon {
             }
         }
 
+        let journal_wanted = journal.is_some();
+        let dbus_wanted = dbus.is_some();
         let rules = RuleEngine::new(&cfg);
         let alerts = jamsys::anomaly::alerts::AlertManager::new(&cfg, &store);
         let now_mono = clock::mono_ms();
@@ -239,6 +252,10 @@ impl Daemon {
             dbus,
             sched: Scheduler::new(now_mono),
             suspend: clock::SuspendWatch::new(),
+            pending_drain: None,
+            cfg_unparsed,
+            journal_wanted,
+            dbus_wanted,
             dedup: journal::Deduper::new(300_000),
             snap: Snapshot::default(),
             cpu_recent: 0.0,
@@ -312,8 +329,26 @@ impl Daemon {
                             }
                         }
                     }
-                    t if t >= TOK_CLIENT_BASE => self.handle_client(t, r.hangup),
+                    t if t >= TOK_CLIENT_BASE => {
+                        if r.writable {
+                            let failed = self.ipc.client(t).is_some_and(|c| c.flush().is_err());
+                            if failed {
+                                self.drop_client(t);
+                                continue;
+                            }
+                        }
+                        if r.readable || r.hangup {
+                            self.handle_client(t, r.hangup);
+                        }
+                    }
                     _ => {}
+                }
+            }
+            // Ask to be woken for any client left with unsent output, and stop
+            // asking for those that have drained.
+            for (fd, tok, want) in self.ipc.backlog_changes() {
+                if self.el.want_writable(fd, tok, want).is_err() {
+                    self.drop_client(tok);
                 }
             }
         }
@@ -347,11 +382,23 @@ impl Daemon {
             self.sched.rebase(now_mono, &self.cfg);
             let e = ExternalEvent::Resumed { slept_ms: ev.slept_ms };
             self.reg.dispatch_event(&e, &mut ctx);
-            self.check_suspend_drain(ev.slept_ms, &mut ctx);
+            // Remember the charge from before the sleep. It cannot be compared
+            // here: no collector has run yet, so `ctx.snap` is still a copy of
+            // the pre-sleep snapshot and the "drain" was always exactly zero.
+            self.pending_drain = Some((self.snap.power.percent, ev.slept_ms));
         }
 
+        let power_ran = due.contains(&Tier::Medium);
+        if due.contains(&Tier::Slow) {
+            self.revive_sources();
+        }
         for t in due {
             self.reg.run_tier(t, &mut ctx, now_mono);
+        }
+        if power_ran {
+            if let Some((before, slept_ms)) = self.pending_drain.take() {
+                self.check_suspend_drain(before, slept_ms, &mut ctx);
+            }
         }
 
         // Idle determination, which drives both the baseline context and the
@@ -490,6 +537,7 @@ impl Daemon {
         if let Some(d) = self.dbus.as_mut() {
             d.publish(&self.widget_state);
         }
+        self.retire_dbus_if_broken();
     }
 
     fn handle_dbus(&mut self) {
@@ -512,6 +560,7 @@ impl Daemon {
                 ServiceAction::None => {}
             }
         }
+        self.retire_dbus_if_broken();
     }
 
     /// Open alerts, from memory. This used to issue a SQL query on every tick, which
@@ -567,18 +616,13 @@ impl Daemon {
     /// Battery consumed while asleep. A laptop that loses 15 % overnight has a real
     /// problem (usually s2idle instead of deep sleep) and this is the only place it
     /// can be observed.
-    fn check_suspend_drain(&mut self, slept_ms: i64, ctx: &mut Ctx) {
-        let hours = slept_ms as f64 / 3_600_000.0;
-        if hours < 0.25 || !self.snap.power.has_battery {
-            return;
-        }
-        let before = self.snap.power.percent;
+    fn check_suspend_drain(&mut self, before: f64, slept_ms: i64, ctx: &mut Ctx) {
         let after = ctx.snap.power.percent;
-        if before <= 0.0 || after <= 0.0 || after > before {
-            return;
-        }
-        let rate = (before - after) / hours;
         let limit = self.cfg.threshold("suspend.drain", "pct_per_hour", 2.0);
+        let Some(rate) = suspend_drain_rate(before, after, slept_ms, ctx.snap.power.has_battery)
+        else {
+            return;
+        };
         ctx.sample("power", "suspend_drain_pct_h", "", "%/h", rate);
         if rate > limit {
             let a = Alert::new("suspend.drain", "", Severity::Notice,
@@ -596,10 +640,19 @@ impl Daemon {
     }
 
     fn handle_journal(&mut self) {
-        let entries = match self.journal.as_mut() {
-            Some(j) => j.read_entries(),
+        let (entries, ended) = match self.journal.as_mut() {
+            Some(j) => (j.read_entries(), j.at_eof()),
             None => return,
         };
+        if ended {
+            // journalctl exited (journald restarted, or it was killed). Stop
+            // watching the dead pipe at once rather than at the next
+            // maintenance pass, up to 45 minutes away.
+            if let Some(j) = self.journal.take() {
+                let _ = self.el.remove(j.fd());
+            }
+            log_warn!("journal follower exited; it will be restarted");
+        }
         if entries.is_empty() {
             return;
         }
@@ -698,10 +751,65 @@ impl Daemon {
         let Some(name) = self.collector_fds.get(idx).copied() else { return };
         let mut ctx = Ctx::new(self.cfg.clone());
         ctx.snap = self.snap.clone();
+        if !self.reg.is_usable(name) {
+            // Still read the socket, or it stays ready and the loop spins; but
+            // a collector that is switched off must not produce anything.
+            self.reg.drain_event(name, &ExternalEvent::CollectorReadable { name }, &mut ctx);
+            return;
+        }
         self.reg
             .dispatch_event(&ExternalEvent::CollectorReadable { name }, &mut ctx);
         self.flush_ctx_events(&mut ctx);
         self.snap = ctx.snap;
+    }
+
+    /// Stop watching an event source that has ended, and bring back any that
+    /// were lost. Called on the slow tier: often enough that the widget and the
+    /// journal are not gone for long, rarely enough to cost nothing.
+    fn revive_sources(&mut self) {
+        if self.journal_wanted && self.journal.is_none() {
+            match JournalStream::spawn(4) {
+                Ok(nj) => {
+                    self.el.add(nj.fd(), TOK_JOURNAL).ok();
+                    self.journal = Some(nj);
+                    log_info!("journal follower restarted");
+                }
+                Err(e) => log_warn!("journal follower could not be restarted: {e}"),
+            }
+        }
+        if self.dbus_wanted && self.dbus.is_none() {
+            if let Some(d) = DbusService::new() {
+                if self.el.add(d.fd(), TOK_DBUS).is_ok() {
+                    self.dbus = Some(d);
+                }
+            }
+        }
+    }
+
+    /// Persist a configuration changed over IPC.
+    ///
+    /// Refused while the file on disk failed to parse: the in-memory config is
+    /// then the built-in defaults, and writing it out would replace everything
+    /// the user had written with them on the first click in the window.
+    fn save_config(&self, cfg: &Config) -> Result<(), String> {
+        if self.cfg_unparsed {
+            return Err(format!(
+                "{} has an error and was not loaded, so it is not being overwritten. \
+                 Fix it (jamsysd --check shows the error), then: systemctl --user reload jamsysd",
+                Config::default_path().display()));
+        }
+        cfg.save(&Config::default_path()).map_err(|e| e.to_string())
+    }
+
+    /// The bus connection failed: a dead socket reads as ready for ever, so it
+    /// has to leave the event loop now. `revive_sources` reconnects.
+    fn retire_dbus_if_broken(&mut self) {
+        if self.dbus.as_ref().is_some_and(|d| d.broken) {
+            if let Some(d) = self.dbus.take() {
+                let _ = self.el.remove(d.fd());
+            }
+            log_warn!("session bus connection lost; the desktop widget will reconnect");
+        }
     }
 
     fn handle_netlink_route(&mut self) {
@@ -770,6 +878,7 @@ impl Daemon {
             Some(e) => log_warn!("reload failed, keeping current config: {e}"),
             None => {
                 log_info!("configuration reloaded");
+                self.cfg_unparsed = false;
                 self.cfg = Arc::new(cfg);
                 self.alerts.reload_suppressions(&self.store);
             }
@@ -777,10 +886,9 @@ impl Daemon {
     }
 
     fn handle_client(&mut self, tok: u64, hangup: bool) {
-        if hangup {
-            self.drop_client(tok);
-            return;
-        }
+        // Read first even on hangup: a peer that sent a request and then closed
+        // has still asked for something, and an `ack` or `mute` sent that way
+        // was being discarded.
         let reqs = match self.ipc.client(tok) {
             Some(c) => match c.read_requests() {
                 Ok(r) => r,
@@ -801,6 +909,13 @@ impl Daemon {
                 self.drop_client(tok);
                 return;
             }
+        }
+        // The reply above has been written as far as the socket would take it.
+        // A closed peer stays readable for ever under level-triggered epoll, so
+        // it cannot be kept around waiting for a backlog to drain.
+        let done = hangup || self.ipc.client(tok).is_some_and(|c| c.eof());
+        if done {
+            self.drop_client(tok);
         }
     }
 
@@ -923,6 +1038,16 @@ impl Daemon {
                     return Response::err(r.id, "bad_request", "scope must be rule|instance|fingerprint and pattern must be set");
                 }
                 let reason = s("reason");
+                // The same permanent suppression twice is one suppression. The
+                // window's "Ignore this service" could be clicked again before
+                // the row disappeared, leaving two entries to remove.
+                let until = i("until_ms");
+                if let Ok(existing) = self.store.load_suppressions() {
+                    if let Some(x) = existing.iter().find(|x|
+                        x.scope == scope && x.pattern == pattern && x.until_ts == until) {
+                        return Response::ok(r.id, serde_json::json!({"suppression_id": x.id}));
+                    }
+                }
                 match self.store.add_suppression(&scope, &pattern, i("until_ms"),
                                                  if reason.is_empty() { None } else { Some(&reason) }) {
                     Ok(id) => {
@@ -958,16 +1083,40 @@ impl Daemon {
                 if rule.is_empty() || key.is_empty() || !val.is_finite() {
                     return Response::err(r.id, "bad_request", "rule_id, key and a finite value are required");
                 }
+                // Only thresholds a rule actually reads, and only values that
+                // leave the rule meaningful. An unknown key used to be stored
+                // and acknowledged while changing nothing.
+                let Some(spec) = jamsys::config::threshold_spec(&rule, &key) else {
+                    return Response::err(r.id, "not_found",
+                        format!("no threshold named {rule}.{key}; the `thresholds` operation lists them"));
+                };
+                if val < spec.min || val > spec.max {
+                    return Response::err(r.id, "out_of_range",
+                        format!("{rule}.{key} must be between {} and {} {}", spec.min, spec.max, spec.unit));
+                }
                 // Written to config so it survives a restart, and applied immediately.
                 let mut cfg = (*self.cfg).clone();
-                cfg.alerts.thresholds.insert(format!("{rule}.{key}"), val);
-                let path = Config::default_path();
-                if let Err(e) = std::fs::write(&path, cfg.to_toml()) {
-                    return Response::err(r.id, "write_failed", e.to_string());
+                if val == spec.default {
+                    // Back to the default is "no override", not an override that
+                    // happens to equal today's default.
+                    cfg.alerts.thresholds.remove(&format!("{rule}.{key}"));
+                } else {
+                    cfg.alerts.thresholds.insert(format!("{rule}.{key}"), val);
+                }
+                if let Err(e) = self.save_config(&cfg) {
+                    return Response::err(r.id, "write_failed", e);
                 }
                 self.cfg = Arc::new(cfg);
                 Response::ok(r.id, serde_json::json!({"rule_id": rule, "key": key, "value": val}))
             }
+            "thresholds" => Response::ok(r.id, serde_json::json!({
+                "thresholds": jamsys::config::THRESHOLDS.iter().map(|t| serde_json::json!({
+                    "rule_id": t.rule, "key": t.key, "applies_to": t.alert,
+                    "default": t.default, "min": t.min, "max": t.max,
+                    "value": self.cfg.threshold(t.rule, t.key, t.default),
+                    "unit": t.unit, "label": t.label,
+                })).collect::<Vec<_>>()
+            })),
             "set_collector" => {
                 let name = s("name");
                 let Some(en) = p.get("enabled").and_then(|v| v.as_bool()) else {
@@ -978,9 +1127,14 @@ impl Daemon {
                 }
                 let mut cfg = (*self.cfg).clone();
                 cfg.collectors.insert(name.clone(), en);
-                let _ = std::fs::write(Config::default_path(), cfg.to_toml());
+                // Applied either way; the reply says whether it will survive a
+                // restart instead of claiming so unconditionally.
+                let saved = self.save_config(&cfg);
                 self.cfg = Arc::new(cfg);
-                Response::ok(r.id, serde_json::json!({"name": name, "enabled": en}))
+                Response::ok(r.id, serde_json::json!({
+                    "name": name, "enabled": en,
+                    "persisted": saved.is_ok(), "persist_error": saved.err(),
+                }))
             }
             "subscribe" => {
                 let topics: Vec<String> = p
@@ -1117,4 +1271,34 @@ fn self_cpu_seconds() -> f64 {
             Some((ut + st) / if tck > 0.0 { tck } else { 100.0 })
         })
         .unwrap_or(0.0)
+}
+
+/// Percent of battery lost per hour of sleep, or `None` when there is nothing
+/// to say: too short a sleep to measure, no battery, an unknown reading, or a
+/// battery that gained charge (it was plugged in).
+fn suspend_drain_rate(before: f64, after: f64, slept_ms: i64, has_battery: bool) -> Option<f64> {
+    let hours = slept_ms as f64 / 3_600_000.0;
+    if hours < 0.25 || !has_battery || before <= 0.0 || after <= 0.0 || after > before {
+        return None;
+    }
+    Some((before - after) / hours)
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::suspend_drain_rate;
+
+    #[test]
+    fn eight_hours_asleep_losing_thirty_percent_is_measured() {
+        let r = suspend_drain_rate(80.0, 50.0, 8 * 3_600_000, true).unwrap();
+        assert!((r - 3.75).abs() < 1e-9, "{r}");
+    }
+
+    #[test]
+    fn nothing_is_claimed_without_a_usable_pair_of_readings() {
+        assert_eq!(suspend_drain_rate(80.0, 50.0, 5 * 60_000, true), None, "too short");
+        assert_eq!(suspend_drain_rate(80.0, 50.0, 8 * 3_600_000, false), None, "no battery");
+        assert_eq!(suspend_drain_rate(0.0, 50.0, 8 * 3_600_000, true), None, "unknown before");
+        assert_eq!(suspend_drain_rate(50.0, 80.0, 8 * 3_600_000, true), None, "charged");
+    }
 }

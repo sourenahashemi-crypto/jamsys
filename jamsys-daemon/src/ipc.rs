@@ -69,9 +69,22 @@ pub struct Client {
     /// Monotonic milliseconds at the last request from this peer. Used only to pick
     /// a victim when the connection table is full.
     last_active_mono: i64,
+    /// The peer has closed its sending side. Requests already received are
+    /// still answered before the connection is dropped.
+    eof: bool,
+    /// Whether the event loop has been asked to report this socket writable.
+    watching_out: bool,
 }
 
 impl Client {
+    pub fn eof(&self) -> bool {
+        self.eof
+    }
+
+    pub fn has_backlog(&self) -> bool {
+        !self.outbuf.is_empty()
+    }
+
     pub fn fd(&self) -> RawFd {
         self.stream.as_raw_fd()
     }
@@ -82,7 +95,13 @@ impl Client {
         let mut chunk = [0u8; 4096];
         loop {
             match self.stream.read(&mut chunk) {
-                Ok(0) => return Err("peer closed".into()),
+                // Not an error yet: a client that sends a request and closes
+                // its write side (a fire-and-forget `ack`) used to be dropped
+                // here with the request it had just delivered still unparsed.
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
                 Ok(n) => {
                     self.inbuf.extend_from_slice(&chunk[..n]);
                     // Measure the *unterminated tail*, not the buffer. Measuring the
@@ -140,7 +159,8 @@ impl Client {
     }
 
     /// Non-blocking write. A UI that stops reading must not be able to block the
-    /// daemon's event loop, so unsent bytes stay buffered and are retried.
+    /// daemon's event loop, so unsent bytes stay buffered and are retried when
+    /// the socket reports writable (see `IpcServer::backlog_changes`).
     pub fn flush(&mut self) -> std::io::Result<()> {
         while !self.outbuf.is_empty() {
             match self.stream.write(&self.outbuf) {
@@ -171,6 +191,9 @@ pub struct IpcServer {
     path: PathBuf,
     clients: HashMap<u64, Client>,
     next_token: u64,
+    /// Inode of the socket file this instance created, so that Drop removes
+    /// only that one.
+    bound_ino: Option<u64>,
 }
 
 impl IpcServer {
@@ -199,7 +222,21 @@ impl IpcServer {
                 ),
             ));
         }
-        // A stale socket from a killed daemon would make bind() fail with EADDRINUSE.
+        // A stale socket from a killed daemon would make bind() fail with
+        // EADDRINUSE, so it is removed -- but only if it really is stale. A socket
+        // that still accepts a connection belongs to a running daemon. Removing
+        // that one let a second jamsysd (started by hand, say) steal the name:
+        // both then wrote the same database and both notified, and when the
+        // second exited it deleted the socket, leaving the service running but
+        // unreachable until restarted.
+        if UnixStream::connect(&path).is_ok() {
+            return Err(std::io::Error::new(
+                ErrorKind::AddrInUse,
+                format!("another jamsysd is already serving {}. Stop it first \
+                         (systemctl --user stop jamsysd) or use the one that is running.",
+                        path.display()),
+            ));
+        }
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path)?;
         {
@@ -209,7 +246,12 @@ impl IpcServer {
             std::fs::set_permissions(&path, p)?;
         }
         set_nonblocking(listener.as_raw_fd())?;
-        Ok(IpcServer { listener, path, clients: HashMap::new(), next_token: TOK_CLIENT_BASE })
+        let bound_ino = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&path).map(|m| m.ino()).ok()
+        };
+        Ok(IpcServer { listener, path, clients: HashMap::new(), next_token: TOK_CLIENT_BASE,
+                       bound_ino })
     }
 
     pub fn fd(&self) -> RawFd {
@@ -292,7 +334,8 @@ impl IpcServer {
                         token,
                         Client { stream, token, inbuf: Vec::new(), outbuf: Vec::new(),
                                  subscriptions: Vec::new(),
-                                 last_active_mono: crate::clock::mono_ms() },
+                                 last_active_mono: crate::clock::mono_ms(),
+                                 eof: false, watching_out: false },
                     );
                     new.push((token, fd));
                 }
@@ -337,6 +380,25 @@ impl IpcServer {
         dead
     }
 
+    /// Clients whose need to be woken for writing has changed since the last call:
+    /// `(fd, token, want_writable)`.
+    ///
+    /// A reply larger than the socket buffer (about 214 KiB here) leaves a tail
+    /// in `outbuf`. Nothing used to come back for it: the loop only watched for
+    /// readability, so the client received exactly one buffer's worth and then
+    /// waited for ever on a reply that was never completed.
+    pub fn backlog_changes(&mut self) -> Vec<(RawFd, u64, bool)> {
+        let mut out = Vec::new();
+        for (tok, c) in self.clients.iter_mut() {
+            let want = c.has_backlog();
+            if want != c.watching_out {
+                c.watching_out = want;
+                out.push((c.stream.as_raw_fd(), *tok, want));
+            }
+        }
+        out
+    }
+
     pub fn tokens(&self) -> Vec<u64> {
         self.clients.keys().copied().collect()
     }
@@ -344,7 +406,12 @@ impl IpcServer {
 
 impl Drop for IpcServer {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Only our own socket. If the path now names a different inode, another
+        // instance has replaced it and it is not ours to delete.
+        use std::os::unix::fs::MetadataExt;
+        if std::fs::metadata(&self.path).map(|m| m.ino()).ok() == self.bound_ino {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -373,7 +440,8 @@ mod tests {
         let (stream, peer) = UnixStream::pair().unwrap();
         set_nonblocking(stream.as_raw_fd()).unwrap();
         (Client { stream, token: TOK_CLIENT_BASE, inbuf: Vec::new(), outbuf: Vec::new(),
-                  subscriptions: Vec::new(), last_active_mono: crate::clock::mono_ms() }, peer)
+                  subscriptions: Vec::new(), last_active_mono: crate::clock::mono_ms(),
+                                 eof: false, watching_out: false }, peer)
     }
 
     #[test]
@@ -527,8 +595,17 @@ mod tests {
         // 128 KiB with no newline: the buffer cap must trip.
         let junk = vec![b'x'; 128 * 1024];
         let _ = cli.write_all(&junk);
-        let r = srv.client(tok).unwrap().read_requests();
-        assert!(r.is_err(), "an unbounded line must be refused");
+        // The bytes cross the socket asynchronously; one read straight after the
+        // write can see less than the cap and legitimately report nothing yet.
+        let mut refused = false;
+        for _ in 0..50 {
+            if srv.client(tok).unwrap().read_requests().is_err() {
+                refused = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(refused, "an unbounded line must be refused");
         drop(srv);
         std::fs::remove_dir_all(&d).ok();
     }
@@ -583,7 +660,11 @@ mod tests {
         let cli = UnixStream::connect(srv.path()).unwrap();
         let tok = srv.accept().0[0].0;
         drop(cli);
-        assert!(srv.client(tok).unwrap().read_requests().is_err());
+        // A close is reported through eof(), not as an error, so that requests
+        // delivered just before it are still answered.
+        let c = srv.client(tok).unwrap();
+        assert!(c.read_requests().is_ok_and(|r| r.is_empty()));
+        assert!(c.eof());
         assert!(srv.drop_client(tok).is_some());
         assert_eq!(srv.client_count(), 0);
         drop(srv);
@@ -631,6 +712,88 @@ mod tests {
             }
         }
         assert_eq!(got, count, "every request in the burst is parsed");
+    }
+
+    #[test]
+    fn a_reply_larger_than_the_socket_buffer_is_delivered_in_full() {
+        use crate::eventloop::EventLoop;
+        let dir = tmpdir("bigreply");
+        let mut srv = IpcServer::bind(&dir).unwrap();
+        let mut c = UnixStream::connect(dir.join("sock")).unwrap();
+        let (tok, fd) = srv.accept().0[0];
+        let el = EventLoop::new().unwrap();
+        el.add(fd, tok).unwrap();
+
+        // Several times any plausible socket buffer.
+        let big = serde_json::json!({"blob": "x".repeat(3 << 20)});
+        srv.client(tok).unwrap().send(&big).unwrap();
+        assert!(srv.client(tok).unwrap().has_backlog(), "the test needs a partial write");
+
+        let reader = std::thread::spawn(move || {
+            let mut line = String::new();
+            std::io::BufReader::new(&mut c).read_line(&mut line).unwrap();
+            line.len()
+        });
+        let mut ready = Vec::new();
+        let mut spins = 0;
+        loop {
+            for (fd, tok, want) in srv.backlog_changes() {
+                el.want_writable(fd, tok, want).unwrap();
+            }
+            if !srv.client(tok).unwrap().has_backlog() {
+                break;
+            }
+            el.wait(&mut ready, 2000).unwrap();
+            assert!(!ready.is_empty(), "a backlog must wake the loop when the peer reads");
+            for r in &ready {
+                if r.writable {
+                    srv.client(r.token).unwrap().flush().unwrap();
+                }
+            }
+            spins += 1;
+            assert!(spins < 100_000, "the loop must make progress");
+        }
+        assert!(reader.join().unwrap() > 3 << 20, "the whole line arrived");
+        // With the backlog gone the interest must be dropped, or an idle socket
+        // (always writable) would wake the loop for ever.
+        el.wait(&mut ready, 50).unwrap();
+        assert!(ready.iter().all(|r| !r.writable), "no writable wakeups once drained");
+        drop(srv);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_second_instance_does_not_steal_a_live_socket() {
+        let dir = tmpdir("single");
+        let first = IpcServer::bind(&dir).unwrap();
+        let err = IpcServer::bind(&dir).err().expect("the second bind must be refused");
+        assert_eq!(err.kind(), ErrorKind::AddrInUse);
+        assert!(err.to_string().contains("systemctl --user stop jamsysd"), "{err}");
+        assert!(UnixStream::connect(dir.join("sock")).is_ok(), "the first is still reachable");
+        drop(first);
+        assert!(!dir.join("sock").exists(), "and removes its own socket on exit");
+        // A leftover file nobody listens on is stale and is replaced.
+        std::fs::write(dir.join("sock"), b"").unwrap();
+        assert!(IpcServer::bind(&dir).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_request_followed_by_a_half_close_is_still_parsed() {
+        let dir = tmpdir("halfclose");
+        let mut srv = IpcServer::bind(&dir).unwrap();
+        let mut c = UnixStream::connect(dir.join("sock")).unwrap();
+        let tok = srv.accept().0[0].0;
+        c.write_all(b"{\"id\":5,\"op\":\"ack\"}\n").unwrap();
+        c.shutdown(std::net::Shutdown::Write).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let cl = srv.client(tok).unwrap();
+        let reqs = cl.read_requests().expect("EOF after a request is not an error");
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].op, "ack");
+        assert!(cl.eof(), "and the close is remembered so the caller can drop it afterwards");
+        drop(srv);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -195,6 +195,7 @@ pub struct JournalStream {
     child: Child,
     fd: RawFd,
     buf: Vec<u8>,
+    eof: bool,
 }
 
 impl JournalStream {
@@ -217,7 +218,14 @@ impl JournalStream {
         // reclaimed when the child is reaped in `Drop`.
         std::mem::forget(stdout);
         crate::eventloop::set_nonblocking(fd)?;
-        Ok(JournalStream { child, fd, buf: Vec::with_capacity(8192) })
+        Ok(JournalStream { child, fd, buf: Vec::with_capacity(8192), eof: false })
+    }
+
+    /// True once the follower's output has ended. A closed pipe is permanently
+    /// readable under level-triggered epoll, so leaving it registered turns the
+    /// event loop into a busy loop until the next maintenance pass.
+    pub fn at_eof(&self) -> bool {
+        self.eof
     }
 
     pub fn fd(&self) -> RawFd {
@@ -231,7 +239,13 @@ impl JournalStream {
         loop {
             // SAFETY: reading into a stack buffer of the declared length from an fd we own.
             let n = unsafe { libc::read(self.fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
-            if n <= 0 {
+            if n == 0 {
+                // The follower has exited. Its pipe now reads as ready for ever,
+                // so the caller has to stop watching it; see `at_eof`.
+                self.eof = true;
+                break;
+            }
+            if n < 0 {
                 break;
             }
             self.buf.extend_from_slice(&chunk[..n as usize]);
