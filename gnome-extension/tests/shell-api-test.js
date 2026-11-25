@@ -17,6 +17,26 @@ const ok = (c, what, extra = '') => {
     if (!c) failures++;
 };
 
+// What the installed schema allows, read from the XML itself.
+const SCHEMA = (() => {
+    const dir = GLib.path_get_dirname((new Error().fileName ?? '').replace(/^file:\/\//, ''));
+    const [, raw] = GLib.file_get_contents(
+        `${dir}/../jamsys@jamsys.org/schemas/org.gnome.shell.extensions.jamsys.gschema.xml`);
+    const xml = new TextDecoder().decode(raw);
+    const enums = {}, strings = {}, ranges = {};
+    for (const m of xml.matchAll(/<enum id="([^"]+)">([\s\S]*?)<\/enum>/g))
+        enums[m[1]] = [...m[2].matchAll(/nick="([^"]+)"/g)].map(n => n[1]);
+    for (const m of xml.matchAll(/<key name="([^"]+)"([^>]*)>([\s\S]*?)<\/key>/g)) {
+        const en = m[2].match(/enum="([^"]+)"/);
+        if (en) strings[m[1]] = enums[en[1]];
+        const ch = [...m[3].matchAll(/<choice value="([^"]+)"/g)].map(c => c[1]);
+        if (ch.length) strings[m[1]] = ch;
+        const r = m[3].match(/<range min="([^"]+)" max="([^"]+)"/);
+        if (r) ranges[m[1]] = [Number(r[1]), Number(r[2])];
+    }
+    return {strings, ranges};
+})();
+
 // A settings object good enough for the extension's reads.
 function fakeSettings(overrides = {}) {
     const v = {
@@ -35,8 +55,22 @@ function fakeSettings(overrides = {}) {
             return v[k];
         },
         get_double: k => v[k], get_int: k => v[k],
-        get_boolean: k => v[k], set_string(k, x) { v[k] = x; },
-        set_double(k, x) { v[k] = x; },
+        get_boolean: k => v[k],
+        // Writes are checked against the real schema file. A permissive setter
+        // accepted position='custom' for as long as the schema had no such
+        // value, so "a drop is remembered" passed while GSettings refused it.
+        set_string(k, x) {
+            const allowed = SCHEMA.strings[k];
+            if (allowed && !allowed.includes(x))
+                throw new Error(`settings.set_string: '${x}' is not a valid ${k}`);
+            v[k] = x;
+        },
+        set_double(k, x) {
+            const r = SCHEMA.ranges[k];
+            if (r && (x < r[0] || x > r[1]))
+                throw new Error(`settings.set_double: ${k}=${x} outside ${r}`);
+            v[k] = x;
+        },
         set_int(k, x) { v[k] = x; },
         connect: () => 1, disconnect() {},
         _values: v,
@@ -119,9 +153,16 @@ run('compact top-right', fakeSettings({mode: 'compact', position: 'top-right'}),
 });
 run('minimal top-left', fakeSettings({mode: 'minimal', position: 'top-left'}), () => {});
 
-print('\na panel mode in a bottom position still floats');
+// It used to "float" by putting the panel button in an St.Bin. A real
+// PanelMenu.Button already has a parent, so that Bin was empty on screen.
+print('\na panel mode in a bottom position still goes in the panel');
 run('compact bottom-left', fakeSettings({mode: 'compact', position: 'bottom-left'}), () => {
-    ok(Main.layoutManager.chrome.length === 1, 'falls back to a chrome actor');
+    ok(Main.layoutManager.chrome.length === 0, 'no empty chrome box');
+    ok(Object.keys(Main.panel.statusArea).length === 1, 'the line is in the panel');
+});
+run('compact custom', fakeSettings({mode: 'compact', position: 'custom'}), () => {
+    ok(Object.keys(Main.panel.statusArea).length === 1,
+       'and after a drag left the position at custom');
 });
 
 print('\nextremes of the size and opacity range');
@@ -242,7 +283,7 @@ withCluster(fakeSettings(), (c, st) => {
     c._ext = {openApp: () => { opened++; }};
 
     ok(typeof c._showMenu === 'function', 'the cluster has its own menu');
-    ok(c._drag !== undefined, 'and a drag action for moving it');
+    ok(c._actions?.includes(c._drag), 'and a pan gesture for moving it');
 
     ok(opened === 0, 'nothing has launched just by building the widget');
 
@@ -265,25 +306,25 @@ print('\nthe button-press handler itself');
 withCluster(fakeSettings(), c => {
     let opened = 0;
     c._ext = {openApp: () => { opened++; }, openPreferences: () => {}};
-    const ev = (button, clicks) => ({
-        get_button: () => button,
-        get_click_count: () => clicks,
-    });
+    // Only what a Clutter 18 event really has. get_click_count is gone, and an
+    // event stub that still offered it hid a handler that threw on every press.
+    const ev = button => ({get_button: () => button});
 
-    const single = c.emitEvent('button-press-event', ev(1, 1));
+    const single = c.emitEvent('button-press-event', ev(1));
     ok(opened === 0, 'a single left click does NOT open the main window');
-    ok(single === false, 'and it propagates, so the drag action can have it',
+    ok(single === false, 'and it propagates, so the gestures can have it',
        String(single));
 
-    const dbl = c.emitEvent('button-press-event', ev(1, 2));
+    ok(c._click.n_clicks_required === 2 && c._click.required_button === 1,
+       'the opening gesture needs two clicks of the left button');
+    c._click.emit('recognize');
     ok(opened === 1, 'a double left click does open it — deliberate, not accidental');
-    ok(dbl === true, 'and is consumed');
 
-    c.emitEvent('button-press-event', ev(3, 1));
+    c.emitEvent('button-press-event', ev(3));
     ok(opened === 1, 'a right click still does not open it');
     ok(c._menu, 'it opens the menu instead');
 
-    const middle = c.emitEvent('button-press-event', ev(2, 1));
+    const middle = c.emitEvent('button-press-event', ev(2));
     ok(opened === 1, 'middle click does not open it either');
     ok(middle === false, 'and is left alone');
 });
@@ -320,14 +361,54 @@ withCluster(fakeSettings({mode: 'cluster'}), (c, st) => {
 
 print('\ndragging places it freely');
 withCluster(fakeSettings({position: 'top-right'}), (c, st) => {
-    c.set_position(640, 400);
-    c._onDragEnd();
+    c.set_position(600, 380);
+    c._drag.emit('recognize');
+    ok(c._dragging === true, 'a pan past the threshold starts a drag');
+    c._drag._delta = {x: 40, y: 20};
+    c._drag.emit('pan-update');
+    ok(c.x === 640 && c.y === 400, 'the gadget follows the pointer', `${c.x},${c.y}`);
+    c._drag.emit('end');
+    ok(c._dragging === false, 'and the drag ends');
     ok(st._values['custom-x'] === 640 && st._values['custom-y'] === 400,
        'where it was dropped is remembered',
        `${st._values['custom-x']},${st._values['custom-y']}`);
     ok(st._values.position === 'custom',
        'and the corner logic is told to stop overriding it');
 });
+withCluster(fakeSettings({position: 'top-right'}), (c, st) => {
+    c.set_position(600, 380);
+    c._drag.emit('recognize');
+    c._drag._delta = {x: 90, y: 90};
+    c._drag.emit('pan-update');
+    c._drag.emit('cancel');
+    ok(c.x === 600 && c.y === 380, 'a cancelled drag puts it back');
+    ok(st._values.position === 'top-right', 'and stores nothing');
+});
+run('drag vs corner logic', fakeSettings({position: 'top-right'}), e => {
+    e._widget._dragging = true;
+    e._floating.set_position(111, 222);
+    e._reposition();
+    ok(e._floating.x === 111 && e._floating.y === 222,
+       'the corner logic leaves the container alone while it is being dragged');
+});
+
+print('\na touchpad swipe is not twenty wheel notches');
+withCluster(fakeSettings({scale: 1.0}), (c, st) => {
+    for (let i = 0; i < 10; i++) c._onScroll(scrollEvent(D.SMOOTH, -0.1));
+    ok(st._values.scale > 1.05 && st._values.scale < 1.12,
+       'ten events of delta 0.1 add up to about one notch', `got ${st._values.scale}`);
+});
+
+print('\n"fade while healthy" is a real switch');
+for (const dim of [true, false]) {
+    run(`dim ${dim}`, fakeSettings({mode: 'compact', 'dim-when-healthy': dim}), e => {
+        const added = [];
+        e._widget._label.add_style_class_name = c => added.push(c);
+        e._widget._setClass('jamsys-healthy');
+        ok(added.includes('jamsys-healthy') === dim,
+           dim ? 'on: the healthy line is dimmed' : 'off: it is not');
+    });
+}
 
 print('\nrebuilding destroys the old cluster menu');
 run('menu teardown', fakeSettings(), e => {
@@ -359,16 +440,23 @@ print('\nlate daemon replies cannot resurrect or roll back the display');
 run('reply ordering', fakeSettings(), e => {
     const proxies = [];
     globalThis.__jamsysProxy = class {
-        constructor(bus, name, path) {
+        constructor(bus, name, path, ready, _cancellable, flags) {
             // Strict, like every other stub here. A permissive constructor let
             // three mutations through unnoticed: wrong bus type, wrong bus name
             // and wrong object path all still "passed".
+            // Without a callback the real constructor blocks the compositor on
+            // a round trip to the daemon.
+            if (typeof ready !== 'function')
+                throw new Error('proxy: must be constructed asynchronously');
+            if (!flags)
+                throw new Error('proxy: must not load properties (flags missing)');
             if (!bus) throw new Error('proxy: a bus connection is required');
             if (name !== 'org.jamsys.Daemon')
                 throw new Error(`proxy: wrong bus name ${name}`);
             if (path !== '/org/jamsys/Daemon')
                 throw new Error(`proxy: wrong object path ${path}`);
             proxies.push(this);
+            ready(this, null);
         }
         connectSignal(name, callback) {
             if (name !== 'StateChanged') throw new Error('unexpected signal');

@@ -29,6 +29,7 @@ import Gtk from 'gi://Gtk?version=4.0';
 import Gdk from 'gi://Gdk?version=4.0';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
+import {CONF_KEYS, confToSave, isClusterCmdline, sanitizeConf, scrollFactor} from './conf.js';
 
 import {drawCluster, drawClusterBare, drawUnavailable, bareHitRegions,
         CLUSTER_W, CLUSTER_H, BARE_W, BARE_H} from './gauges.js';
@@ -63,6 +64,9 @@ const DEFAULT_SCALE = 1.30;
 
 /* ------------------------------------------------------- persisted settings */
 
+const CONF_LIMITS = {minScale: MIN_SCALE, maxScale: MAX_SCALE, minOpacity: 0.2};
+const MY_PID = new Gio.Credentials().get_unix_pid();
+
 const CONF_DIR = GLib.build_filenamev([GLib.get_user_config_dir(), 'jamsys']);
 const CONF = GLib.build_filenamev([CONF_DIR, 'cluster.json']);
 
@@ -74,15 +78,22 @@ const PIDFILE = GLib.build_filenamev([
 
 function writePidFile() {
     try {
-        GLib.file_set_contents(PIDFILE, String(new Gio.Credentials().get_unix_pid()));
+        GLib.file_set_contents(PIDFILE, String(MY_PID));
     } catch {
-        // Not fatal: --quit falls back to matching the process list.
+        // Not fatal, but --quit will not find this window; Escape and the
+        // close button still work.
     }
 }
 
-function removePidFile() {
+/** Remove the pid file, but only one that names `pid`.
+ *
+ * Unconditional removal let one instance delete another's: start two, close
+ * one, and `--quit` reported "no running cluster" for the survivor. */
+function removePidFile(pid = MY_PID) {
     try {
-        GLib.unlink(PIDFILE);
+        const [ok, bytes] = GLib.file_get_contents(PIDFILE);
+        if (ok && parseInt(new TextDecoder().decode(bytes).trim(), 10) === pid)
+            GLib.unlink(PIDFILE);
     } catch { /* already gone */ }
 }
 
@@ -104,20 +115,24 @@ function quitRunning() {
         const alive = GLib.file_test(`/proc/${pid}/cmdline`, GLib.FileTest.EXISTS);
         if (!alive) {
             printerr('jamsys-cluster: no running cluster found');
-            removePidFile();
+            removePidFile(pid);
             return false;
         }
         const [okc, bytes] = GLib.file_get_contents(`/proc/${pid}/cmdline`);
         const cmd = okc ? new TextDecoder().decode(bytes) : '';
-        if (!cmd.includes('standalone.js')) {
+        if (!isClusterCmdline(cmd)) {
             printerr('jamsys-cluster: stale pid file; not signalling an unrelated process');
-            removePidFile();
+            removePidFile(pid);
             return false;
         }
-        GLib.spawn_command_line_sync(`kill ${pid}`);
-        // SIGTERM does not run the window's close handler, so tidy up from here
-        // rather than leaving a pid file that outlives the process.
-        removePidFile();
+        const [, , , status] = GLib.spawn_command_line_sync(`kill ${pid}`);
+        if (status !== 0) {
+            printerr(`jamsys-cluster: could not signal pid ${pid} (kill exited ${status})`);
+            return false;
+        }
+        // The window handles SIGTERM itself (saving settings and removing its
+        // pid file); this covers one that died before it could.
+        removePidFile(pid);
         print(`closed the cluster (pid ${pid})`);
         return true;
     } catch (e) {
@@ -129,7 +144,8 @@ function quitRunning() {
 function loadConf() {
     try {
         const [ok, bytes] = GLib.file_get_contents(CONF);
-        if (ok) return JSON.parse(new TextDecoder().decode(bytes));
+        if (ok)
+            return sanitizeConf(JSON.parse(new TextDecoder().decode(bytes)), CONF_LIMITS);
     } catch { /* first run, or unreadable — defaults are fine */ }
     return {};
 }
@@ -145,8 +161,25 @@ function saveConf(c) {
 
 /* ---------------------------------------------------------------- arguments */
 
+/** Keys set by a flag on this run; see confToSave(). */
+const cliKeys = new Set();
+/** Keys the user changed in the window since it opened. */
+const changedKeys = new Set();
+let savedConf = {};
+
 function parseArgs(argv) {
-    const saved = loadConf();
+    const saved = savedConf = loadConf();
+    const flag = (key, value) => { o[key] = value; cliKeys.add(key); };
+    // A number must follow, and must be one: `--scale --on-top` used to eat
+    // `--on-top` as the (unparseable) size and silently ignore both.
+    const number = (name, i) => {
+        const v = parseFloat(argv[i + 1]);
+        if (!Number.isFinite(v)) {
+            printerr(`jamsys-cluster: ${name} needs a number, for example ${name} 1.5`);
+            imports.system.exit(2);
+        }
+        return v;
+    };
     // A default of 1.3 rather than 1.0: at 1.0 the auxiliary dials are legible but
     // the secondary readings are not, on a high-density laptop panel.
     const o = {
@@ -154,33 +187,43 @@ function parseArgs(argv) {
         opacity: saved.opacity ?? 0.92,
         decorated: saved.decorated ?? false,
         bare: saved.bare ?? true,
-        clickthrough: saved.clickthrough ?? false,
+        clickthrough: false,      // never remembered; see sanitizeConf()
         ontop: saved.ontop ?? false,
         sticky: saved.sticky ?? false,
     };
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
-        if (a === '--scale') o.scale = parseFloat(argv[++i]) || o.scale;
-        else if (a === '--opacity') o.opacity = parseFloat(argv[++i]) || o.opacity;
-        else if (a === '--decorated') o.decorated = true;
-        else if (a === '--undecorated') o.decorated = false;
-        else if (a === '--bare') o.bare = true;
-        else if (a === '--housing') o.bare = false;
+        if (a === '--scale') flag('scale', number(a, i++));
+        else if (a === '--opacity') flag('opacity', number(a, i++));
+        else if (a === '--decorated') flag('decorated', true);
+        else if (a === '--undecorated') flag('decorated', false);
+        else if (a === '--bare') flag('bare', true);
+        else if (a === '--housing') flag('bare', false);
         else if (a === '--click-through') o.clickthrough = true;
         else if (a === '--no-click-through') o.clickthrough = false;
-        else if (a === '--on-top') o.ontop = true;
-        else if (a === '--no-on-top') o.ontop = false;
-        else if (a === '--all-workspaces') o.sticky = true;
+        else if (a === '--on-top') flag('ontop', true);
+        else if (a === '--no-on-top') flag('ontop', false);
+        else if (a === '--all-workspaces') flag('sticky', true);
+        else if (a === '--no-all-workspaces') flag('sticky', false);
         else if (a === '--reset') {
+            // The one flag that is *meant* to change what is remembered.
             o.scale = DEFAULT_SCALE; o.opacity = 0.92; o.decorated = false;
             o.bare = true; o.clickthrough = false;
             o.ontop = false; o.sticky = false;
+            cliKeys.clear();
+            for (const k of CONF_KEYS) changedKeys.add(k);
+            o.reset = true;
         }
         else if (a === '--quit' || a === '--stop') o.quit = true;
         else if (a === '--help' || a === '-h') o.help = true;
+        else if (a === '--wayland') { /* consumed by the launcher */ }
+        else {
+            printerr(`jamsys-cluster: unknown option ${a} (see --help)`);
+            imports.system.exit(2);
+        }
     }
     o.scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, o.scale));
-    o.opacity = Math.max(0.2, Math.min(1.0, o.opacity));
+    o.opacity = Math.max(CONF_LIMITS.minOpacity, Math.min(1.0, o.opacity));
     return o;
 }
 
@@ -195,16 +238,25 @@ USAGE:
   jamsys-cluster [--scale N] [--opacity N] [--decorated] [--on-top]
                  [--all-workspaces] [--reset]
 
-  --scale N       ${MIN_SCALE} to ${MAX_SCALE}; 1.0 is ${CLUSTER_W}x${CLUSTER_H} px. Default 1.3.
+  --scale N       ${MIN_SCALE} to ${MAX_SCALE}; Default 1.3. At 1.0 the cut-out face is
+                  470x176 px and the housing ${CLUSTER_W}x${CLUSTER_H}.
   --opacity N     0.2 to 1.0 of the housing. The instruments stay opaque.
   --decorated     keep a title bar
   --on-top        keep the cluster above other windows (needs XWayland)
   --all-workspaces  show it on every workspace
+  --housing       the boxed face, instead of the cut-out dials
+  --no-on-top, --no-all-workspaces, --undecorated, --bare
+                  the opposite of each of the above
   --reset         forget the remembered size, opacity and stacking
   --quit          close a running cluster and exit
   --click-through let clicks fall through the gaps between the dials. Off by
                   default: on GNOME it also stops the gadget being focused or
-                  clicked, which makes it very hard to close.
+                  clicked, which makes it very hard to close. It lasts until
+                  the cluster is closed and is never remembered.
+  --no-click-through  turn that off again
+
+A flag applies to this run. What the window remembers is what you change from
+its own menu, by scrolling, or with --reset.
 
 WHILE IT IS OPEN
   scroll              resize
@@ -276,22 +328,38 @@ function applySize() {
         applyInputShape();
         return false;
     });
-    scheduleSave();
 }
 
 function setScale(s) {
     scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, s));
     applySize();
+    scheduleSave('scale');
 }
 
 /** Debounced, so a scroll gesture does not write the file on every tick. */
-function scheduleSave() {
+function scheduleSave(key) {
+    if (key) changedKeys.add(key);
     if (saveTimer) GLib.Source.remove(saveTimer);
     saveTimer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
         saveTimer = 0;
-        saveConf({scale, opacity, decorated, bare, clickthrough, ontop, sticky});
+        writeConf();
         return false;
     });
+}
+
+function writeConf() {
+    saveConf(confToSave({scale, opacity, decorated, bare, ontop, sticky},
+                        savedConf, cliKeys, changedKeys));
+}
+
+/** Write a pending change now. The save is debounced by a second, so closing
+ *  the window straight after resizing it used to lose the new size. */
+function flushSave() {
+    if (!saveTimer)
+        return;
+    GLib.Source.remove(saveTimer);
+    saveTimer = 0;
+    writeConf();
 }
 
 app.connect('activate', () => {
@@ -369,7 +437,8 @@ app.connect('activate', () => {
     // deliberate: double click, or the right-click menu.
     const click = new Gtk.GestureClick({button: 1});
     click.connect('released', (_g, nPress) => {
-        if (nPress >= 2) openApp();
+        // Exactly two: `>= 2` opened the window a second time on a triple click.
+        if (nPress === 2) openApp();
     });
     area.add_controller(click);
 
@@ -389,7 +458,7 @@ app.connect('activate', () => {
         flags: Gtk.EventControllerScrollFlags.VERTICAL,
     });
     scroll.connect('scroll', (_c, _dx, dy) => {
-        setScale(scale * (dy < 0 ? 1.08 : 1 / 1.08));
+        setScale(scale * scrollFactor(dy));
         return true;
     });
     area.add_controller(scroll);
@@ -448,6 +517,17 @@ app.connect('activate', () => {
 
     win.present();
     writePidFile();
+    if (opts.reset)
+        writeConf();
+    // `--quit` sends SIGTERM. Left to the default action that killed the
+    // process outright: a size changed in the last second was never saved and
+    // the pid file was left for the next `--quit` to trip over.
+    try {
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 15, () => {
+            win.close();
+            return GLib.SOURCE_REMOVE;
+        });
+    } catch { /* no unix signals in this GLib; --quit still terminates it */ }
     win.connect('close-request', () => {
         stopDaemon();
         // GtkPopover is parented directly to the drawing area. GTK does not
@@ -457,6 +537,7 @@ app.connect('activate', () => {
         popover?.popdown();
         popover?.unparent();
         popover = null;
+        flushSave();
         removePidFile();
         return false;   // let the close proceed
     });
@@ -665,7 +746,9 @@ function buildMenu() {
 
     const act = new Gio.Menu();
     act.append('Open JamSys…', 'win.open');
-    act.append('Hide the cluster', 'win.quit');
+    // "Close", not "Hide": on the Shell widget Hide leaves a panel line that can
+    // bring the cluster back. Here it ends the process, and should say so.
+    act.append('Close the cluster', 'win.quit');
     menu.append_section(null, act);
 
     const add = (name, paramType, fn) => {
@@ -683,13 +766,13 @@ function buildMenu() {
         opacity = Math.max(0.2, Math.min(1.0,
             opacity + (p.get_string()[0] === 'up' ? 0.06 : -0.06)));
         area.queue_draw();
-        scheduleSave();
+        scheduleSave('opacity');
     });
     add('decorations', null, () => {
         decorated = !decorated;
         win.set_decorated(decorated);
         applyInputShape();
-        scheduleSave();
+        scheduleSave('decorated');
     });
     add('open', null, () => openApp());
     add('quit', null, () => win.close());
@@ -701,7 +784,6 @@ function buildMenu() {
         clickthroughAction.set_state(GLib.Variant.new_boolean(clickthrough));
         applyInputShape();
         if (clickthrough) warnClickThrough();
-        scheduleSave();
     });
     win.add_action(clickthroughAction);
 
@@ -712,7 +794,7 @@ function buildMenu() {
         // The two modes have different natural aspects, so resize as well as redraw.
         applySize();
         applyInputShape();
-        scheduleSave();
+        scheduleSave('bare');
     });
     win.add_action(bareAction);
 
@@ -728,7 +810,7 @@ function buildMenu() {
             }
             set(next);
             a.set_state(GLib.Variant.new_boolean(get()));
-            scheduleSave();
+            scheduleSave(name);
         });
         // Greyed out rather than silently doing nothing on a native Wayland surface.
         a.set_enabled(stackingAvailable());

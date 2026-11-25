@@ -6,6 +6,9 @@
     <value nick="top-right" value="2"/>
     <value nick="bottom-left" value="3"/>
     <value nick="bottom-right" value="4"/>
+    <!-- Written when the cluster is dragged. Without this nick the write was
+         refused, so a dragged widget snapped straight back to its corner. -->
+    <value nick="custom" value="5"/>
   </enum>
   <enum id="org.gnome.shell.extensions.jamsys.mode">
     <value nick="compact" value="0"/>
@@ -23,6 +26,7 @@
       <summary>Instrument cluster, compact single line, or minimal multi-line</summary>
     </key>
     <key name="style" type="s">
+      <choices><choice value="cutout"/><choice value="housing"/></choices>
       <default>'cutout'</default>
       <summary>Cluster face: 'cutout' (dials on the wallpaper) or 'housing' (panel)</summary>
     </key>

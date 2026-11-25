@@ -109,5 +109,15 @@ eq(styleFor('attention'), 'jamsys-attention', 'attention');
 eq(styleFor('critical'), 'jamsys-critical', 'critical');
 eq(styleFor('nonsense'), 'jamsys-unknown', 'an unknown health word is not treated as healthy');
 
+print('\nmissing or unknown data');
+ok(!normalLine({}, {'show-cpu': true, 'show-ram': true, 'show-gpu': true}, false).includes('NaN'),
+   'an empty state prints dashes, not NaN');
+ok(normalLine({...healthy, dgpu: ''}, {'show-gpu': true}, false) === 'GPU —',
+   'no discrete GPU is a dash, not 0%');
+ok(normalLine({...healthy, dgpu: 'resuming'}, {'show-gpu': true}, false) === 'GPU —',
+   'a GPU that is waking up has not been measured yet');
+eq(shortAlert({alert_subsystem: 'CPU', cpu_pct: 99, cpu_temp_c: 0}), 'CPU 99%',
+   'no temperature sensor leaves the degrees out rather than printing 0°');
+
 print(`\n${failures === 0 ? 'ALL PASS' : failures + ' FAILURE(S)'}`);
 imports.system.exit(failures === 0 ? 0 : 1);

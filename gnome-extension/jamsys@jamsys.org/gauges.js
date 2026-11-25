@@ -432,29 +432,44 @@ export const CLUSTER_H = 192;
 /** Map a JamSys state object onto instrument readings. */
 export function readings(s) {
     const cpuTemp = Number.isFinite(s.cpu_temp_c) ? s.cpu_temp_c : 0;
-    const dgpuAsleep = s.dgpu === 'suspended';
+    // A discrete-GPU figure is a measurement only while the card is awake.
+    // Testing for 'suspended' alone drew a lit "0 %" for every other case --
+    // no NVIDIA card at all, resuming, suspending, state unreadable -- which is
+    // exactly the "zero implies it was measured" this dial exists to avoid.
+    const dgpuAsleep = s.dgpu !== 'active';
+    const dgpuWord = s.dgpu === 'suspended' ? 'asleep'
+                   : s.dgpu ? String(s.dgpu) : 'none';
+    // A whole percentage, or a dash for anything that is not a number: a state
+    // object with fields missing must not put "NaN" on a dial.
+    const whole = v => Number.isFinite(v)
+        ? `${Math.round(Math.max(0, Math.min(100, v)))}` : '\u2014';
+    const igpuKnown = Number.isFinite(s.igpu_pct)
+        && (s.igpu_pct > 0 || Number(s.igpu_freq_mhz) > 0);
     return {
-        cpu:  {v: norm(s.cpu_pct, 0, 100), text: `${Math.round(s.cpu_pct)}`,
+        cpu:  {v: norm(s.cpu_pct, 0, 100), text: whole(s.cpu_pct),
                sub: cpuTemp > 0 ? `${Math.round(cpuTemp)}\u00b0C` : '',
                // Temperature earns a colour of its own: a cluster that shows 97 °C
                // in the same calm cyan as 45 °C is throwing away the reading.
                subColor: cpuTemp >= 90 ? C.red : cpuTemp >= 75 ? C.amber : C.secondary},
-        ram:  {v: norm(s.mem_pct, 0, 100), text: `${Math.round(s.mem_pct)}`},
+        ram:  {v: norm(s.mem_pct, 0, 100), text: whole(s.mem_pct)},
         gpu:  {v: dgpuAsleep ? 0 : norm(s.gpu_pct, 0, 100),
-               text: dgpuAsleep ? '\u2014' : `${Math.round(s.gpu_pct)}`,
+               text: dgpuAsleep ? '\u2014' : whole(s.gpu_pct),
                dim: dgpuAsleep},
         // The two GPUs are genuinely different instruments and are drawn as such.
         // iGPU busy is 100 - RC6 residency, which is a proxy rather than a hardware
         // busy counter, so the dial says RC6 underneath it.
-        igpu: {v: norm(s.igpu_pct ?? 0, 0, 100),
-               text: `${Math.round(s.igpu_pct ?? 0)}`,
+        // With neither a busy figure nor a clock there is no Intel GPU being
+        // read (the daemon sends zero for "absent"), so dim it like the dGPU.
+        igpu: {v: igpuKnown ? norm(s.igpu_pct, 0, 100) : 0,
+               text: igpuKnown ? whole(s.igpu_pct) : '\u2014',
                sub: s.igpu_freq_mhz ? `${Math.round(s.igpu_freq_mhz)}MHz` : '',
-               subColor: C.secondary},
+               subColor: C.secondary,
+               dim: !igpuKnown},
         // Never woken to be read: while the card is suspended the dial is dimmed and
         // shows a dash, which is the truth, not a zero.
         dgpu: {v: dgpuAsleep ? 0 : norm(s.dgpu_pct ?? 0, 0, 100),
-               text: dgpuAsleep ? '\u2014' : `${Math.round(s.dgpu_pct ?? 0)}`,
-               sub: dgpuAsleep ? 'asleep'
+               text: dgpuAsleep ? '\u2014' : whole(s.dgpu_pct ?? 0),
+               sub: dgpuAsleep ? dgpuWord
                     : (s.dgpu_temp_c ? `${Math.round(s.dgpu_temp_c)}\u00b0C` : ''),
                subColor: (s.dgpu_temp_c ?? 0) >= 85 ? C.red
                          : (s.dgpu_temp_c ?? 0) >= 70 ? C.amber : C.secondary,
@@ -465,10 +480,15 @@ export function readings(s) {
         // With no battery there is no whole-system power figure at all unless the
         // privileged RAPL helper is installed, so say so rather than drawing a zero.
         power: {v: norm(Math.abs(s.power_w), 0, 60),
-                text: s.has_battery ? `${Math.abs(s.power_w).toFixed(1)}` : '\u2014',
-                known: s.has_battery,
+                // Three figures at most: "123.4" overran the PWR bar beside it.
+                text: s.has_battery && Number.isFinite(s.power_w)
+                    ? (Math.abs(s.power_w) >= 100 ? `${Math.round(Math.abs(s.power_w))}`
+                                                  : `${Math.abs(s.power_w).toFixed(1)}`)
+                    : '\u2014',
+                known: !!s.has_battery && Number.isFinite(s.power_w),
                 charging: !s.on_battery && s.has_battery},
-        battery: {v: norm(s.battery_pct, 0, 100), pct: Math.round(s.battery_pct)},
+        battery: {v: norm(s.battery_pct, 0, 100),
+                  pct: Number.isFinite(s.battery_pct) ? Math.round(s.battery_pct) : 0},
     };
 }
 
@@ -483,8 +503,11 @@ export function rate(bps) {
     const units = ['B/s', 'kB/s', 'MB/s', 'GB/s'];
     let v = bps, i = 0;
     while (v >= 1000 && i < units.length - 1) { v /= 1000; i++; }
-    const n = v >= 100 ? Math.round(v).toString()
-            : v >= 10 ? v.toFixed(0)
+    // Rounding can carry into a fourth digit (999.6 -> "1000"); move up a unit
+    // instead, so the promise of at most three digits actually holds.
+    if (Math.round(v) >= 1000 && i < units.length - 1) { v /= 1000; i++; }
+    const n = v >= 99.5 ? Math.round(v).toString()
+            : v >= 9.95 ? v.toFixed(0)
             : v.toFixed(1);
     return {n, u: units[i]};
 }

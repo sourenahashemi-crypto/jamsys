@@ -7,8 +7,10 @@ import Gtk from 'gi://Gtk';
 
 import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
-const POSITIONS = ['top-left', 'top-center', 'top-right', 'bottom-left', 'bottom-right'];
-const POSITION_LABELS = ['Top left', 'Top centre', 'Top right', 'Bottom left', 'Bottom right'];
+const POSITIONS = ['top-left', 'top-center', 'top-right', 'bottom-left', 'bottom-right',
+                   'custom'];
+const POSITION_LABELS = ['Top left', 'Top centre', 'Top right', 'Bottom left', 'Bottom right',
+                         'Where I dragged it'];
 const MODES = ['cluster', 'compact', 'minimal'];
 const STYLES = ['cutout', 'housing'];
 const STYLE_LABELS = ['Cut-out dials (no panel)', 'Panel housing'];
@@ -50,7 +52,8 @@ export default class JamSysPrefs extends ExtensionPreferences {
 
         const posRow = new Adw.ComboRow({
             title: 'Corner',
-            subtitle: 'Where the cluster sits, or which end of the panel the line uses',
+            subtitle: 'Where the cluster sits, or which end of the panel the line uses. '
+                    + 'Dragging the cluster selects the last entry.',
             model: Gtk.StringList.new(POSITION_LABELS),
         });
         posRow.set_selected(Math.max(0, POSITIONS.indexOf(settings.get_string('position'))));
@@ -69,8 +72,11 @@ export default class JamSysPrefs extends ExtensionPreferences {
 
         const scale = new Adw.SpinRow({
             title: 'Size',
-            subtitle: '1.0 is 420 × 192 pixels',
-            adjustment: new Gtk.Adjustment({lower: 0.55, upper: 1.8, step_increment: 0.05}),
+            subtitle: '1.0 is 470 × 176 pixels for the cut-out face, 420 × 192 for the panel',
+            // The same range as the schema and the scroll wheel. Capped lower,
+            // this row showed 1.80 for a widget scrolled to 2.5 and shrank it on
+            // the first click.
+            adjustment: new Gtk.Adjustment({lower: 0.55, upper: 3.0, step_increment: 0.05}),
             digits: 2,
         });
         settings.bind('scale', scale, 'value', Gio.SettingsBindFlags.DEFAULT);

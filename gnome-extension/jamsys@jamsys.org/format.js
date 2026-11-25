@@ -5,9 +5,12 @@
  * `gjs` can import directly, so the label strings are covered by tests/format-test.js.
  */
 
-export const pct = v => `${Math.round(v)}%`;
-export const deg = v => `${Math.round(v)}°`;
-export const watt = v => `${Math.abs(v).toFixed(1)}W`;
+/* Each prints a dash for anything that is not a number. The daemon can send a
+ * state with fields missing, and "CPU NaN%" in the top bar is worse than "CPU —". */
+const fin = Number.isFinite;
+export const pct = v => fin(v) ? `${Math.round(v)}%` : '—';
+export const deg = v => fin(v) ? `${Math.round(v)}°` : '—';
+export const watt = v => fin(v) ? `${Math.abs(v).toFixed(1)}W` : '—';
 /** Signed form: a negative reading is charge going in, not power coming out. */
 export const wattSigned = (v, onBattery) =>
     onBattery || v >= 0 ? watt(v) : `+${watt(v)}`;
@@ -22,7 +25,8 @@ export function normalLine(s, show, minimal) {
     if (show['show-ram'])
         parts.push(`RAM ${pct(s.mem_pct)}`);
     if (show['show-gpu'])
-        parts.push(s.dgpu === 'suspended' ? 'GPU —' : `GPU ${pct(s.gpu_pct)}`);
+        // Measured only while the card is awake; see readings() in gauges.js.
+        parts.push(s.dgpu === 'active' ? `GPU ${pct(s.gpu_pct)}` : 'GPU —');
     if (show['show-power'] && s.has_battery)
         parts.push(s.on_battery ? watt(s.power_w) : `AC ${pct(s.battery_pct)}`);
     if (show['show-net'])
@@ -35,7 +39,9 @@ export function shortAlert(s) {
     const sub = (s.alert_subsystem || '').toUpperCase();
     switch (s.alert_subsystem) {
     case 'Power':   return `${sub} ${wattSigned(s.power_w, s.on_battery)}`;
-    case 'CPU':     return `${sub} ${pct(s.cpu_pct)} ${deg(s.cpu_temp_c)}`;
+    case 'CPU':     return s.cpu_temp_c > 0
+        ? `${sub} ${pct(s.cpu_pct)} ${deg(s.cpu_temp_c)}`
+        : `${sub} ${pct(s.cpu_pct)}`;   // no sensor: "0°" would be a made-up reading
     case 'Memory':  return `${sub} ${pct(s.mem_pct)}`;
     case 'GPU':     return `${sub} ${pct(s.gpu_pct)}`;
     case 'Network': return `${sub} ${s.net_label}`;

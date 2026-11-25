@@ -173,5 +173,36 @@ ok(/render\('idle', base\);/.test(harness) && /face = 'cutout'/.test(harness),
 for (const name of ['idle', 'warn', 'critical', 'offline', 'housing-idle'])
     ok(harness.includes(`'${name}'`), `and still renders the ${name} face`);
 
+print('\nonly an awake card has a measured GPU figure');
+for (const state of ['', 'resuming', 'suspending', 'unknown', 'unsupported']) {
+    const q = readings({...base, dgpu: state, dgpu_pct: 0, gpu_pct: 0});
+    ok(q.dgpu.dim && q.dgpu.text === '\u2014' && q.gpu.text === '\u2014',
+       `dGPU state '${state}' is a dash on a dimmed dial, not a lit 0`);
+}
+eq(readings({...base, dgpu: ''}).dgpu.sub, 'none', 'no discrete card says so');
+eq(readings({...base, dgpu: 'resuming'}).dgpu.sub, 'resuming', 'a transition is named');
+r = readings({...base, dgpu: 'active', dgpu_pct: 37});
+ok(!r.dgpu.dim && r.dgpu.text === '37', 'an awake card shows its reading');
+
+print('\na missing Intel GPU is not 0% busy');
+r = readings({...base, igpu_pct: 0, igpu_freq_mhz: 0});
+ok(r.igpu.dim && r.igpu.text === '\u2014', 'no busy figure and no clock is a dash');
+r = readings({...base, igpu_pct: 0, igpu_freq_mhz: 700});
+ok(!r.igpu.dim && r.igpu.text === '0', 'an idle but present iGPU is a real 0');
+
+print('\na state with fields missing never prints NaN');
+r = readings({});
+for (const k of ['cpu', 'ram', 'gpu', 'igpu', 'dgpu', 'power'])
+    ok(!String(r[k].text).includes('NaN'), `${k} reads '${r[k].text}'`);
+ok(Number.isFinite(r.battery.pct), 'battery percentage is a number');
+eq(readings({...base, cpu_pct: 250}).cpu.text, '100', 'an out-of-range percentage is clamped');
+eq(readings({...base, has_battery: true, power_w: 123.4}).power.text, '123',
+   'a three-digit power figure drops its decimal to fit');
+
+print('\nrate() never needs a fourth digit');
+for (const v of [999, 999.6, 9960, 99960, 999600, 999_600_000, 12345, 1])
+    ok(rate(v).n.replace('.', '').length <= 3, `rate(${v}) = ${rate(v).n} ${rate(v).u}`);
+eq(rate(999600).u, 'MB/s', 'a value that rounds up to 1000 moves to the next unit');
+
 print(`\n${failures === 0 ? 'ALL PASS' : failures + ' FAILURE(S)'}`);
 imports.system.exit(failures === 0 ? 0 : 1);

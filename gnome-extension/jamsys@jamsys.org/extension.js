@@ -34,8 +34,9 @@ import {labelFor, normalLine, styleFor} from './format.js';
 import {drawCluster, drawClusterBare, drawUnavailable,
         CLUSTER_W, CLUSTER_H, BARE_W, BARE_H} from './gauges.js';
 
-/* Must match the range in the gschema, or set_double() is silently clamped by
- * GSettings and the widget stops responding at the edges with no explanation. */
+/* Must match the range in the gschema: GSettings refuses an out-of-range
+ * set_double() outright, so the widget would stop responding at the edges with
+ * no explanation. */
 const SCALE_MIN = 0.55;
 const SCALE_MAX = 3.0;
 
@@ -82,18 +83,27 @@ class JamSysCluster extends St.Widget {
                 this._showMenu();
                 return Clutter.EVENT_STOP;
             }
-            if (event.get_button() === 1 && event.get_click_count() === 2) {
-                this._ext.openApp(this._state?.alert_subsystem);
-                return Clutter.EVENT_STOP;
-            }
-            return Clutter.EVENT_PROPAGATE;   // let the drag action have it
+            return Clutter.EVENT_PROPAGATE;   // left button belongs to the gestures
         });
 
-        // Drag to place it anywhere, not just the five preset corners. The drag
-        // action owns the pointer grab and only starts past Clutter's threshold,
-        // so a plain click is still a click.
-        this._drag = new Clutter.DragAction();
-        this._drag.connect('drag-end', () => this._onDragEnd());
+        // Clutter 18 (GNOME 50) removed ClutterDragAction and
+        // clutter_event_get_click_count(). This used both, so the constructor
+        // threw and the extension sat in ERROR without ever drawing -- while the
+        // tests passed against stubs that still modelled the old API. Gestures
+        // are what the Shell itself uses now.
+        this._click = new Clutter.ClickGesture({n_clicks_required: 2, required_button: 1});
+        this._click.connect('recognize',
+            () => this._ext.openApp(this._state?.alert_subsystem));
+        this.add_action(this._click);
+
+        // Drag to place it anywhere, not just the preset corners. A pan only
+        // begins past its threshold, so a plain click is still a click.
+        this._dragging = false;
+        this._drag = new Clutter.PanGesture({required_button: 1});
+        this._drag.connect('recognize', () => this._onDragBegin());
+        this._drag.connect('pan-update', g => this._onDragUpdate(g));
+        this._drag.connect('end', () => this._onDragEnd());
+        this._drag.connect('cancel', () => this._onDragCancel());
         this.add_action(this._drag);
         // Hover lifts the housing slightly, so it reads as a clickable object.
         this.connect('notify::hover', () => this._area.queue_repaint());
@@ -106,9 +116,39 @@ class JamSysCluster extends St.Widget {
         this._resize();
     }
 
+    /* What moves is the chrome container, not this actor: the cluster fills its
+     * Bin, so its own position is always (0, 0) relative to it and says nothing
+     * about where on the screen the gadget is. */
+    _dragTarget() {
+        return this.get_parent() ?? this;
+    }
+
+    _onDragBegin() {
+        this._dragging = true;
+        this._dragFrom = this._dragTarget().get_position();
+    }
+
+    _onDragUpdate(gesture) {
+        if (!this._dragging)
+            return;
+        const d = gesture.get_accumulated_delta();
+        const dx = d?.x ?? d?.[0] ?? 0;
+        const dy = d?.y ?? d?.[1] ?? 0;
+        this._dragTarget().set_position(Math.round(this._dragFrom[0] + dx),
+                                        Math.round(this._dragFrom[1] + dy));
+    }
+
+    _onDragCancel() {
+        if (!this._dragging)
+            return;
+        this._dragging = false;
+        this._dragTarget().set_position(...this._dragFrom);
+    }
+
     /** Remember where it was dropped, and stop the corner logic overriding it. */
     _onDragEnd() {
-        const [x, y] = this.get_position();
+        this._dragging = false;
+        const [x, y] = this._dragTarget().get_position();
         this._settings.set_int('custom-x', Math.round(x));
         this._settings.set_int('custom-y', Math.round(y));
         // Writing 'position' last: it is a rebuild key, so the widget is placed
@@ -151,7 +191,7 @@ class JamSysCluster extends St.Widget {
                 // Not a 'hidden' flag with no way back: switch to the panel line,
                 // which keeps one small thing on screen whose own menu can bring
                 // the cluster back. A gadget you cannot un-hide is a lost gadget.
-                this._settings.set_string('mode', 'minimal');
+                this._settings.set_string('mode', 'compact');
             });
             this._menu.addMenuItem(hide);
 
@@ -176,7 +216,7 @@ class JamSysCluster extends St.Widget {
     /** Scroll up grows, scroll down shrinks; the setting is the single source. */
     _onScroll(event) {
         const dir = event.get_scroll_direction();
-        let up;
+        let up, notches = 0;
         if (dir === Clutter.ScrollDirection.UP) {
             up = true;
         } else if (dir === Clutter.ScrollDirection.DOWN) {
@@ -187,13 +227,18 @@ class JamSysCluster extends St.Widget {
             const [, dy] = event.get_scroll_delta();
             if (!Number.isFinite(dy) || Math.abs(dy) < 0.01)
                 return Clutter.EVENT_PROPAGATE;
-            up = dy < 0;
+            // A touchpad swipe is dozens of events with small deltas. A fixed
+            // 8% per event took the widget from one clamp to the other in a
+            // single gesture; scaling by the delta makes one notch one notch.
+            notches = -Math.max(-1, Math.min(1, dy));
         } else {
             return Clutter.EVENT_PROPAGATE;
         }
+        if (up !== undefined)
+            notches = up ? 1 : -1;
 
         const cur = this._settings.get_double('scale');
-        const next = Math.max(SCALE_MIN, Math.min(SCALE_MAX, cur * (up ? 1.08 : 1 / 1.08)));
+        const next = Math.max(SCALE_MIN, Math.min(SCALE_MAX, cur * Math.pow(1.08, notches)));
         // Writing the setting is what resizes: 'scale' is already wired to
         // _restyle(), which resizes and repositions. Rounded so that repeated
         // scrolling cannot accumulate floating-point drift in a stored value.
@@ -320,7 +365,10 @@ class JamSysIndicator extends PanelMenu.Button {
         for (const c of ['jamsys-healthy', 'jamsys-attention',
                          'jamsys-critical', 'jamsys-unknown'])
             this._label.remove_style_class_name(c);
-        this._label.add_style_class_name(cls);
+        // 'dim-when-healthy' had a switch in Preferences and nothing reading it:
+        // the healthy class always dimmed. Leaving the class off is "not dimmed".
+        if (cls !== 'jamsys-healthy' || this._settings.get_boolean('dim-when-healthy'))
+            this._label.add_style_class_name(cls);
         this._label.remove_style_class_name('jamsys-minimal');
         if (this._settings.get_string('mode') === 'minimal')
             this._label.add_style_class_name('jamsys-minimal');
@@ -413,7 +461,13 @@ export default class JamSysExtension extends Extension {
         const cluster = this._isCluster();
         // A 420px instrument binnacle has no business in the top panel, so cluster
         // mode always floats; the position setting only picks which corner.
-        const floating = cluster || pos.startsWith('bottom');
+        //
+        // The line modes always go in the panel. They used to float for a bottom
+        // position by putting the PanelMenu.Button in an St.Bin, but a panel
+        // button already has a parent (its own `container`), so the Bin stayed
+        // empty: "Hide the cluster" from a bottom corner left a blank box and no
+        // menu to bring the cluster back.
+        const floating = cluster;
 
         this._widget = cluster ? new Cluster(this) : new Indicator(this);
 
@@ -437,7 +491,7 @@ export default class JamSysExtension extends Extension {
                                                    () => this._reposition());
             this._reposition();
         } else {
-            const box = pos === 'top-left' ? 'left' : pos === 'top-center' ? 'center' : 'right';
+            const box = pos.endsWith('left') ? 'left' : pos.endsWith('center') ? 'center' : 'right';
             Main.panel.addToStatusArea(this.uuid, this._widget, box === 'left' ? 10 : 0, box);
         }
 
@@ -489,7 +543,9 @@ export default class JamSysExtension extends Extension {
     }
 
     _reposition() {
-        if (!this._floating)
+        // Moving the container changes its allocation, which lands here; without
+        // this the corner logic would snap it back on every pointer motion.
+        if (!this._floating || this._widget?._dragging)
             return;
         const mon = Main.layoutManager.primaryMonitor;
         if (!mon)
@@ -530,9 +586,7 @@ export default class JamSysExtension extends Extension {
     _connect() {
         this._disconnect();
         const generation = this._connectionGeneration;
-        try {
-            this._proxy = new JamSysProxy(Gio.DBus.session, BUS_NAME, OBJECT_PATH);
-        } catch (e) {
+        const failed = e => {
             // _connect() is only ever the name-appeared callback, so the name IS
             // owned and the daemon IS running. Reporting "jamsysd is not running"
             // here sent the user to fix something that was not broken.
@@ -546,8 +600,27 @@ export default class JamSysExtension extends Extension {
             // single transient failure would strand the widget until the daemon
             // itself restarted.
             this._scheduleReconnect();
-            return;
+        };
+        // Asynchronous, and without the property load. This runs inside the
+        // compositor: the synchronous constructor blocks on a round trip to a
+        // single-threaded daemon, so a daemon busy in its first collection pass
+        // froze the whole desktop until it answered.
+        try {
+            new JamSysProxy(Gio.DBus.session, BUS_NAME, OBJECT_PATH, (proxy, err) => {
+                if (generation !== this._connectionGeneration) return;
+                if (err) {
+                    failed(err);
+                    return;
+                }
+                this._proxy = proxy;
+                this._subscribe(generation);
+            }, null, Gio.DBusProxyFlags.DO_NOT_LOAD_PROPERTIES);
+        } catch (e) {
+            failed(e);
         }
+    }
+
+    _subscribe(generation) {
         let pushed = false;
         this._signalId = this._proxy.connectSignal('StateChanged', (_p, _s, [json]) => {
             if (generation !== this._connectionGeneration) return;
@@ -614,7 +687,8 @@ export default class JamSysExtension extends Extension {
             p.init(null);
         } catch (e) {
             logError(e, 'JamSys: could not launch the application');
-            Main.notify('JamSys', 'Could not launch the JamSys window.');
+            Main.notify('JamSys', 'Could not launch the JamSys window. '
+                + 'Check that `jamsys` is on your PATH (run: which jamsys).');
         }
     }
 
