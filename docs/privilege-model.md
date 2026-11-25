@@ -141,6 +141,13 @@ line closes that connection only.
   logs. It opens no socket, captures nothing, sends nothing, and gains no privilege.
   It follows that it cannot block anything either: JamSys is not a firewall, and the
   page recommends the system's own (`sudo ufw enable`) rather than imitating one.
+  The one thing the Security page can *change* is whether `ufw` is on. It does so
+  by running `pkexec /usr/sbin/ufw --force enable` or `pkexec /usr/sbin/ufw disable`:
+  two fixed argument vectors with no input of any kind, authorised by an
+  administrator password each time. There is no JamSys helper involved because
+  there is nothing to validate; the window itself never holds privilege, and the
+  daemon is not involved at all. `--force` only answers ufw's "this may disrupt
+  ssh" question, which cannot be answered through pkexec.
   A sign-in failure records the service, the account name tried and the remote
   address as logged; passwords are never in the journal and never seen.
 * Everything is stored under `~/.local/share/jamsys/`. Deleting that directory deletes

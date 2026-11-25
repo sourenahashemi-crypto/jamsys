@@ -24,6 +24,7 @@ from . import report
 from .processes import select_processes
 from .client import Client, DaemonError, run_async
 from .hardware import (CHARGE_LIMITS, MODES, PRESETS, SPEEDS, ChargeLimitControl,
+                       FirewallControl,
                        KeyboardControl, ints_to_rgba, repo_script, rgba_to_ints)
 from .format import (SEVERITY, clock_hm, human_ago, human_bps, human_bytes,
                      human_duration, pct, temp, watts)
@@ -403,7 +404,7 @@ class OverviewPage(Page):
 
         grid = Gtk.FlowBox(
             selection_mode=Gtk.SelectionMode.NONE, homogeneous=True,
-            min_children_per_line=2, max_children_per_line=4,
+            min_children_per_line=2, max_children_per_line=3,
             row_spacing=12, column_spacing=12)
         self.cards: dict[str, MetricCard] = {}
         for key, title, icon, page in [
@@ -415,6 +416,7 @@ class OverviewPage(Page):
             ("storage", "Disk", "drive-harddisk-symbolic", "Storage"),
             ("network", "Network", "network-wireless-symbolic", "Network"),
             ("services", "Services", "system-run-symbolic", "Services"),
+            ("security", "Security", "security-high-symbolic", "Security"),
         ]:
             c = MetricCard(title, icon, on_click=lambda p=page: self.win.goto(p))
             self.cards[key] = c
@@ -487,6 +489,7 @@ class OverviewPage(Page):
         self._storage_card(s)
         self._network_card(s)
         self._services_card(s)
+        self._security_card(s)
 
     # -- sparklines ---------------------------------------------------------
 
@@ -703,6 +706,33 @@ class OverviewPage(Page):
                 "0", "No failed units",
                 f"{len(ignored)} ignored" if ignored else "",
                 "healthy", "Normal")
+
+    def _security_card(self, s):
+        sec = s.get("security")
+        card = self.cards["security"]
+        card.spark.set_visible(False)       # a checklist has no curve
+        if not sec:
+            card.set_unavailable("Restart the daemon to enable: "
+                                 "systemctl --user restart jamsysd")
+            return
+        checks = sec.get("checks") or []
+        failing = [c for c in checks if c.get("status") == "warn"]
+        new = len(sec.get("unexpected") or [])
+        fails = sec.get("auth_failures_10m", 0)
+        fw = (sec.get("firewall") or {}).get("state", "unknown")
+        status, word = "healthy", "Normal"
+        if new:
+            status, word = "attention", "New listener"
+        elif failing:
+            status, word = "attention", "Worth fixing"
+        card.update(
+            "All clear" if not failing and not new else
+            f"{len(failing) + new} to check",
+            (failing[0]["title"] if failing else
+             f"firewall {fw} · {sec.get('exposed_tcp', 0)} reachable from the network"),
+            f"{fails} failed sign-in(s) in 10 min" if fails else "",
+            status, word)
+        card.spark.set_visible(False)
 
     def set_events(self, items: list[dict]) -> None:
         """Replace the event list -- unless that would only get in the way.
@@ -1186,6 +1216,8 @@ class SecurityPage(Page):
     def __init__(self, win):
         super().__init__(win)
         self._shown = None
+        self.firewall = FirewallControl()
+        self._switching = False
 
     def update(self, snap):
         # Rebuilt only when something on it changed: it has buttons, and a button
@@ -1207,6 +1239,7 @@ class SecurityPage(Page):
                 "installed version:  systemctl --user restart jamsysd"))
             return
 
+        self._checkup(sec)
         self._firewall(sec.get("firewall") or {}, sec.get("exposed_tcp", 0))
         self._sign_ins(sec)
         listeners = sec.get("listeners") or []
@@ -1244,6 +1277,92 @@ class SecurityPage(Page):
 
     # -- sections -----------------------------------------------------------
 
+    CHECK_ICONS = {"ok": ("emblem-ok-symbolic", "sv-healthy"),
+                   "warn": ("dialog-warning-symbolic", "sv-attention"),
+                   "note": ("dialog-information-symbolic", "sv-idle"),
+                   "unknown": ("dialog-question-symbolic", "sv-unknown")}
+
+    def _checkup(self, sec):
+        """The short answer first: a handful of settings, each right or not."""
+        checks = sec.get("checks") or []
+        if not checks:
+            return
+        failing = [c for c in checks if c.get("status") == "warn"]
+        g = self.group(
+            "Checkup",
+            ("Everything that can be checked from here is as it should be."
+             if not failing else
+             f"{len(failing)} thing(s) worth fixing, most important first. Each says "
+             "what to do; nothing here is changed without you."))
+        order = {"warn": 0, "note": 1, "unknown": 2, "ok": 3}
+        for c in sorted(checks, key=lambda c: order.get(c.get("status"), 2)):
+            row = Adw.ActionRow(title=GLib.markup_escape_text(c.get("title", "")),
+                                subtitle=GLib.markup_escape_text(c.get("detail", "")))
+            icon, css = self.CHECK_ICONS.get(c.get("status"), self.CHECK_ICONS["unknown"])
+            ic = Gtk.Image.new_from_icon_name(icon)
+            ic.add_css_class(css)
+            row.add_prefix(ic)
+            fix = c.get("fix")
+            if fix and c.get("id") == "firewall" and self.firewall.available():
+                row.add_suffix(self._firewall_button(True))
+            elif fix:
+                cmd = Gtk.Label(label=fix, selectable=True)
+                cmd.add_css_class("sv-mono")
+                row.add_suffix(cmd)
+                copy = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER,
+                                  tooltip_text="Copy this command")
+                copy.add_css_class("flat")
+                copy.connect("clicked", lambda _b, text=fix: (
+                    self.get_clipboard().set(text),
+                    self.win.toasts.add_toast(Adw.Toast(
+                        title="Copied — paste it into a terminal", timeout=3))))
+                row.add_suffix(copy)
+            g.add(row)
+        self.body.append(g)
+
+    def _firewall_button(self, on: bool) -> Gtk.Button:
+        b = Gtk.Button(label="Turn on" if on else "Turn off", valign=Gtk.Align.CENTER,
+                       sensitive=not self._switching)
+        b.set_tooltip_text(
+            "Runs `ufw enable` after asking for an administrator password. Incoming "
+            "connections are refused unless allowed; outgoing ones are unaffected."
+            if on else
+            "Runs `ufw disable` after asking for an administrator password.")
+        if on:
+            b.add_css_class("suggested-action")
+        else:
+            b.add_css_class("flat")
+        b.connect("clicked", lambda _b: self._switch_firewall(on))
+        return b
+
+    def _switch_firewall(self, on: bool):
+        if self._switching:
+            return
+        self._switching = True
+        self._shown = None
+        self.update(self.win.last_snapshot or {})
+
+        def done(ok, err):
+            self._switching = False
+            if getattr(self.win, "_closed", False):
+                return
+            if ok and not err:
+                self.win.toasts.add_toast(Adw.Toast(
+                    title=("Firewall turned on. Incoming connections are now refused "
+                           "unless you allow them." if on else "Firewall turned off."),
+                    timeout=5))
+            else:
+                self.win.toasts.add_toast(Adw.Toast(
+                    title=f"Firewall not changed: {err or self.firewall.last_error}",
+                    timeout=7))
+            # The daemon re-reads the setting on its next pass; redraw then, and
+            # now, so the button is usable again either way.
+            self._shown = None
+            if self.win.current_page() is self:
+                self.update(self.win.last_snapshot or {})
+            self.win.refresh()
+        run_async(lambda: self.firewall.set_enabled(on), done)
+
     def _firewall(self, fw, exposed):
         state = fw.get("state", "unknown")
         g = self.group("Firewall")
@@ -1258,10 +1377,15 @@ class SecurityPage(Page):
         ic = Gtk.Image.new_from_icon_name(icon)
         ic.add_css_class(css)
         row.add_prefix(ic)
+        # Reversible from the same place: what can be switched on here can be
+        # switched off here.
+        if fw.get("tool") == "ufw" and state in ("enabled", "disabled") \
+                and self.firewall.available():
+            row.add_suffix(self._firewall_button(state == "disabled"))
         g.add(row)
         if state == "disabled":
             g.add(self.row(
-                "To turn it on", "sudo ufw enable",
+                "Or from a terminal", "sudo ufw enable",
                 (f"{exposed} program(s) below are reachable from the network right now. "
                  if exposed else "Nothing is reachable from the network right now. ")
                 + "Outgoing connections are not affected."))

@@ -327,5 +327,74 @@ sp2.update({"snapshot": {"security": SEC3}})
 check("an unwatched sign-in log says so instead of showing zero",
       "Not being counted" in labels(sp2.body))
 
+print("\nthe security checkup and the firewall switch")
+from jamsys_ui.hardware import FirewallControl  # noqa: E402
+
+fc = FirewallControl()
+check("turning it on is one fixed command", fc.argv(True) == ["pkexec", "/usr/sbin/ufw", "--force", "enable"])
+check("and so is turning it off", fc.argv(False) == ["pkexec", "/usr/sbin/ufw", "disable"])
+fc.UFW = "/nonexistent/ufw"
+check("without ufw the reason is one the user can act on",
+      fc.set_enabled(True) is False and "sudo ufw enable" in (fc.last_error or ""), repr(fc.last_error))
+
+CHECKS = [
+    {"id": "auto_updates", "status": "ok", "title": "Security updates install automatically", "detail": "d", "fix": ""},
+    {"id": "firewall", "status": "warn", "title": "Firewall is off", "detail": "Nothing refuses & blocks", "fix": "sudo ufw enable"},
+    {"id": "updates", "status": "warn", "title": "2 security update(s) waiting", "detail": "d", "fix": "sudo apt update && sudo apt upgrade"},
+    {"id": "disk_encryption", "status": "note", "title": "The system disk is not encrypted", "detail": "d", "fix": ""}]
+calls = []
+cwin = StubWin()
+cwin.refresh = lambda: None
+cp = SecurityPage(cwin)
+cwin.page = cp
+cp.firewall.available = lambda: True
+cp.firewall.set_enabled = lambda on: calls.append(on) or True
+snapc = {"snapshot": {"security": dict(SEC, checks=CHECKS, checks_failing=2)}}
+cwin.last_snapshot = snapc
+cp.update(snapc)
+rows = [w.get_title() for w in appmod._walk(cp.body) if isinstance(w, Adw.ActionRow)]
+order = [r for r in rows if r in [c["title"] for c in CHECKS]]
+check("what needs fixing is listed before what is fine",
+      order[:2] == ["Firewall is off", "2 security update(s) waiting"]
+      and order[-1] == "Security updates install automatically", str(order))
+text = labels(cp.body)
+check("a fix is shown as a command that can be selected and copied",
+      "sudo apt update && sudo apt upgrade" in text)
+on_buttons = [w for w in appmod._walk(cp.body)
+              if isinstance(w, Gtk.Button) and w.get_label() == "Turn on"]
+check("the firewall can be turned on from the checkup and from its own section",
+      len(on_buttons) == 2, f"{len(on_buttons)} buttons")
+on_buttons[0].emit("clicked")
+pump(lambda: bool(calls))
+check("pressing it asks for exactly that", calls == [True], str(calls))
+pump(lambda: not cp._switching)
+check("and the page is usable again afterwards", not cp._switching)
+
+cp.firewall.available = lambda: False
+cp._shown = None
+cp.update(snapc)
+check("without ufw or pkexec there is no button, only the command",
+      not [w for w in appmod._walk(cp.body)
+           if isinstance(w, Gtk.Button) and w.get_label() == "Turn on"]
+      and "sudo ufw enable" in labels(cp.body))
+
+on = dict(SEC, firewall={"state": "enabled", "tool": "ufw", "detail": "d"}, checks=[], checks_failing=0)
+cp.firewall.available = lambda: True
+cp.update({"snapshot": {"security": on}})
+check("a firewall that is on can be turned off from the same place",
+      len([w for w in appmod._walk(cp.body)
+           if isinstance(w, Gtk.Button) and w.get_label() == "Turn off"]) == 1)
+
+print("\nthe Overview's Security card")
+ov2 = OverviewPage(StubWin())
+ov2._security_card({"security": dict(SEC, checks=CHECKS, unexpected=[SEC["listeners"][0]])})
+t2 = labels(ov2.cards["security"])
+check("counts failing checks and new listeners together", "3 to check" in t2, str(t2))
+ov2._security_card({"security": dict(SEC, checks=[CHECKS[0]], unexpected=[], auth_failures_10m=0)})
+check("and says so when there is nothing to do", "All clear" in labels(ov2.cards["security"]))
+ov2._security_card({})
+check("an older daemon is not shown as all clear",
+      "All clear" not in labels(ov2.cards["security"]))
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

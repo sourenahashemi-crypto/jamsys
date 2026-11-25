@@ -214,14 +214,16 @@ an unprivileged program can honestly observe, and says what it could not.
 |---|---|---|
 | Listening sockets, with exposure and owner | Working | Isolated run of the new binary on this machine listed the real listeners (systemd-resolve :53, cups :631, all loopback; avahi UDP 5353) |
 | Alert on a new network-facing listener | Working | A test socket bound to `0.0.0.0:8765` raised `security.new_listener` within 57 s, naming `python3`, its pid and the firewall state. Accepting it cleared the alert; a key that is not listening was refused |
-| Firewall on/off | Partial | Reads `ENABLED=` from `/etc/ufw/ufw.conf` (here: `no`) or firewalld's pid file. **Rules are never read**: they need root. A machine filtering with raw nftables reports `unknown` |
-| `security.firewall_off` | Unverified live | Unit-tested. Not seen firing: nothing on this machine is network-facing, which is the condition it requires |
-| Failed sign-in counting | **Unverified live** | The parser is tested against lines copied from this machine's journal (sudo, polkit) and against documented sshd formats. No failed sign-in was provoked, so the follower → counter → alert path has not run end to end. sshd is not installed here, so its patterns have never met a real line |
+| Firewall on/off | Partial | Reads `ENABLED=` from `/etc/ufw/ufw.conf` or firewalld's pid file. Seen live in both states: it read `no`, the owner ran `sudo ufw enable` in a terminal mid-test, and the next sample read `enabled`. **Rules are never read**: they need root. A machine filtering with raw nftables reports `unknown` |
+| `security.firewall_off` | Unverified live | Unit-tested. A live attempt held a network-facing test socket open for ten minutes, but the firewall was switched on 85 s in, so the rule correctly stayed silent. It has not been seen firing, and provoking it now would mean turning the owner's firewall off |
+| Failed sign-in counting | Working for sudo; **sshd unverified** | On the installed daemon, six wrong passwords given to `sudo` were counted as exactly six (each attempt writes three journal lines) and raised `security.login_failures` within seconds, as a Notice naming the account; it resolved by itself as the window emptied. sshd is not installed here, so its patterns have only met documented formats, never a real line |
+| Security checkup | Working | Seven checks read from world-readable files. On this machine: automatic updates on, no updates waiting (the "22 ESM Apps" advertisement is correctly not counted), no restart pending, Secure Boot on, system disk **not** encrypted (reported as a note, not a failure) |
+| Turning the firewall on or off from the window | **Unverified live** | `pkexec /usr/sbin/ufw --force enable` / `disable`, fixed argument vectors. The button and its wiring are tested with the command stubbed; the real command was not run, because it needs the administrator password |
 | Process name for another user's socket | Unsupported | Needs root. Shown by account (`root`), and the page says so |
 | Outbound connections per process | Not implemented | |
 | Blocking, or reading firewall rules | Unsupported by design | Would require the daemon or a helper to hold root and accept addresses and ports, which the privilege rules exclude |
 
-Known limits: sockets are sampled on the slow tier (60 s, 180 s while idle on
+Known limits: sockets are sampled on the medium tier (10 s, 30 s while idle on
 battery), so a listener that lives for less than that can be missed entirely; the
 baseline is whatever was listening the first time the collector ran, so something
 already malicious at that moment is "expected"; and software running as root can

@@ -93,6 +93,49 @@ pub struct AuthFailure {
     pub source: String,
 }
 
+/// One line of the security checkup: a setting that is either as it should be
+/// or not, with the one command that changes it.
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+pub struct Check {
+    pub id: String,
+    /// "ok", "warn" (worth fixing, and `fix` says how), "note" (worth knowing,
+    /// not simply fixable) or "unknown" (could not be determined here).
+    pub status: String,
+    pub title: String,
+    pub detail: String,
+    /// A command to run, or empty.
+    pub fix: String,
+}
+
+fn check(id: &str, status: &str, title: impl Into<String>, detail: impl Into<String>,
+         fix: &str) -> Check {
+    Check { id: id.into(), status: status.into(), title: title.into(),
+            detail: detail.into(), fix: fix.into() }
+}
+
+/// `APT::Periodic::Unattended-Upgrade "1";` -> Some(true). None when not stated.
+pub fn parse_auto_upgrades(text: &str) -> Option<bool> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with("//") && !l.starts_with('#'))
+        .find_map(|l| l.strip_prefix("APT::Periodic::Unattended-Upgrade"))
+        .and_then(|v| v.split('"').nth(1))
+        .map(|v| v.trim() != "0" && !v.trim().is_empty())
+}
+
+/// From update-notifier's summary: (updates installable now, of which security).
+/// The second is None when the file does not say.
+pub fn parse_updates_available(text: &str) -> Option<(u32, Option<u32>)> {
+    let first_number = |l: &str| l.split_whitespace().next().and_then(|n| n.parse::<u32>().ok());
+    let all = text.lines().find(|l| l.contains("can be applied immediately")
+                                    || l.contains("can be installed immediately"))
+        .and_then(first_number)?;
+    let sec = text.lines().find(|l| l.contains("standard security update")
+                                    || l.contains("are security updates"))
+        .and_then(first_number);
+    Some((all, sec.or(if all == 0 { Some(0) } else { None })))
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct SecurityState {
     pub listeners: Vec<Listener>,
@@ -109,6 +152,10 @@ pub struct SecurityState {
     pub auth_log_watched: bool,
     /// False until the baseline of expected listeners exists.
     pub baseline_ready: bool,
+    /// The checkup, in the order worth reading.
+    pub checks: Vec<Check>,
+    /// How many of `checks` are "warn".
+    pub checks_failing: usize,
 }
 
 /// One row of `/proc/net/{tcp,udp}{,6}`.
@@ -273,6 +320,8 @@ pub struct SecurityCollector {
     etc: PathBuf,
     run: PathBuf,
     sys_module: PathBuf,
+    sys_root: PathBuf,
+    var: PathBuf,
     baseline_file: PathBuf,
     /// Keys present at first run. `None` until loaded or learned.
     baseline: Option<BTreeSet<String>>,
@@ -293,6 +342,8 @@ impl SecurityCollector {
             etc: "/etc".into(),
             run: "/run".into(),
             sys_module: "/sys/module".into(),
+            sys_root: "/sys".into(),
+            var: "/var".into(),
             baseline_file: crate::config::data_dir().join("known-listeners.json"),
             baseline: None,
             owners: HashMap::new(),
@@ -311,6 +362,8 @@ impl SecurityCollector {
             etc: root.join("etc"),
             run: root.join("run"),
             sys_module: root.join("sys/module"),
+            sys_root: root.join("sys"),
+            var: root.join("var"),
             baseline_file: root.join("known-listeners.json"),
             ..Self::new()
         }
@@ -448,6 +501,119 @@ impl SecurityCollector {
         }
     }
 
+    /// Is the block device `name` (as in /sys/class/block) encrypted, or built
+    /// on something that is? Follows device-mapper `slaves` so LVM-on-LUKS counts.
+    fn encrypted(&self, name: &str, depth: u8) -> bool {
+        let dev = self.sys_root.join("class/block").join(name);
+        if read_str(dev.join("dm/uuid")).is_some_and(|u| u.starts_with("CRYPT-")) {
+            return true;
+        }
+        depth < 4 && list_dir(dev.join("slaves")).iter().any(|s| self.encrypted(s, depth + 1))
+    }
+
+    /// The device mounted at `/`, as a /sys/class/block name.
+    fn root_device(&self) -> Option<String> {
+        let text = read_str(self.proc_root.join("self/mountinfo"))?;
+        let line = text.lines().find(|l| l.split_whitespace().nth(4) == Some("/"))?;
+        let src = line.split(" - ").nth(1)?.split_whitespace().nth(1)?;
+        let path = std::fs::canonicalize(src).unwrap_or_else(|_| PathBuf::from(src));
+        path.file_name()?.to_str().map(String::from)
+    }
+
+    /// The checkup. Every line is something read from a file anyone may read;
+    /// where the file is missing the answer is "unknown", never a guess.
+    fn checks(&self, fw: &FirewallState, exposed: &[&Listener], unexpected: usize) -> Vec<Check> {
+        let mut out = Vec::new();
+
+        out.push(match fw.state.as_str() {
+            "enabled" => check("firewall", "ok", format!("Firewall is on ({})", fw.tool), &fw.detail, ""),
+            "disabled" => check("firewall", "warn", "Firewall is off",
+                "Nothing refuses incoming connections. Turning it on blocks what other devices \
+                 start and leaves everything you start untouched.", "sudo ufw enable"),
+            _ => check("firewall", "unknown", "Firewall state unknown", &fw.detail, ""),
+        });
+
+        out.push(if exposed.is_empty() {
+            check("exposure", "ok", "Nothing is reachable from the network",
+                  "No program is accepting connections from other devices.", "")
+        } else {
+            let names: Vec<String> = exposed.iter().map(|l| format!("{} ({})", l.port, l.name())).collect();
+            check("exposure", if unexpected > 0 { "warn" } else { "note" },
+                  format!("{} program(s) reachable from the network", exposed.len()),
+                  format!("Ports {}. Fine if you mean to share them; each one is a door.{}",
+                          names.join(", "),
+                          if unexpected > 0 { " At least one is new and has not been accepted." } else { "" }),
+                  "")
+        });
+
+        let apt = self.etc.join("apt/apt.conf.d");
+        let auto = list_dir(&apt).iter()
+            .filter_map(|f| read_str(apt.join(f)))
+            .filter_map(|t| parse_auto_upgrades(&t))
+            .last();
+        out.push(match auto {
+            Some(true) => check("auto_updates", "ok", "Security updates install automatically",
+                                "unattended-upgrades is enabled.", ""),
+            Some(false) => check("auto_updates", "warn", "Automatic security updates are off",
+                "Fixes for known holes wait until you install them by hand.",
+                "sudo dpkg-reconfigure -plow unattended-upgrades"),
+            None => check("auto_updates", "unknown", "Automatic updates: could not tell",
+                          "No APT::Periodic setting was found; this may not be an apt system.", ""),
+        });
+
+        if let Some(t) = read_str(self.var.join("lib/update-notifier/updates-available")) {
+            if let Some((all, sec)) = parse_updates_available(&t) {
+                out.push(match (all, sec) {
+                    (_, Some(s)) if s > 0 => check("updates", "warn",
+                        format!("{s} security update(s) waiting"),
+                        format!("{all} update(s) can be installed now, {s} of them security fixes."),
+                        "sudo apt update && sudo apt upgrade"),
+                    (0, _) => check("updates", "ok", "No updates waiting",
+                                    "As of the system's last check.", ""),
+                    (n, _) => check("updates", "note", format!("{n} update(s) waiting"),
+                                    "None is marked as a security fix.",
+                                    "sudo apt update && sudo apt upgrade"),
+                });
+            }
+        }
+
+        if self.run.join("reboot-required").exists() {
+            let pkgs = read_str(self.run.join("reboot-required.pkgs"))
+                .map(|p| p.lines().take(4).collect::<Vec<_>>().join(", "))
+                .unwrap_or_default();
+            out.push(check("restart", "warn", "A restart is needed to finish updating",
+                if pkgs.is_empty() { "An installed update only takes effect after a restart.".to_string() }
+                else { format!("Installed but not yet running: {pkgs}.") }, ""));
+        }
+
+        if let Some(dev) = self.root_device() {
+            out.push(if self.encrypted(&dev, 0) {
+                check("disk_encryption", "ok", "The system disk is encrypted",
+                      "If this computer is lost or stolen, its files cannot be read.", "")
+            } else {
+                check("disk_encryption", "note", "The system disk is not encrypted",
+                    format!("Anyone holding this computer can read its files without your \
+                             password ({dev} is a plain partition). Full-disk encryption can only \
+                             be chosen when installing; for now, keep sensitive files in an \
+                             encrypted folder or volume."), "")
+            });
+        }
+
+        let efi = self.sys_root.join("firmware/efi/efivars");
+        if let Some(var) = list_dir(&efi).into_iter().find(|n| n.starts_with("SecureBoot-")) {
+            // Four attribute bytes, then the value.
+            match std::fs::read(efi.join(var)).ok().and_then(|b| b.get(4).copied()) {
+                Some(1) => out.push(check("secure_boot", "ok", "Secure Boot is on",
+                    "The firmware only starts a signed bootloader and kernel.", "")),
+                Some(_) => out.push(check("secure_boot", "note", "Secure Boot is off",
+                    "The firmware will start any bootloader. It is switched on in the firmware \
+                     setup screen, not from here.", "")),
+                None => {}
+            }
+        }
+        out
+    }
+
     fn load_baseline(&mut self, current: &[Listener]) {
         if self.baseline.is_some() {
             return;
@@ -498,7 +664,10 @@ impl Collector for SecurityCollector {
         "security"
     }
     fn tier(&self) -> Tier {
-        Tier::Slow
+        // Medium, not slow: a listener that lives for less than the sampling
+        // interval is never seen, so the interval is the size of the blind spot.
+        // Every source here is a small text file; nothing is spawned.
+        Tier::Medium
     }
 
     fn probe(&mut self) -> Support {
@@ -552,10 +721,19 @@ impl Collector for SecurityCollector {
         let short = self.failures.iter()
             .filter(|f| ctx.ts_ms - f.ts_ms <= WINDOW_SHORT_MS).count() as u32;
 
+        let firewall = self.firewall();
+        let unexpected: Vec<Listener> = listeners.iter().filter(|l| !l.expected).cloned().collect();
+        let checks = {
+            let exposed: Vec<&Listener> =
+                listeners.iter().filter(|l| l.proto == "tcp" && l.exposed()).collect();
+            self.checks(&firewall, &exposed, unexpected.len())
+        };
         let st = SecurityState {
             exposed_tcp: listeners.iter().filter(|l| l.proto == "tcp" && l.exposed()).count(),
-            unexpected: listeners.iter().filter(|l| !l.expected).cloned().collect(),
-            firewall: self.firewall(),
+            unexpected,
+            checks_failing: checks.iter().filter(|c| c.status == "warn").count(),
+            checks,
+            firewall,
             auth_failures_10m: short,
             auth_failures_1h: self.failures.len() as u32,
             recent_failures: self.failures.iter().rev().take(10).cloned().collect(),
@@ -829,6 +1007,92 @@ mod tests {
         }
         assert_eq!(x.snap.security.auth_failures_10m, 500, "every attempt is counted");
         assert_eq!(x.events.len(), MAX_FAILURE_EVENTS, "but only the first few are logged one by one");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn apt_and_update_notifier_files_are_read_for_what_they_say() {
+        assert_eq!(parse_auto_upgrades("APT::Periodic::Update-Package-Lists \"1\";\nAPT::Periodic::Unattended-Upgrade \"1\";\n"), Some(true));
+        assert_eq!(parse_auto_upgrades("APT::Periodic::Unattended-Upgrade \"0\";"), Some(false));
+        assert_eq!(parse_auto_upgrades("// APT::Periodic::Unattended-Upgrade \"1\";"), None, "a comment is not a setting");
+        assert_eq!(parse_auto_upgrades(""), None);
+
+        // Verbatim from this machine.
+        let here = "\nExpanded Security Maintenance for Applications is not enabled.\n\n0 updates can be applied immediately.\n\n22 additional security updates can be applied with ESM Apps.\n";
+        assert_eq!(parse_updates_available(here), Some((0, Some(0))),
+                   "the ESM advertisement is not a count of waiting updates");
+        let some = "14 updates can be applied immediately.\n9 of these updates are standard security updates.\n";
+        assert_eq!(parse_updates_available(some), Some((14, Some(9))));
+        assert_eq!(parse_updates_available("3 updates can be applied immediately.\n"), Some((3, None)));
+        assert_eq!(parse_updates_available("nothing useful"), None);
+    }
+
+    #[test]
+    fn the_checkup_reports_each_setting_or_admits_it_cannot() {
+        let d = tree("checks");
+        let by = |x: &Ctx, id: &str| x.snap.security.checks.iter().find(|c| c.id == id).cloned();
+        let mut c = SecurityCollector::with_roots(&d);
+        let mut x = ctx();
+        c.collect(&mut x).unwrap();
+        assert_eq!(by(&x, "firewall").unwrap().status, "unknown");
+        assert_eq!(by(&x, "auto_updates").unwrap().status, "unknown");
+        assert!(by(&x, "updates").is_none() && by(&x, "restart").is_none()
+                && by(&x, "disk_encryption").is_none() && by(&x, "secure_boot").is_none(),
+                "a check with no source is left out, not guessed");
+        // sshd on 0.0.0.0 was there at first run: reachable, but expected.
+        assert_eq!(by(&x, "exposure").unwrap().status, "note");
+        assert_eq!(x.snap.security.checks_failing, 0);
+
+        std::fs::write(d.join("etc/ufw/ufw.conf"), "ENABLED=no\n").unwrap();
+        std::fs::create_dir_all(d.join("etc/apt/apt.conf.d")).unwrap();
+        std::fs::write(d.join("etc/apt/apt.conf.d/20auto-upgrades"),
+                       "APT::Periodic::Unattended-Upgrade \"0\";\n").unwrap();
+        std::fs::create_dir_all(d.join("var/lib/update-notifier")).unwrap();
+        std::fs::write(d.join("var/lib/update-notifier/updates-available"),
+                       "5 updates can be applied immediately.\n2 of these updates are standard security updates.\n").unwrap();
+        std::fs::create_dir_all(d.join("run")).unwrap();
+        std::fs::write(d.join("run/reboot-required"), "").unwrap();
+        std::fs::write(d.join("run/reboot-required.pkgs"), "linux-image-7.0.0-44-generic\n").unwrap();
+        c.collect(&mut x).unwrap();
+        let fw = by(&x, "firewall").unwrap();
+        assert_eq!((fw.status.as_str(), fw.fix.as_str()), ("warn", "sudo ufw enable"));
+        assert_eq!(by(&x, "auto_updates").unwrap().status, "warn");
+        assert!(by(&x, "updates").unwrap().title.starts_with("2 security"));
+        assert!(by(&x, "restart").unwrap().detail.contains("linux-image"));
+        assert_eq!(x.snap.security.checks_failing, 4);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn disk_encryption_is_followed_through_device_mapper() {
+        let d = tree("crypt");
+        let block = d.join("sys/class/block");
+        // Plain partition.
+        std::fs::create_dir_all(block.join("nvme0n1p7")).unwrap();
+        // LVM volume (dm-1) on a LUKS container (dm-0).
+        std::fs::create_dir_all(block.join("dm-0/dm")).unwrap();
+        std::fs::write(block.join("dm-0/dm/uuid"), "CRYPT-LUKS2-abc-nvme0n1p3_crypt\n").unwrap();
+        std::fs::create_dir_all(block.join("dm-1/dm")).unwrap();
+        std::fs::write(block.join("dm-1/dm/uuid"), "LVM-xyz\n").unwrap();
+        std::fs::create_dir_all(block.join("dm-1/slaves/dm-0")).unwrap();
+        let c = SecurityCollector::with_roots(&d);
+        assert!(!c.encrypted("nvme0n1p7", 0));
+        assert!(c.encrypted("dm-0", 0));
+        assert!(c.encrypted("dm-1", 0), "LVM on LUKS is encrypted");
+        assert!(!c.encrypted("missing", 0));
+
+        std::fs::create_dir_all(d.join("proc/self")).unwrap();
+        std::fs::write(d.join("proc/self/mountinfo"),
+            "25 1 259:7 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p7 rw\n30 25 0:26 / /sys rw - sysfs sysfs rw\n").unwrap();
+        assert_eq!(c.root_device().as_deref(), Some("nvme0n1p7"));
+        std::fs::create_dir_all(d.join("sys/firmware/efi/efivars")).unwrap();
+        std::fs::write(d.join("sys/firmware/efi/efivars/SecureBoot-8be4df61"), [6u8, 0, 0, 0, 1]).unwrap();
+        let mut c = SecurityCollector::with_roots(&d);
+        let mut x = ctx();
+        c.collect(&mut x).unwrap();
+        let get = |id: &str| x.snap.security.checks.iter().find(|c| c.id == id).unwrap().status.clone();
+        assert_eq!(get("disk_encryption"), "note", "not simply fixable, so not a failing check");
+        assert_eq!(get("secure_boot"), "ok");
         std::fs::remove_dir_all(&d).ok();
     }
 

@@ -155,7 +155,7 @@ that collector and nothing else.
 | Hotplug add/remove | `NETLINK_KOBJECT_UEVENT` group 1 | netlink socket | — | **event** | — | libudev-format messages skipped, not mis-parsed |
 | Expected-device list | learned over 10 consecutive slow ticks | in-memory set | — | derived | — | One-off plug-ins never become "expected" |
 
-## Security — collector `security`, slow tier
+## Security — collector `security`, medium tier
 
 Detection only. Nothing is blocked and no packet is read; see
 [privilege-model.md](privilege-model.md).
@@ -170,6 +170,20 @@ Detection only. Nothing is blocked and no packet is read; see
 | Firewall on/off | `ENABLED=` in `/etc/ufw/ufw.conf`; `/run/firewalld.pid` | none | **the rules are root-only and are not read.** With neither tool present the state is `unknown`, never "off" |
 | Failed sign-ins | a second `journalctl --follow` restricted to sshd, sudo, su, login, polkitd, gdm | `adm` or `systemd-journal` | informational priority, which the main follower excludes. sshd is counted from its own lines and every other service from `pam_unix`, so one attempt is one count |
 
+**The checkup.** A short list of settings, each `ok`, `warn` (with the one command
+that fixes it), `note` (worth knowing, not simply fixable) or `unknown`. A check
+whose source file is absent is left out or marked unknown, never assumed.
+
+| Check | Source | `warn` when |
+|---|---|---|
+| Firewall | as above | switched off |
+| Exposure | the listener table | a network-facing listener is new and unaccepted (`note` if all are expected) |
+| Automatic security updates | `APT::Periodic::Unattended-Upgrade` in `/etc/apt/apt.conf.d/*` | set to `0` |
+| Updates waiting | `/var/lib/update-notifier/updates-available` | any is a security update. The "ESM Apps" advertisement in that file is not counted |
+| Restart needed | `/run/reboot-required` | present |
+| Disk encryption | device mounted at `/`, followed through device-mapper `slaves` for a `CRYPT-` uuid | never: unencrypted is a `note`, since it can only be chosen at install time |
+| Secure Boot | byte 5 of the `SecureBoot-*` EFI variable | never: off is a `note`, changed in firmware setup |
+
 The baseline of expected network-facing listeners is learned once, at first run, into
 `~/.local/share/jamsys/known-listeners.json`, and extended only by the user accepting
 a listener (`[security] accepted_listeners` in `config.toml`). It is deliberately not
@@ -177,7 +191,7 @@ re-learned on restart. Ports from 32768 up are treated as one identity per progr
 since applications pick a different one each launch.
 
 Not seen: firewall rules; which process owns another user's socket; a socket that
-opens and closes between two samples (60 s, or 180 s while idle on battery);
+opens and closes between two samples (10 s, or 30 s while idle on battery);
 outbound connections per process; anything about traffic contents.
 
 ## Services and journal

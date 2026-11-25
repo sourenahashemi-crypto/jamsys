@@ -123,6 +123,52 @@ class ChargeLimitControl:
         return True
 
 
+class FirewallControl:
+    """Switches the system firewall (`ufw`) on or off.
+
+    There is no JamSys helper for this, and deliberately so: the two commands
+    take no input at all, so there is nothing for a helper to validate. They are
+    fixed argument vectors handed to pkexec, which asks for an administrator
+    password each time. This process never gains privilege, and nothing a user
+    or a file supplies ever reaches the command line.
+    """
+
+    UFW = "/usr/sbin/ufw"
+    #: `--force` only suppresses ufw's "may disrupt existing ssh connections"
+    #: question, which cannot be answered through pkexec.
+    COMMANDS = {True: ("--force", "enable"), False: ("disable",)}
+
+    def __init__(self):
+        self.last_error: Optional[str] = None
+
+    def available(self) -> bool:
+        return _executable(self.UFW) and any(
+            _executable(os.path.join(d, "pkexec"))
+            for d in os.environ.get("PATH", "/usr/bin").split(os.pathsep) if d)
+
+    def argv(self, on: bool) -> list[str]:
+        return ["pkexec", self.UFW, *self.COMMANDS[bool(on)]]
+
+    def set_enabled(self, on: bool) -> bool:
+        self.last_error = None
+        if not self.available():
+            self.last_error = ("ufw or pkexec is not installed -- run it yourself: "
+                               f"sudo ufw {'enable' if on else 'disable'}")
+            return False
+        try:
+            r = subprocess.run(self.argv(on), capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            self.last_error = str(e)
+            return False
+        if r.returncode != 0:
+            if r.returncode in (126, 127):
+                self.last_error = "Authorisation was declined"
+            else:
+                self.last_error = (r.stderr or r.stdout or "").strip() or f"exit {r.returncode}"
+            return False
+        return True
+
+
 class KeyboardControl:
     """Invokes the privileged helper. Nothing here builds a shell command."""
 

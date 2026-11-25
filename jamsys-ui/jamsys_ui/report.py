@@ -92,6 +92,13 @@ def summarise(snapshot: dict, alerts: list[dict], coverage: list[dict],
     # Things that are not alerts but will bite: known-bad configuration the
     # collectors noticed in passing.
     risks: list[str] = list((snap.get("bluetooth") or {}).get("risk_notes") or [])
+    # Security settings worth changing are exactly what this section is for.
+    for c in (snap.get("security") or {}).get("checks") or []:
+        if isinstance(c, dict) and c.get("status") == "warn":
+            note = f"{c.get('title', '')}. {c.get('detail', '')}".strip()
+            if c.get("fix"):
+                note += f"  Fix: {c['fix']}"
+            risks.append(note)
 
     # Anything the daemon cannot see is part of the picture: an absent sensor
     # explains a missing alert as much as a present one explains a firing alert.
