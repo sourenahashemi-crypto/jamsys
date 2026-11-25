@@ -155,14 +155,14 @@ that collector and nothing else.
 | Hotplug add/remove | `NETLINK_KOBJECT_UEVENT` group 1 | netlink socket | — | **event** | — | libudev-format messages skipped, not mis-parsed |
 | Expected-device list | learned over 10 consecutive slow ticks | in-memory set | — | derived | — | One-off plug-ins never become "expected" |
 
-## Security — collector `security`, medium tier
+## Security — collector `security`, medium tier, 0.7 ms/run measured
 
 Detection only. Nothing is blocked and no packet is read; see
 [privilege-model.md](privilege-model.md).
 
 | Reading | Source | Privilege | Notes |
 |---|---|---|---|
-| Listening TCP sockets | `/proc/net/tcp`, `/proc/net/tcp6`, state `0A` | none | local address, port, owning uid, inode |
+| Listening TCP sockets | `sock_diag` netlink with a LISTEN state filter; `/proc/net/tcp{,6}` (state `0A`) as the fallback | none | local address, port, owning uid, inode. Reading `/proc/net/tcp` makes the kernel walk every TCP socket and cost 5.5 ms per sample here; the filtered query costs 0.7 ms and a test holds the two sources equal |
 | Waiting UDP sockets | `/proc/net/udp`, `/proc/net/udp6`, no remote end | none | listed, never alerted on |
 | Exposure | the bound address | none | loopback / all interfaces / one address; `::ffff:127.0.0.1` counts as loopback |
 | Owning account | uid → `/etc/passwd` | none | |

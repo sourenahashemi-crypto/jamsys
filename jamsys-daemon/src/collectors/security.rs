@@ -213,6 +213,106 @@ pub fn parse_proc_net(text: &str, tcp: bool) -> Vec<RawSocket> {
     out
 }
 
+/// Listening TCP sockets of one address family, asked of the kernel directly.
+///
+/// `/proc/net/tcp` answers the same question by formatting *every* TCP socket
+/// as text, which means walking the whole established-connection hash table: a
+/// fixed cost of about a millisecond per file on this machine however few
+/// sockets exist, measured at 5 ms per sample inside the daemon. `sock_diag`
+/// takes a state filter, so the kernel visits only the listening sockets.
+///
+/// `None` means "could not ask" (no netlink, a seccomp filter, an old kernel);
+/// the caller falls back to /proc. Never blocks: the socket has a receive
+/// timeout, because this runs on the daemon's only thread.
+pub fn listening_tcp_via_diag(family: u8) -> Option<Vec<RawSocket>> {
+    const NETLINK_SOCK_DIAG: libc::c_int = 4;
+    const SOCK_DIAG_BY_FAMILY: u16 = 20;
+    const NLM_F_REQUEST_DUMP: u16 = 0x1 | 0x300;
+    const NLMSG_ERROR: u16 = 2;
+    const NLMSG_DONE: u16 = 3;
+    const TCP_LISTEN: u32 = 10;
+
+    // SAFETY: plain socket creation; the descriptor is closed on every path below.
+    let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, NETLINK_SOCK_DIAG) };
+    if fd < 0 {
+        return None;
+    }
+    struct Close(libc::c_int);
+    impl Drop for Close {
+        fn drop(&mut self) {
+            // SAFETY: we own this descriptor.
+            unsafe { libc::close(self.0) };
+        }
+    }
+    let _guard = Close(fd);
+    let tv = libc::timeval { tv_sec: 0, tv_usec: 200_000 };
+    // SAFETY: `tv` is a valid timeval of the size passed.
+    unsafe {
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO,
+                         &tv as *const _ as *const libc::c_void,
+                         std::mem::size_of::<libc::timeval>() as libc::socklen_t);
+    }
+
+    // nlmsghdr (16) + inet_diag_req_v2 (56).
+    let mut req = [0u8; 72];
+    req[0..4].copy_from_slice(&72u32.to_ne_bytes());
+    req[4..6].copy_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
+    req[6..8].copy_from_slice(&NLM_F_REQUEST_DUMP.to_ne_bytes());
+    req[8..12].copy_from_slice(&1u32.to_ne_bytes());
+    req[16] = family;
+    req[17] = libc::IPPROTO_TCP as u8;
+    req[20..24].copy_from_slice(&(1u32 << TCP_LISTEN).to_ne_bytes());
+    // SAFETY: sending a fully initialised buffer of the stated length.
+    if unsafe { libc::send(fd, req.as_ptr() as *const libc::c_void, req.len(), 0) } != 72 {
+        return None;
+    }
+
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 32 * 1024];
+    loop {
+        // SAFETY: receiving into a buffer of the stated length.
+        let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+        if n <= 0 {
+            return None; // timeout or error: do not report a partial table
+        }
+        let data = &buf[..n as usize];
+        let mut off = 0usize;
+        while off + 16 <= data.len() {
+            let len = u32::from_ne_bytes(data[off..off + 4].try_into().ok()?) as usize;
+            let kind = u16::from_ne_bytes(data[off + 4..off + 6].try_into().ok()?);
+            if len < 16 || off + len > data.len() {
+                return None;
+            }
+            match kind {
+                NLMSG_DONE => return Some(out),
+                NLMSG_ERROR => return None,
+                _ => {
+                    // inet_diag_msg: family, state, timer, retrans, then the
+                    // socket id (ports big-endian, addresses in network order),
+                    // then expires, rqueue, wqueue, uid, inode.
+                    let m = &data[off + 16..off + len];
+                    if m.len() >= 72 {
+                        let port = u16::from_be_bytes([m[4], m[5]]);
+                        let addr = if m[0] == libc::AF_INET as u8 {
+                            IpAddr::V4(Ipv4Addr::new(m[8], m[9], m[10], m[11]))
+                        } else {
+                            let mut a = [0u8; 16];
+                            a.copy_from_slice(&m[8..24]);
+                            IpAddr::V6(Ipv6Addr::from(a))
+                        };
+                        let uid = u32::from_ne_bytes(m[64..68].try_into().ok()?);
+                        let inode = u32::from_ne_bytes(m[68..72].try_into().ok()?) as u64;
+                        if port != 0 {
+                            out.push(RawSocket { addr, port, uid, inode });
+                        }
+                    }
+                }
+            }
+            off += (len + 3) & !3;
+        }
+    }
+}
+
 /// Who can reach a socket bound to `addr`.
 pub fn exposure_of(addr: &IpAddr) -> &'static str {
     let v4 = match addr {
@@ -325,13 +425,20 @@ pub struct SecurityCollector {
     baseline_file: PathBuf,
     /// Keys present at first run. `None` until loaded or learned.
     baseline: Option<BTreeSet<String>>,
-    /// inode -> (pid, name), for the user's own sockets.
-    owners: HashMap<u64, (i32, String)>,
+    /// inode -> (pid, name), for the user's own sockets. `None` records an inode
+    /// that was looked for and not found (a process in another namespace, or one
+    /// that exited mid-scan), so that it is not looked for again on every sample.
+    owners: HashMap<u64, Option<(i32, String)>>,
     users: HashMap<u32, String>,
     failures: Vec<AuthFailure>,
     /// Keys of TCP listeners on the previous pass, for open/close events.
     prev: Option<BTreeMap<String, String>>,
     auth_seen: bool,
+    /// The slow-changing half of the checkup, and when it was read.
+    settings: Vec<Check>,
+    settings_at: i64,
+    /// Ask the kernel over sock_diag rather than reading /proc/net/tcp.
+    use_diag: bool,
 }
 
 impl SecurityCollector {
@@ -351,6 +458,9 @@ impl SecurityCollector {
             failures: Vec::new(),
             prev: None,
             auth_seen: false,
+            settings: Vec::new(),
+            settings_at: 0,
+            use_diag: true,
         }
     }
 
@@ -365,6 +475,7 @@ impl SecurityCollector {
             sys_root: root.join("sys"),
             var: root.join("var"),
             baseline_file: root.join("known-listeners.json"),
+            use_diag: false,
             ..Self::new()
         }
     }
@@ -409,17 +520,32 @@ impl SecurityCollector {
                 if missing.contains(&ino) && !self.owners.contains_key(&ino) {
                     let name = read_str(self.proc_root.join(&entry).join("comm"))
                         .unwrap_or_else(|| format!("pid {pid}"));
-                    self.owners.insert(ino, (pid, name));
+                    self.owners.insert(ino, Some((pid, name)));
                 }
             }
+        }
+        for ino in missing {
+            self.owners.entry(ino).or_insert(None);
         }
     }
 
     fn listeners(&mut self) -> Option<Vec<Listener>> {
         let mut raw: Vec<(&'static str, RawSocket)> = Vec::new();
         let mut any = false;
-        for (file, proto, tcp) in [("tcp", "tcp", true), ("tcp6", "tcp", true),
-                                   ("udp", "udp", false), ("udp6", "udp", false)] {
+        for (file, proto, tcp, family) in [
+            ("tcp", "tcp", true, libc::AF_INET as u8), ("tcp6", "tcp", true, libc::AF_INET6 as u8),
+            ("udp", "udp", false, 0), ("udp6", "udp", false, 0),
+        ] {
+            // TCP from sock_diag when the real /proc is in use (a test tree has
+            // no kernel behind it); /proc text otherwise, and always for UDP,
+            // whose table is small and has no state to filter on.
+            if tcp && self.use_diag && self.proc_net.join(file).exists() {
+                if let Some(socks) = listening_tcp_via_diag(family) {
+                    any = true;
+                    raw.extend(socks.into_iter().map(|s| (proto, s)));
+                    continue;
+                }
+            }
             if let Ok(text) = std::fs::read_to_string(self.proc_net.join(file)) {
                 any = true;
                 raw.extend(parse_proc_net(&text, tcp).into_iter().map(|s| (proto, s)));
@@ -429,8 +555,13 @@ impl SecurityCollector {
             return None;
         }
         let my_uid = unsafe { libc::getuid() };
-        let mine: BTreeSet<u64> =
-            raw.iter().filter(|(_, s)| s.uid == my_uid).map(|(_, s)| s.inode).collect();
+        // TCP only. Naming the owner means walking every /proc/<pid>/fd, which is
+        // affordable when a listener appears and not when it is repeated every
+        // sample: browsers open and close UDP sockets constantly, so including
+        // them made nearly every run a full scan.
+        let mine: BTreeSet<u64> = raw.iter()
+            .filter(|(proto, s)| *proto == "tcp" && s.uid == my_uid)
+            .map(|(_, s)| s.inode).collect();
         self.resolve_owners(&mine);
 
         // One row per (protocol, port, exposure, owner): a service bound to both
@@ -438,7 +569,7 @@ impl SecurityCollector {
         let mut merged: BTreeMap<(String, u16, String, String), Listener> = BTreeMap::new();
         for (proto, s) in raw {
             let owner = self.user_name(s.uid);
-            let who = self.owners.get(&s.inode).cloned();
+            let who = self.owners.get(&s.inode).cloned().flatten();
             let name = who.as_ref().map(|w| w.1.clone()).unwrap_or_else(|| owner.clone());
             let exposure = exposure_of(&s.addr).to_string();
             let l = merged
@@ -522,7 +653,8 @@ impl SecurityCollector {
 
     /// The checkup. Every line is something read from a file anyone may read;
     /// where the file is missing the answer is "unknown", never a guess.
-    fn checks(&self, fw: &FirewallState, exposed: &[&Listener], unexpected: usize) -> Vec<Check> {
+    fn checks(&mut self, fw: &FirewallState, exposed: &[&Listener], unexpected: usize,
+              now_ms: i64) -> Vec<Check> {
         let mut out = Vec::new();
 
         out.push(match fw.state.as_str() {
@@ -546,6 +678,18 @@ impl SecurityCollector {
                   "")
         });
 
+        // The rest are settings that change when an administrator changes them,
+        // read from a few dozen small files. Once a minute is plenty.
+        if self.settings_at == 0 || !(0..60_000).contains(&(now_ms - self.settings_at)) {
+            self.settings = self.setting_checks();
+            self.settings_at = now_ms;
+        }
+        out.extend(self.settings.iter().cloned());
+        out
+    }
+
+    fn setting_checks(&self) -> Vec<Check> {
+        let mut out = Vec::new();
         let apt = self.etc.join("apt/apt.conf.d");
         let auto = list_dir(&apt).iter()
             .filter_map(|f| read_str(apt.join(f)))
@@ -726,7 +870,7 @@ impl Collector for SecurityCollector {
         let checks = {
             let exposed: Vec<&Listener> =
                 listeners.iter().filter(|l| l.proto == "tcp" && l.exposed()).collect();
-            self.checks(&firewall, &exposed, unexpected.len())
+            self.checks(&firewall, &exposed, unexpected.len(), ctx.ts_ms)
         };
         let st = SecurityState {
             exposed_tcp: listeners.iter().filter(|l| l.proto == "tcp" && l.exposed()).count(),
@@ -1054,6 +1198,11 @@ mod tests {
         std::fs::write(d.join("run/reboot-required"), "").unwrap();
         std::fs::write(d.join("run/reboot-required.pkgs"), "linux-image-7.0.0-44-generic\n").unwrap();
         c.collect(&mut x).unwrap();
+        assert_eq!(by(&x, "firewall").unwrap().status, "warn", "the firewall is re-read every time");
+        assert_eq!(by(&x, "auto_updates").unwrap().status, "unknown",
+                   "slow-changing settings are re-read once a minute, not every sample");
+        x.ts_ms += 61_000;
+        c.collect(&mut x).unwrap();
         let fw = by(&x, "firewall").unwrap();
         assert_eq!((fw.status.as_str(), fw.fix.as_str()), ("warn", "sudo ufw enable"));
         assert_eq!(by(&x, "auto_updates").unwrap().status, "warn");
@@ -1094,6 +1243,25 @@ mod tests {
         assert_eq!(get("disk_encryption"), "note", "not simply fixable, so not a failing check");
         assert_eq!(get("secure_boot"), "ok");
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn sock_diag_and_proc_agree_about_what_is_listening() {
+        // The two sources must describe the same sockets, or switching between
+        // them (the fallback) would look like listeners appearing and vanishing.
+        // Runs against this machine's real tables.
+        for (family, file) in [(libc::AF_INET as u8, "/proc/net/tcp"), (libc::AF_INET6 as u8, "/proc/net/tcp6")] {
+            let Ok(text) = std::fs::read_to_string(file) else { continue };
+            let Some(mut diag) = listening_tcp_via_diag(family) else {
+                eprintln!("sock_diag unavailable here; skipping {file}");
+                continue;
+            };
+            let mut procfs = parse_proc_net(&text, true);
+            let key = |s: &RawSocket| (s.addr, s.port, s.uid, s.inode);
+            diag.sort_by_key(key);
+            procfs.sort_by_key(key);
+            assert_eq!(diag, procfs, "{file}");
+        }
     }
 
     #[test]
