@@ -509,6 +509,11 @@ class MetricCard(Gtk.Button):
 
     def update(self, value: str, sub: str = "", normal: str = "",
                status: str = "healthy", status_text: str = "") -> None:
+        # Undo set_unavailable(): a card that was dimmed once (no filesystems in
+        # the very first snapshot, say) otherwise stays grey with no sparkline for
+        # the life of the window, looking unmonitored while showing live values.
+        self.remove_css_class("dim-label")
+        self.spark.set_visible(True)
         self._value.set_text(value)
         self._sub.set_text(sub)
         self._range.set_text(normal)

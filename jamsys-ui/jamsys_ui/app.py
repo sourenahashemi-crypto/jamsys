@@ -24,8 +24,7 @@ from . import report
 from .processes import select_processes
 from .client import Client, DaemonError, run_async
 from .hardware import (CHARGE_LIMITS, MODES, PRESETS, SPEEDS, ChargeLimitControl,
-                       KeyboardControl, helper_path,
-                       ints_to_rgba, rgba_to_ints)
+                       KeyboardControl, ints_to_rgba, repo_script, rgba_to_ints)
 from .format import (SEVERITY, clock_hm, human_ago, human_bps, human_bytes,
                      human_duration, pct, temp, watts)
 from .widgets import (CSS, CoreMatrix, MetricCard, Sparkline, StatusPill,
@@ -77,6 +76,44 @@ def _has_open_popover(widget) -> bool:
     return False
 
 
+def _walk(widget):
+    """Every descendant of `widget`, depth first."""
+    child = widget.get_first_child()
+    while child is not None:
+        yield child
+        yield from _walk(child)
+        child = child.get_next_sibling()
+
+
+def _expanded_titles(widget) -> set:
+    """Titles of the expander rows the user currently has open under `widget`."""
+    return {w.get_title() for w in _walk(widget)
+            if isinstance(w, Adw.ExpanderRow) and w.get_expanded()}
+
+
+def _reexpand(widget, titles: set) -> None:
+    """Open the rows that were open before a rebuild, without replaying the slide.
+
+    A rebuilt row is a new widget, so setting it expanded would animate it open
+    again on every refresh -- the explanation the user is reading would collapse
+    and slide back every two seconds. Animations are switched off for the
+    duration of the call, which makes the revealer jump straight to its end state.
+    """
+    if not titles:
+        return
+    settings = Gtk.Settings.get_default()
+    animated = settings.get_property("gtk-enable-animations") if settings else False
+    if animated:
+        settings.set_property("gtk-enable-animations", False)
+    try:
+        for w in _walk(widget):
+            if isinstance(w, Adw.ExpanderRow) and w.get_title() in titles:
+                w.set_expanded(True)
+    finally:
+        if animated:
+            settings.set_property("gtk-enable-animations", True)
+
+
 class Page(Gtk.Box):
     """Base for every detail page. Subclasses implement `render`."""
 
@@ -120,10 +157,19 @@ class Page(Gtk.Box):
         """
         if self.is_interacting():
             return
-        adj = self._scroller.get_vadjustment() if self._scroller else None
-        pos = adj.get_value() if adj else 0.0
+        state = self.view_state()
         self.render(snap)
-        if adj and pos > 0.0:
+        self.restore_view_state(state)
+
+    def view_state(self):
+        """What a rebuild would otherwise throw away: scroll offset and open rows."""
+        adj = self._scroller.get_vadjustment() if self._scroller else None
+        return (adj.get_value() if adj else 0.0, _expanded_titles(self.body))
+
+    def restore_view_state(self, state) -> None:
+        pos, expanded = state
+        _reexpand(self.body, expanded)
+        if pos > 0.0:
             # After the rebuild the new children have not been allocated yet,
             # so upper/page_size are still stale; restoring on idle waits for
             # the layout that makes the clamp meaningful.
@@ -146,11 +192,29 @@ class Page(Gtk.Box):
         return bool(focus and focus.is_ancestor(self)
                     and isinstance(focus, (Gtk.Entry, Gtk.SearchEntry, Gtk.Text)))
 
+    def show_render_error(self, err: Exception) -> None:
+        """Say that the page failed, on the page.
+
+        A render that raises used to be printed to a terminal nobody was looking
+        at, leaving a half-built page that read as "nothing to report here".
+        """
+        self.clear()
+        g = self.group("This page could not be drawn",
+                       "The readings arrived but JamSys failed to display them. "
+                       "The other pages are unaffected. Running "
+                       "`jamsys --json snapshot` shows the raw data, and the "
+                       "error below is what to include in a bug report.")
+        g.add(self.row(type(err).__name__, "", str(err)))
+        self.body.append(g)
+
     # -- small helpers used by every page --------------------------------
 
     @staticmethod
     def group(title: str, description: str = "") -> Adw.PreferencesGroup:
-        return Adw.PreferencesGroup(title=title, description=description)
+        # Both are parsed as Pango markup, like row titles. A drive model or an
+        # interface name with an ampersand in it otherwise blanks the heading.
+        return Adw.PreferencesGroup(title=GLib.markup_escape_text(title),
+                                    description=GLib.markup_escape_text(description))
 
     @staticmethod
     def row(title: str, value: str, subtitle: str = "") -> Adw.ActionRow:
@@ -171,11 +235,132 @@ class Page(Gtk.Box):
         return r
 
     def clear(self) -> None:
-        child = self.body.get_first_child()
+        self._empty(self.body)
+
+    @staticmethod
+    def _empty(box) -> None:
+        child = box.get_first_child()
         while child is not None:
             nxt = child.get_next_sibling()
-            self.body.remove(child)
+            box.remove(child)
             child = nxt
+
+
+class AsyncPage(Page):
+    """A page whose content needs its own round trip to the daemon.
+
+    These pages used to clear themselves and then fill in when the reply
+    arrived, on every two-second refresh. Three things followed from that: the
+    page blinked empty each tick; the scroll offset was restored while the page
+    was still empty, so it snapped to the top and a long event list could not be
+    read past the first screen; and any row the user had expanded was collapsed
+    again before they finished reading it.
+
+    So the order is reversed: fetch first, and only touch the widgets once the
+    reply is in hand -- and not even then if nothing the page shows has changed.
+    """
+
+    #: Seconds a page may go without a rebuild when only volatile figures
+    #: (run counters, uptime) moved. None means "rebuild only on real change".
+    max_age: Optional[float] = None
+
+    def __init__(self, win: "MainWindow"):
+        super().__init__(win)
+        self.area = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        self.body.append(self.area)
+        self._pending = False
+        self._shown = None
+        self._built_at = 0.0
+        self._wanted = None
+
+    # -- for subclasses ----------------------------------------------------
+
+    def request(self):
+        """Hashable description of what to fetch (a filter, say). Main thread."""
+        return None
+
+    def fetch(self, request):
+        """Worker thread. Returns the data `build` needs; may raise DaemonError."""
+        raise NotImplementedError
+
+    def build(self, data) -> None:
+        """Main thread. `self.area` is empty; fill it."""
+        raise NotImplementedError
+
+    def identity(self, data):
+        """The part of `data` whose change is worth a rebuild."""
+        return data
+
+    # -- machinery -----------------------------------------------------------
+
+    def render(self, snap: dict) -> None:
+        self.reload()
+
+    def reload(self, force: bool = False) -> None:
+        req = self.request()
+        if self._pending:
+            # Remember the newest request so a filter clicked mid-fetch is not lost.
+            self._wanted = (req, force)
+            return
+        if not self.win.client.connected:
+            if self._shown is None:
+                self._message("Waiting for the monitoring service",
+                              "This page fills in as soon as JamSys reconnects.")
+            return
+        if self._shown is None:
+            self._message("Loading…", "")
+        self._pending = True
+
+        def done(res, err):
+            self._pending = False
+            if getattr(self.win, "_closed", False):
+                return
+            wanted, self._wanted = self._wanted, None
+            if req == self.request():
+                self._deliver(req, res, err, force)
+            if wanted is not None and (wanted[0] != req or wanted[1]):
+                self.reload(force=wanted[1])
+
+        run_async(lambda: self.fetch(req), done)
+
+    def _deliver(self, req, res, err, force: bool) -> None:
+        if err is not None or res is None:
+            # Keep what is on screen: stale readings beat an error box, and the
+            # window-wide banner already says the service is unreachable.
+            if self._shown is None or self._shown[0] != req:
+                self._message("Could not load this page", str(err))
+                self._shown = None
+            return
+        key = (req, self.identity(res))
+        age = time.monotonic() - self._built_at
+        fresh = self.max_age is None or age < self.max_age
+        if not force and key == self._shown and fresh:
+            return
+        # A rebuild for a new request is the user's own doing; one for new data
+        # must wait until they have let go of whatever they are holding.
+        same_request = self._shown is not None and self._shown[0] == req
+        if not force and same_request and self.is_interacting():
+            return
+        state = self.view_state()
+        self._empty(self.area)
+        try:
+            self.build(res)
+        except Exception as e:  # noqa: BLE001 -- a render bug must not kill the UI
+            print(f"[jamsys-ui] render error on {self.title}: {e!r}", file=sys.stderr)
+            self._message("This page could not be drawn",
+                          f"{type(e).__name__}: {e}")
+            self._shown = None
+            return
+        self._shown = key
+        self._built_at = time.monotonic()
+        if same_request:
+            self.restore_view_state(state)
+        else:
+            self._scroller.get_vadjustment().set_value(0)
+
+    def _message(self, title: str, detail: str) -> None:
+        self._empty(self.area)
+        self.area.append(self.group(title, detail))
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +424,7 @@ class OverviewPage(Page):
         self.events_group = self.group("Recent events and alerts")
         self.body.append(self.events_group)
         self._event_rows: list = []
+        self._events_shown = None
         # Sparklines are refreshed on a much slower cadence than the numbers. Eight
         # history queries every two seconds would be pointless work for a 60-pixel
         # strip whose shape barely changes between ticks.
@@ -519,6 +705,23 @@ class OverviewPage(Page):
                 "healthy", "Normal")
 
     def set_events(self, items: list[dict]) -> None:
+        """Replace the event list -- unless that would only get in the way.
+
+        This runs on every refresh, outside Page.update(), so it needs the same
+        guards: rebuilding the rows closed an alert's open menu under the
+        pointer and collapsed the explanation being read, every two seconds.
+        Relative times ("3m ago") are the only thing that moves when the data
+        does not, so the minute is part of what counts as a change.
+        """
+        key = (items[:12], int(time.time() // 60))
+        if key == self._events_shown or self.is_interacting():
+            return
+        self._events_shown = key
+        expanded = _expanded_titles(self.events_group)
+        self._replace_events(items)
+        _reexpand(self.events_group, expanded)
+
+    def _replace_events(self, items: list[dict]) -> None:
         for r in self._event_rows:
             self.events_group.remove(r)
         self._event_rows.clear()
@@ -811,9 +1014,11 @@ class StoragePage(Page):
                     ng.add(self.row("Data written", human_bytes(duw * 512_000)))
             else:
                 r = Adw.ActionRow(title="SMART health data unavailable",
-                                  subtitle="/dev/nvme0 is root-only. Install the privileged helper to read "
-                                           "wear, spare blocks and media errors. Temperature above is read "
-                                           "unprivileged through hwmon and is unaffected.")
+                                  subtitle="The NVMe admin interface is root-only. Enable the optional "
+                                           "read-only helper to see wear, spare blocks and media errors:  "
+                                           "sudo systemctl enable --now jamsys-helper.timer   "
+                                           "Temperature above is read unprivileged through hwmon "
+                                           "and is unaffected.")
                 ic = Gtk.Image.new_from_icon_name("dialog-information-symbolic")
                 r.add_prefix(ic)
                 ng.add(r)
@@ -1036,22 +1241,6 @@ class ProcessPage(Page):
             g.add(row)
 
 
-def _repo_script(name: str) -> str:
-    """Absolute path to a script in the source checkout, if we can find one.
-
-    A relative `./scripts/...` is useless in a message: it only works from inside
-    the tree, and this text is read from a window that could have been launched
-    from anywhere.
-    """
-    import os
-    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    for base in (os.path.dirname(here), here):
-        cand = os.path.join(base, "scripts", name)
-        if os.path.isfile(cand):
-            return cand
-    return f"/path/to/jamsys/scripts/{name}"
-
-
 class HardwarePage(Page):
     """Hardware controls. Read-only monitoring is elsewhere; this page *changes* things,
     so every action here is explicit and reversible."""
@@ -1069,10 +1258,60 @@ class HardwarePage(Page):
         self._mode = 0
         self._speed = 1
         self._sent_anything = False
+        # kbd_rgb_state is write-only too. These start at the firmware's own
+        # default and then follow what was sent, so a switch the user turned on
+        # is not shown as off again by the next refresh.
+        self._states = {"boot": False, "awake": True, "sleep": False, "keyboard": True}
+        self._rendered_for = None
+        self._scale = self._brightness_row = None
+        self._scale_handler = 0
+        # One helper invocation per kind at a time, newest request wins.
+        self._sending: dict[str, bool] = {}
+        self._queued: dict[str, tuple] = {}
+
+    def _inputs(self, snap):
+        """Everything this page is built from, except the brightness reading.
+
+        The rest of the page is controls, and controls must not be rebuilt
+        while nothing they depend on has changed: the two-second refresh was
+        replacing the slider in the middle of a drag, discarding the colour
+        picker's button while its dialog was open, and resetting the
+        power-state switches to their defaults. Brightness is the one live
+        reading here and is updated in place instead.
+        """
+        s = snap.get("snapshot", {})
+        k = dict(s.get("keyboard", {}))
+        k.pop("brightness", None)
+        p = s.get("power", {})
+        return (sorted(k.items()), p.get("has_battery"),
+                p.get("charge_limit_supported"), p.get("charge_limit_pct"),
+                self.charge.available())
+
+    def update(self, snap):
+        if self._rendered_for is None or self._inputs(snap) != self._rendered_for:
+            super().update(snap)
+            return
+        self._show_brightness((snap.get("snapshot", {}).get("keyboard", {})
+                               .get("brightness", 0)))
+
+    def _show_brightness(self, level):
+        if self._brightness_row is None:
+            return
+        self._brightness_row.set_subtitle(f"currently {level}")
+        busy = self._sending.get("brightness") or "brightness" in self._queued
+        # Follow a change made elsewhere (the Fn key), but never pull the
+        # slider out from under a hand that is on it or a write still in flight.
+        if (not busy and not self._scale.has_focus()
+                and int(round(self._scale.get_value())) != int(level)):
+            self._scale.handler_block(self._scale_handler)
+            self._scale.set_value(float(level))
+            self._scale.handler_unblock(self._scale_handler)
 
     def render(self, snap):
         s = snap.get("snapshot", {})
         k = s.get("keyboard", {})
+        self._rendered_for = self._inputs(snap)
+        self._scale = self._brightness_row = None
         self.clear()
 
         # Battery care comes first: it is the control with a lasting effect, and it
@@ -1117,7 +1356,10 @@ class HardwarePage(Page):
         scale.set_sensitive(enabled)
         for i in range(maxb + 1):
             scale.add_mark(i, Gtk.PositionType.BOTTOM, str(i))
-        scale.connect("value-changed", self._on_brightness, control)
+        scale.update_property([Gtk.AccessibleProperty.LABEL],
+                              ["Keyboard backlight level"])
+        self._scale_handler = scale.connect("value-changed", self._on_brightness, control)
+        self._scale, self._brightness_row = scale, brow
         brow.add_suffix(scale)
         bg.add(brow)
         self.body.append(bg)
@@ -1125,6 +1367,8 @@ class HardwarePage(Page):
         if not k.get("rgb_capable"):
             self.body.append(self.group(
                 "Colour", "This keyboard has a backlight but no addressable RGB."))
+            if not enabled:
+                self.body.append(self._how_to_enable())
             return
 
         # -- colour -------------------------------------------------------
@@ -1177,12 +1421,14 @@ class HardwarePage(Page):
         if k.get("state_capable"):
             sg = self.group("When the keyboard is lit",
                             "Which power states keep the lighting on. Written together, "
-                            "in the kernel's field order: boot, awake, sleep, keyboard.")
+                            "in the kernel's field order: boot, awake, sleep, keyboard. "
+                            "The kernel cannot report these back, so the switches show "
+                            "what JamSys last set, or the firmware default.")
             self._state_switches = {}
             for key, title in [("boot", "During boot"), ("awake", "While awake"),
                                ("sleep", "While asleep"), ("keyboard", "Keyboard lighting")]:
                 r = Adw.SwitchRow(title=title)
-                r.set_active(key in ("awake", "keyboard"))
+                r.set_active(self._states[key])
                 r.set_sensitive(enabled)
                 r.connect("notify::active", self._on_state, control)
                 self._state_switches[key] = r
@@ -1213,22 +1459,28 @@ class HardwarePage(Page):
         if not installed:
             desc += ("\n\nThe privileged helper is not installed, so this is "
                      "read-only. Install it with:\n"
-                     "    sudo ./scripts/install-privileged.sh")
+                     f"    sudo {repo_script('install-privileged.sh')}")
         g = self.group("Battery care", desc)
 
         row = Adw.ActionRow(
             title="Charge limit",
             subtitle=("charging stops at this level"
                       if (current or 100) < 100 else "charging normally, to 100%"))
-        combo = Gtk.DropDown.new_from_strings([label for label, _ in CHARGE_LIMITS])
-        values = [v for _, v in CHARGE_LIMITS]
-        # Select the firmware's current value when it is one we offer; otherwise
-        # leave the list alone rather than silently misreporting it.
+        choices = list(CHARGE_LIMITS)
+        values = [v for _, v in choices]
+        # A limit set by another tool need not be one of ours. A dropdown always
+        # shows *something* selected, so without its own entry the firmware's 75
+        # would be displayed as the first item in the list, 60.
+        if isinstance(current, int) and current not in values:
+            choices.append((f"{current}%  (set elsewhere)", current))
+            values.append(current)
+        combo = Gtk.DropDown.new_from_strings([label for label, _ in choices])
         if current in values:
             combo.set_selected(values.index(current))
         combo.set_valign(Gtk.Align.CENTER)
         combo.set_sensitive(installed)
-        combo.connect("notify::selected", self._on_charge_limit, values)
+        combo.update_property([Gtk.AccessibleProperty.LABEL], ["Battery charge limit"])
+        combo.connect("notify::selected", self._on_charge_limit, values, current)
         row.add_suffix(combo)
         g.add(row)
 
@@ -1242,20 +1494,35 @@ class HardwarePage(Page):
                 "the battery neither charges nor discharges"))
         self.body.append(g)
 
-    def _on_charge_limit(self, combo, _param, values):
+    def _on_charge_limit(self, combo, _param, values, current):
         idx = combo.get_selected()
-        if idx < 0 or idx >= len(values):
+        if idx == Gtk.INVALID_LIST_POSITION or idx >= len(values):
             return
         want = values[idx]
-        if not self.charge.set_limit(want):
-            self.win.toasts.add_toast(Adw.Toast(
-                title=f"Charge limit: {self.charge.last_error or 'could not set it'}",
-                timeout=6))
+        if want == current:
             return
-        # The firmware is the source of truth, so say what was asked for and let the
-        # next snapshot report what actually took effect.
-        self.win.toasts.add_toast(Adw.Toast(title=f"Charge limit set to {want}%",
-                                            timeout=3))
+        combo.set_sensitive(False)
+
+        # pkexec blocks for as long as the password dialog is open. Run on the
+        # main thread, that froze the whole window behind the prompt.
+        def done(ok, err):
+            if getattr(self.win, "_closed", False):
+                return
+            if ok and not err:
+                # The firmware is the source of truth: say what was asked for and
+                # let the next snapshot report what actually took effect.
+                self.win.toasts.add_toast(Adw.Toast(
+                    title=f"Charge limit set to {want}%", timeout=3))
+            else:
+                self.win.toasts.add_toast(Adw.Toast(
+                    title=f"Charge limit: {err or self.charge.last_error or 'could not set it'}",
+                    timeout=6))
+            # Rebuild so the list shows the firmware's value again rather than a
+            # choice that was refused.
+            self._rendered_for = None
+            if self.win.current_page() is self:
+                self.update(self.win.last_snapshot or {})
+        run_async(lambda: self.charge.set_limit(want), done)
 
     def _control_description(self, control):
         if control == "helper":
@@ -1271,7 +1538,7 @@ class HardwarePage(Page):
         return ("The lighting attributes are root-only (kbd_rgb_mode is mode 0200) "
                 "and no write path is installed, so everything below is read-only.\n\n"
                 "Install the helper once — this is the whole fix:\n"
-                f"    sudo {_repo_script('install-privileged.sh')}\n"
+                f"    sudo {repo_script('install-privileged.sh')}\n"
                 "    systemctl --user restart jamsysd\n\n"
                 "It installs two small validated binaries and their Polkit actions. "
                 "Nothing runs as root afterwards.")
@@ -1303,22 +1570,51 @@ class HardwarePage(Page):
     # -- actions ----------------------------------------------------------
 
     def _apply(self, ok: bool, what: str):
+        if getattr(self.win, "_closed", False):
+            return
         if ok:
+            first = not self._sent_anything
             self._sent_anything = True
             self.win.toasts.add_toast(Adw.Toast(title=f"{what} applied", timeout=2))
+            if first:
+                # The colour note changes from "a default" to "what JamSys set".
+                self._rendered_for = None
         else:
             self.win.toasts.add_toast(
                 Adw.Toast(title=f"{what} failed: {self.kbd.last_error}", timeout=6))
 
+    def _send(self, kind: str, fn, what: str):
+        """Run one helper call per kind at a time; the newest request wins.
+
+        Dragging the slider from 0 to 3 emits 1, 2 and 3. Each used to start its
+        own pkexec, and whichever finished last decided the brightness -- not
+        necessarily the one the slider stopped on.
+        """
+        if self._sending.get(kind):
+            self._queued[kind] = (fn, what)
+            return
+        self._sending[kind] = True
+
+        def done(ok, err):
+            self._sending[kind] = False
+            nxt = self._queued.pop(kind, None)
+            if nxt is not None:
+                # Superseded: report only the request that is still wanted.
+                self._send(kind, *nxt)
+                return
+            self._apply(bool(ok) and not err, what)
+        run_async(fn, done)
+
     def _on_brightness(self, scale, control):
         v = int(round(scale.get_value()))
-        run_async(lambda: self.kbd.set_brightness(v, control),
-                  lambda ok, err: self._apply(bool(ok) and not err, f"Brightness {v}"))
+        self._send("brightness", lambda: self.kbd.set_brightness(v, control),
+                   f"Brightness {v}")
 
     def _push_rgb(self, control):
         r, g, b = self._colour
-        run_async(lambda: self.kbd.set_rgb(self._mode, r, g, b, self._speed, control),
-                  lambda ok, err: self._apply(bool(ok) and not err, "Lighting"))
+        mode, speed = self._mode, self._speed
+        self._send("rgb", lambda: self.kbd.set_rgb(mode, r, g, b, speed, control),
+                   "Lighting")
 
     def _on_colour(self, btn, _p, control):
         self._colour = rgba_to_ints(btn.get_rgba())
@@ -1337,11 +1633,12 @@ class HardwarePage(Page):
         self._push_rgb(control)
 
     def _on_state(self, _row, _p, control):
-        sw = self._state_switches
-        run_async(lambda: self.kbd.set_states(
-                      sw["boot"].get_active(), sw["awake"].get_active(),
-                      sw["sleep"].get_active(), sw["keyboard"].get_active(), control),
-                  lambda ok, err: self._apply(bool(ok) and not err, "Lighting states"))
+        for key, sw in self._state_switches.items():
+            self._states[key] = sw.get_active()
+        st = dict(self._states)
+        self._send("state", lambda: self.kbd.set_states(
+                       st["boot"], st["awake"], st["sleep"], st["keyboard"], control),
+                   "Lighting states")
 
 
 class ReportPage(Page):
@@ -1525,90 +1822,334 @@ class ReportPage(Page):
         dlg.save(self.win, None, finish)
 
 
-class DiagnosticsPage(Page):
+class DiagnosticsPage(AsyncPage):
     """What the monitoring application costs. A monitor that will not report its own
     overhead is asking to be taken on trust."""
 
     title, icon = "Diagnostics", "speedometer-symbolic"
 
-    def render(self, snap):
-        self.clear()
-        self._daemon = self.group(
+    def fetch(self, _request):
+        call = self.win.client.call
+        return call("stats"), call("ping")
+
+    def build(self, data):
+        d, ping = data
+        daemon_g = self.group(
             "Monitoring daemon",
             "Measured live from /proc/self. If these numbers look wrong, they are wrong "
             "about the thing you should trust least: this application.")
-        self.body.append(self._daemon)
-        self._store = self.group("History store")
-        self.body.append(self._store)
-        self._widget = self.group("GNOME Shell readout")
-        self.body.append(self._widget)
-        self._ui = self.group("This window")
-        self.body.append(self._ui)
-        self.win.load_diagnostics(self._daemon, self._store, self._widget, self._ui)
+        store_g = self.group("History store")
+        widget_g = self.group("GNOME Shell readout")
+        ui_g = self.group("This window")
+        for g in (daemon_g, store_g, widget_g, ui_g):
+            self.area.append(g)
+
+        up = max(d.get("uptime_s", 1), 1)
+        cpu = d.get("cpu_seconds", 0)
+        daemon_g.add(self.row("Version", ping.get("version", "?"),
+                              f"protocol {ping.get('schema')} · pid {ping.get('pid')}"))
+        daemon_g.add(self.row("Uptime", human_duration(up)))
+        daemon_g.add(self.row("CPU used", f"{cpu:.2f} s",
+                              f"{100*cpu/up:.3f}% of one core since start"))
+        daemon_g.add(self.row("Memory", human_bytes(d.get("rss_bytes", 0)),
+                              f"{d.get('threads', 0)} threads"))
+        daemon_g.add(self.row("Wakeups", f"{d.get('wakeups', 0):,}",
+                              f"{d.get('wakeups_per_s', 0):.2f} per second"))
+        daemon_g.add(self.row("Scheduler ticks", f"{d.get('ticks', 0):,}"))
+        frac = d.get("idle_tick_fraction", 0) or 0
+        blocked = d.get("idle_blocked_by") or ""
+        daemon_g.add(self.row("Reduced sampling",
+                              f"{100*frac:.0f}% of ticks",
+                              (f"currently off: {blocked}" if blocked
+                               else "currently active")))
+        daemon_g.add(self.row("Sampling rate",
+                              f"×{d.get('sampling_multiplier', 1):.0f} interval multiplier",
+                              "3× while idle on battery with no window open"))
+        daemon_g.add(self.row("Activity state", d.get("activity", "?"),
+                              f"baseline context: {d.get('context','?')}"))
+        daemon_g.add(self.row("Events processed", f"{d.get('events_processed', 0):,}",
+                              f"{d.get('events_dropped', 0):,} dropped"))
+        daemon_g.add(self.row("Notifications rate-limited",
+                              str(d.get("suppressed_notifications", 0))))
+
+        store_g.add(self.row("Database on disk", human_bytes(d.get("db_bytes", 0)),
+                             f"{d.get('sample_rows',0):,} ten-second samples · "
+                             f"{d.get('rollup_rows',0):,} rollups · "
+                             f"{d.get('event_rows',0):,} events"))
+        store_g.add(self.row("Full-resolution buffer",
+                             human_bytes(d.get("live_bytes", 0)),
+                             f"{d.get('live_points', 0):,} points held in memory only"))
+        store_g.add(self.row("Pending writes", str(d.get("samples_pending", 0)),
+                             "flushed in one transaction every 15 s"))
+        store_g.add(self.row("Learned baselines", f"{d.get('baselines', 0)} series"))
+
+        has = d.get("dbus_widget", False)
+        widget_g.add(self.row("D-Bus service",
+                              "org.jamsys.Daemon" if has else "unavailable",
+                              "" if has else "no session bus when the daemon started"))
+        widget_g.add(self.row("Repaints pushed", f"{d.get('dbus_signals', 0):,}",
+                              "only when a displayed value changed enough to matter"))
+        widget_g.add(self.row("Method calls served", f"{d.get('dbus_calls', 0):,}"))
+
+        ui_g.add(self.row("Memory", human_bytes(_self_rss()),
+                          "this window; the daemon keeps running when it closes"))
+        ui_g.add(self.row("IPC clients attached", str(d.get("ipc_clients", 0))))
 
 
-class EventsPage(Page):
+class EventsPage(AsyncPage):
     title, icon = "Events", "document-open-recent-symbolic"
+
+    FILTERS = [("All", "all"), ("Alerts", "alerts"), ("Warnings and above", "warn")]
 
     def __init__(self, win):
         super().__init__(win)
         self.filter = "all"
-
-    def render(self, snap):
-        self.clear()
-        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        for label, key in [("All", "all"), ("Alerts", "alerts"), ("Warnings and above", "warn")]:
+        # Built once and kept: recreating the buttons on every refresh lost
+        # keyboard focus, and as ungrouped toggles they could all be switched
+        # off, leaving a list with no visible filter selected.
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        bar.add_css_class("linked")
+        bar.set_halign(Gtk.Align.START)
+        first = None
+        for label, key in self.FILTERS:
             b = Gtk.ToggleButton(label=label, active=(self.filter == key))
+            if first is None:
+                first = b
+            else:
+                b.set_group(first)
             b.connect("toggled", self._set_filter, key)
             bar.append(b)
-        self.body.append(bar)
-        self._group = self.group("History")
-        self.body.append(self._group)
-        self.win.load_events(self._group, self.filter)
+        self.body.prepend(bar)
 
     def _set_filter(self, btn, key):
         if btn.get_active() and self.filter != key:
             self.filter = key
-            self.render(self.win.last_snapshot or {})
+            self.reload()
+
+    def request(self):
+        return self.filter
+
+    def fetch(self, flt):
+        call = self.win.client.call
+        if flt == "alerts":
+            return [("alert", a) for a in
+                    call("alerts", open_only=False, limit=200).get("alerts", [])]
+        evs = call("events", limit=300).get("events", [])
+        if flt == "warn":
+            evs = [e for e in evs if e["severity"] >= 2]
+        return [("event", e) for e in evs]
+
+    def identity(self, data):
+        # Alert rows print a relative time, which goes stale without new data.
+        return (data, int(time.time() // 60))
+
+    def build(self, res):
+        group = self.group("History")
+        self.area.append(group)
+        now = time.time() * 1000
+        if not res:
+            group.add(Adw.ActionRow(title={
+                "alerts": "No alerts have been raised",
+                "warn": "No warnings or critical events recorded",
+            }.get(self.filter, "Nothing recorded yet")))
+            return
+        for kind, it in res[:300]:
+            if kind == "alert":
+                sub = (f"{clock_hm(it['last_ts'])} · {human_ago(it['last_ts'], now)}"
+                       f" · fired {it['count']}×")
+                if it.get("resolved_ts"):
+                    sub += " · resolved"
+                row = Adw.ExpanderRow(title=GLib.markup_escape_text(it["title"]), subtitle=sub)
+                lbl = Gtk.Label(xalign=0, label=it.get("explanation", ""), selectable=True, wrap=True)
+                lbl.add_css_class("sv-mono")
+                for m in ("top", "bottom", "start", "end"):
+                    getattr(lbl, f"set_margin_{m}")(10)
+                holder = Adw.ActionRow()
+                holder.set_child(lbl)
+                row.add_row(holder)
+                row.add_suffix(self.win.alert_menu(it))
+            else:
+                row = severity_row(it["severity"], it["summary"],
+                                   f"{clock_hm(it['ts'])} · {it['subsystem']} · {it['kind']}")
+            group.add(row)
 
 
-class CoveragePage(Page):
+class CoveragePage(AsyncPage):
     title, icon = "Coverage", "checkbox-checked-symbolic"
 
-    def render(self, snap):
-        self.clear()
-        intro = self.group(
+    # Run counters and timings move on every tick. They are worth showing but
+    # not worth rebuilding a page of switches under the pointer for.
+    max_age = 15.0
+
+    LABELS = {"Full": ("emblem-ok-symbolic", "sv-healthy"),
+              "Partial": ("dialog-information-symbolic", "sv-idle"),
+              "Unavailable": ("action-unavailable-symbolic", "sv-unknown"),
+              "Quarantined": ("dialog-error-symbolic", "sv-critical"),
+              "Disabled": ("action-unavailable-symbolic", "sv-unknown")}
+
+    def fetch(self, _request):
+        call = self.win.client.call
+        return call("coverage"), call("inventory"), call("inventory", changes=True)
+
+    def identity(self, data):
+        cov, inv, chg = data
+        stable = [(c.get("name"), c.get("label"), c.get("tier"), str(c.get("support")))
+                  for c in cov.get("collectors", [])]
+        flags = [cov.get(k) for k in ("journal", "netlink_route", "netlink_uevent",
+                                      "helper_installed")]
+        return (stable, flags, inv, chg)
+
+    def build(self, data):
+        cov, inv, chg = data
+        self.area.append(self.group(
             "Monitoring coverage",
             "A monitor that quietly fails to monitor something is worse than no monitor, "
             "because you believe you are covered. Everything JamSys can and cannot see "
-            "on this machine is listed here.")
-        self.body.append(intro)
-        self._group = self.group("Collectors")
-        self.body.append(self._group)
-        self._inv = self.group("Hardware inventory")
-        self.body.append(self._inv)
-        self._chg = self.group("Changes since first run",
+            "on this machine is listed here."))
+        group = self.group("Collectors",
+                           "Switching a collector off stops it being sampled and is "
+                           "remembered across restarts.")
+        inv_group = self.group("Hardware inventory")
+        chg_group = self.group("Changes since first run",
                                "Useful after a kernel or driver update: what actually changed.")
-        self.body.append(self._chg)
-        self.win.load_coverage(self._group, self._inv, self._chg)
+        for g in (group, inv_group, chg_group):
+            self.area.append(g)
+
+        for c in cov.get("collectors", []):
+            lab = c["label"]
+            sup = c.get("support", {})
+            detail = sup.get("detail") or sup.get("reason") or ""
+            sub = f"{c['tier']} tier · {c['runs']} runs · {c['avg_us']} µs average"
+            if detail:
+                sub = detail + " · " + sub
+            row = Adw.ActionRow(title=GLib.markup_escape_text(c["name"]),
+                                subtitle=GLib.markup_escape_text(sub))
+            icon, css = self.LABELS.get(lab, self.LABELS["Unavailable"])
+            ic = Gtk.Image.new_from_icon_name(icon)
+            ic.add_css_class(css)
+            row.add_prefix(ic)
+            val = Gtk.Label(label=lab)
+            val.add_css_class(css)
+            row.add_suffix(val)
+            sw = Gtk.Switch(active=(lab != "Disabled"), valign=Gtk.Align.CENTER)
+            sw.set_tooltip_text(f"Sample the {c['name']} collector")
+            sw.update_property([Gtk.AccessibleProperty.LABEL],
+                               [f"Enable the {c['name']} collector"])
+            sw.connect("state-set", self.win._toggle_collector, c["name"])
+            row.add_suffix(sw)
+            row.set_activatable_widget(sw)
+            group.add(row)
+        for name, ok, why in [
+            ("Journal (kernel errors, Xid, OOM)", cov.get("journal"), "journalctl could not be started"),
+            ("Network change events (rtnetlink)", cov.get("netlink_route"), "netlink socket unavailable"),
+            ("Device hotplug events (uevent)", cov.get("netlink_uevent"), "netlink socket unavailable"),
+            ("Privileged helper (RAPL, NVMe SMART)", cov.get("helper_installed"),
+             "not installed — enable it with: sudo systemctl enable --now jamsys-helper.timer"),
+        ]:
+            row = Adw.ActionRow(title=name, subtitle="" if ok else why)
+            ic = Gtk.Image.new_from_icon_name("emblem-ok-symbolic" if ok else "action-unavailable-symbolic")
+            ic.add_css_class("sv-healthy" if ok else "sv-unknown")
+            row.add_prefix(ic)
+            row.add_suffix(Gtk.Label(label="Available" if ok else "Unavailable"))
+            group.add(row)
+
+        for it in inv.get("items", []):
+            inv_group.add(self.row(it["key"], it["value"]))
+        changes = chg.get("changes", [])
+        if not changes:
+            chg_group.add(Adw.ActionRow(title="Nothing has changed since JamSys was installed"))
+        for c in changes[:80]:
+            old = c.get("old")
+            chg_group.add(self.row(
+                c["key"], c["new"],
+                (f"was {old} · " if old else "first seen · ") + clock_hm(c["ts"])))
 
 
-class SettingsPage(Page):
+class SettingsPage(AsyncPage):
     title, icon = "Settings", "preferences-system-symbolic"
 
-    def render(self, snap):
-        self.clear()
+    def fetch(self, _request):
+        call = self.win.client.call
+        try:
+            thresholds = call("thresholds")
+        except DaemonError:
+            # A daemon from before this operation existed is still running.
+            # That must cost one section, not the whole page.
+            thresholds = None
+        return call("suppressions"), thresholds, call("ping")
+
+    def build(self, data):
+        sup, thresholds, ping = data
         g = self.group("Notifications")
-        self._group = g
-        self.body.append(g)
-        s = self.group("Active suppressions",
-                       "Muted alerts, snoozes and ignored rules or devices. All reversible.")
-        self._sup = s
-        self.body.append(s)
-        d = self.group("Daemon", "Live self-measurement of the monitoring application itself.")
-        self._daemon = d
-        self.body.append(d)
-        self.win.load_settings(self._group, self._sup, self._daemon)
+        row = Adw.ActionRow(
+            title="Desktop notifications",
+            subtitle="Sent by the daemon, so they work with this window closed. "
+                     "The minimum severity is set in ~/.config/jamsys/config.toml.")
+        g.add(row)
+        self.area.append(g)
+
+        sg = self.group("Active suppressions",
+                        "Muted alerts, snoozes and ignored rules or devices. All reversible.")
+        items = sup.get("suppressions", [])
+        if not items:
+            sg.add(Adw.ActionRow(title="Nothing is suppressed"))
+        for s in items:
+            until = s.get("until_ts")
+            sub = f"{s['scope']} · " + ("permanent" if not until else f"until {clock_hm(until)}")
+            if s.get("reason"):
+                sub += f" · {s['reason']}"
+            r = Adw.ActionRow(title=GLib.markup_escape_text(s["pattern"]),
+                              subtitle=GLib.markup_escape_text(sub))
+            b = Gtk.Button(label="Remove", valign=Gtk.Align.CENTER)
+            b.add_css_class("flat")
+            b.connect("clicked", lambda _w, i=s["id"]: self.win._unsuppress(i))
+            r.add_suffix(b)
+            sg.add(r)
+        self.area.append(sg)
+
+        tg = self.group("Alert thresholds",
+                        "The level at which each rule fires. A changed value is shown "
+                        "with its default, and takes effect immediately.")
+        if thresholds is None:
+            tg.add(self.row(
+                "Not available from the running daemon", "",
+                "It predates this feature. Restart it to pick up the installed "
+                "version:  systemctl --user restart jamsysd"))
+        else:
+            for t in thresholds.get("thresholds", []):
+                self._threshold_row(tg, t)
+        self.area.append(tg)
+
+        dg = self.group("Daemon")
+        dg.add(self.row("Version", ping.get("version", "?"),
+                        f"protocol {ping.get('schema')} · its running cost is on the "
+                        "Diagnostics page"))
+        self.area.append(dg)
+
+    def _threshold_row(self, group, t):
+        value, default = t["value"], t["default"]
+        changed = value != default
+        sub = f"{t['rule_id']} · {t['key']}"
+        if changed:
+            sub += f" · default {default:g}"
+        row = Adw.ActionRow(title=GLib.markup_escape_text(t.get("label") or t["rule_id"]),
+                            subtitle=GLib.markup_escape_text(sub))
+        val = Gtk.Label(label=f"{value:g} {t.get('unit', '')}".strip())
+        val.add_css_class("dim-label" if not changed else "sv-idle")
+        row.add_suffix(val)
+        edit = Gtk.Button(icon_name="document-edit-symbolic", valign=Gtk.Align.CENTER,
+                          tooltip_text="Change this threshold")
+        edit.add_css_class("flat")
+        edit.connect("clicked", lambda *_: self.win._threshold_dialog(t["rule_id"], t["key"]))
+        row.add_suffix(edit)
+        if changed:
+            reset = Gtk.Button(icon_name="edit-undo-symbolic", valign=Gtk.Align.CENTER,
+                               tooltip_text=f"Back to the default ({default:g})")
+            reset.add_css_class("flat")
+            reset.connect("clicked", lambda *_: self.win._set_threshold(
+                t["rule_id"], t["key"], default))
+            row.add_suffix(reset)
+        group.add(row)
 
 
 # ---------------------------------------------------------------------------
@@ -1627,7 +2168,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.client = Client(on_push=self._on_push, on_state=self._on_state)
         self.last_snapshot: Optional[dict] = None
         self._alert_cache: list[dict] = []
-        self._charts: dict[str, Sparkline] = {}
+        self._charts: dict[tuple, list] = {}
         self._busy = False
         self._connecting = False
         self._events_busy = False
@@ -1809,10 +2350,7 @@ class MainWindow(Adw.ApplicationWindow):
             self.connection_banner.set_revealed(False)
             page = self.current_page()
             if page:
-                try:
-                    page.update(res)
-                except Exception as e:  # noqa: BLE001 — a render bug must not kill the UI
-                    print(f"[jamsys-ui] render error on {page.title}: {e}")
+                self._render(page, res, user=False)
             if isinstance(page, OverviewPage):
                 self.refresh_events()
         run_async(work, done)
@@ -1851,224 +2389,43 @@ class MainWindow(Adw.ApplicationWindow):
             page.set_events(merged)
         run_async(work, done)
 
-    def load_events(self, group: Adw.PreferencesGroup, flt: str):
-        def work():
-            if flt == "alerts":
-                return [("alert", a) for a in self.client.call("alerts", open_only=False, limit=200).get("alerts", [])]
-            evs = self.client.call("events", limit=300).get("events", [])
-            if flt == "warn":
-                evs = [e for e in evs if e["severity"] >= 2]
-            return [("event", e) for e in evs]
-
-        def done(res, err):
-            if err or res is None:
-                group.add(Adw.ActionRow(title="Could not load events", subtitle=str(err)))
-                return
-            now = time.time() * 1000
-            if not res:
-                group.add(Adw.ActionRow(title="Nothing recorded yet"))
-                return
-            for kind, it in res[:300]:
-                if kind == "alert":
-                    sub = f"{clock_hm(it['last_ts'])} · {human_ago(it['last_ts'], now)} · fired {it['count']}×"
-                    if it.get("resolved_ts"):
-                        sub += " · resolved"
-                    row = Adw.ExpanderRow(title=GLib.markup_escape_text(it["title"]), subtitle=sub)
-                    lbl = Gtk.Label(xalign=0, label=it.get("explanation", ""), selectable=True, wrap=True)
-                    lbl.add_css_class("sv-mono")
-                    for m in ("top", "bottom", "start", "end"):
-                        getattr(lbl, f"set_margin_{m}")(10)
-                    holder = Adw.ActionRow()
-                    holder.set_child(lbl)
-                    row.add_row(holder)
-                    row.add_suffix(self.alert_menu(it))
-                else:
-                    row = severity_row(it["severity"], it["summary"],
-                                       f"{clock_hm(it['ts'])} · {it['subsystem']} · {it['kind']}")
-                group.add(row)
-        run_async(work, done)
-
-    def load_coverage(self, group, inv_group, chg_group):
-        def work():
-            cov = self.client.call("coverage")
-            inv = self.client.call("inventory")
-            chg = self.client.call("inventory", changes=True)
-            return cov, inv, chg
-
-        def done(res, err):
-            if err or not res:
-                group.add(Adw.ActionRow(title="Could not load coverage", subtitle=str(err)))
-                return
-            cov, inv, chg = res
-            labels = {"Full": ("emblem-ok-symbolic", "sv-healthy"),
-                      "Partial": ("dialog-information-symbolic", "sv-idle"),
-                      "Unavailable": ("action-unavailable-symbolic", "sv-unknown"),
-                      "Quarantined": ("dialog-error-symbolic", "sv-critical"),
-                      "Disabled": ("action-unavailable-symbolic", "sv-unknown")}
-            for c in cov.get("collectors", []):
-                lab = c["label"]
-                sup = c.get("support", {})
-                detail = sup.get("detail") or sup.get("reason") or ""
-                sub = f"{c['tier']} tier · {c['runs']} runs · {c['avg_us']} µs average"
-                if detail:
-                    sub = detail + " · " + sub
-                row = Adw.ActionRow(title=GLib.markup_escape_text(c["name"]),
-                                    subtitle=GLib.markup_escape_text(sub))
-                icon, css = labels.get(lab, labels["Unavailable"])
-                ic = Gtk.Image.new_from_icon_name(icon)
-                ic.add_css_class(css)
-                row.add_prefix(ic)
-                val = Gtk.Label(label=lab)
-                val.add_css_class(css)
-                row.add_suffix(val)
-                sw = Gtk.Switch(active=(lab != "Disabled"), valign=Gtk.Align.CENTER)
-                sw.connect("state-set", self._toggle_collector, c["name"])
-                row.add_suffix(sw)
-                group.add(row)
-            for name, ok, why in [
-                ("Journal (kernel errors, Xid, OOM)", cov.get("journal"), "journalctl could not be started"),
-                ("Network change events (rtnetlink)", cov.get("netlink_route"), "netlink socket unavailable"),
-                ("Device hotplug events (uevent)", cov.get("netlink_uevent"), "netlink socket unavailable"),
-                ("Privileged helper (RAPL, NVMe SMART)", cov.get("helper_installed"),
-                 "not installed — see the README for the optional helper"),
-            ]:
-                row = Adw.ActionRow(title=name, subtitle="" if ok else why)
-                ic = Gtk.Image.new_from_icon_name("emblem-ok-symbolic" if ok else "action-unavailable-symbolic")
-                ic.add_css_class("sv-healthy" if ok else "sv-unknown")
-                row.add_prefix(ic)
-                row.add_suffix(Gtk.Label(label="Available" if ok else "Unavailable"))
-                group.add(row)
-
-            for it in inv.get("items", []):
-                inv_group.add(self.pages["Coverage"].row(it["key"], it["value"]))
-            changes = chg.get("changes", [])
-            if not changes:
-                chg_group.add(Adw.ActionRow(title="Nothing has changed since JamSys was installed"))
-            for c in changes[:80]:
-                old = c.get("old")
-                chg_group.add(self.pages["Coverage"].row(
-                    c["key"], c["new"],
-                    (f"was {old} · " if old else "first seen · ") + clock_hm(c["ts"])))
-        run_async(work, done)
-
-    def load_settings(self, group, sup_group, daemon_group):
-        def work():
-            return self.client.call("suppressions"), self.client.call("stats"), self.client.call("ping")
-
-        def done(res, err):
-            if err or not res:
-                group.add(Adw.ActionRow(title="Could not load settings", subtitle=str(err)))
-                return
-            sup, stats, ping = res
-            row = Adw.ActionRow(
-                title="Desktop notifications",
-                subtitle="Sent by the daemon, so they work with this window closed. "
-                         "Edit config.toml to change the minimum severity.")
-            row.add_suffix(Gtk.Label(label="enabled in config"))
-            group.add(row)
-
-            items = sup.get("suppressions", [])
-            if not items:
-                sup_group.add(Adw.ActionRow(title="Nothing is suppressed"))
-            for s in items:
-                until = s.get("until_ts")
-                sub = f"{s['scope']} · " + ("permanent" if not until else f"until {clock_hm(until)}")
-                if s.get("reason"):
-                    sub += f" · {s['reason']}"
-                r = Adw.ActionRow(title=GLib.markup_escape_text(s["pattern"]),
-                                  subtitle=GLib.markup_escape_text(sub))
-                b = Gtk.Button(label="Remove", valign=Gtk.Align.CENTER)
-                b.add_css_class("flat")
-                b.connect("clicked", lambda _w, i=s["id"]: self._unsuppress(i))
-                r.add_suffix(b)
-                sup_group.add(r)
-
-            pg = self.pages["Settings"]
-            up = stats.get("uptime_s", 0)
-            cpu = stats.get("cpu_seconds", 0)
-            daemon_group.add(pg.row("Version", ping.get("version", "?"), f"protocol {ping.get('schema')}"))
-            daemon_group.add(pg.row("Uptime", human_duration(up)))
-            daemon_group.add(pg.row("Memory used by the daemon", human_bytes(stats.get("rss_bytes", 0)),
-                                    f"{stats.get('threads', 0)} threads"))
-            daemon_group.add(pg.row("CPU used by the daemon", f"{cpu:.2f} s",
-                                    f"{100*cpu/max(up,1):.3f}% of one core since start"))
-            daemon_group.add(pg.row("Wakeups", f"{stats.get('wakeups', 0)}",
-                                    f"{stats.get('wakeups_per_s', 0):.2f} per second"))
-            daemon_group.add(pg.row("Sampling rate", f"×{stats.get('sampling_multiplier', 1):.0f} interval multiplier",
-                                    "3× while idle on battery with no window open"))
-            daemon_group.add(pg.row("Database", human_bytes(stats.get("db_bytes", 0)),
-                                    f"{stats.get('sample_rows',0):,} samples · {stats.get('rollup_rows',0):,} rollups · "
-                                    f"{stats.get('event_rows',0):,} events"))
-            daemon_group.add(pg.row("Learned baselines", f"{stats.get('baselines', 0)} series"))
-            daemon_group.add(pg.row("Notifications suppressed by rate limiting",
-                                    str(stats.get("suppressed_notifications", 0))))
-        run_async(work, done)
-
-    def load_diagnostics(self, daemon_g, store_g, widget_g, ui_g):
-        def work():
-            return self.client.call("stats"), self.client.call("ping")
-
-        def done(res, err):
-            pg = self.pages["Diagnostics"]
-            if err or not res:
-                daemon_g.add(Adw.ActionRow(title="Could not read daemon statistics",
-                                           subtitle=str(err)))
-                return
-            d, ping = res
-            up = max(d.get("uptime_s", 1), 1)
-            cpu = d.get("cpu_seconds", 0)
-            daemon_g.add(pg.row("Version", ping.get("version", "?"),
-                                f"protocol {ping.get('schema')} · pid {ping.get('pid')}"))
-            daemon_g.add(pg.row("Uptime", human_duration(up)))
-            daemon_g.add(pg.row("CPU used", f"{cpu:.2f} s",
-                                f"{100*cpu/up:.3f}% of one core since start"))
-            daemon_g.add(pg.row("Memory", human_bytes(d.get("rss_bytes", 0)),
-                                f"{d.get('threads', 0)} threads"))
-            daemon_g.add(pg.row("Wakeups", f"{d.get('wakeups', 0):,}",
-                                f"{d.get('wakeups_per_s', 0):.2f} per second"))
-            daemon_g.add(pg.row("Scheduler ticks", f"{d.get('ticks', 0):,}"))
-            frac = d.get("idle_tick_fraction", 0) or 0
-            blocked = d.get("idle_blocked_by") or ""
-            daemon_g.add(pg.row("Reduced sampling",
-                                f"{100*frac:.0f}% of ticks",
-                                (f"currently off: {blocked}" if blocked
-                                 else "currently active")))
-            daemon_g.add(pg.row("Activity state", d.get("activity", "?"),
-                                f"baseline context: {d.get('context','?')}"))
-            daemon_g.add(pg.row("Events processed", f"{d.get('events_processed', 0):,}",
-                                f"{d.get('events_dropped', 0):,} dropped"))
-            daemon_g.add(pg.row("Notifications rate-limited",
-                                str(d.get("suppressed_notifications", 0))))
-
-            store_g.add(pg.row("Database on disk", human_bytes(d.get("db_bytes", 0)),
-                               f"{d.get('sample_rows',0):,} ten-second samples · "
-                               f"{d.get('rollup_rows',0):,} rollups · "
-                               f"{d.get('event_rows',0):,} events"))
-            store_g.add(pg.row("Full-resolution buffer",
-                               human_bytes(d.get("live_bytes", 0)),
-                               f"{d.get('live_points', 0):,} points held in memory only"))
-            store_g.add(pg.row("Pending writes", str(d.get("samples_pending", 0)),
-                               "flushed in one transaction every 15 s"))
-            store_g.add(pg.row("Learned baselines", f"{d.get('baselines', 0)} series"))
-
-            has = d.get("dbus_widget", False)
-            widget_g.add(pg.row("D-Bus service",
-                                "org.jamsys.Monitor" if has else "unavailable",
-                                "" if has else "no session bus when the daemon started"))
-            widget_g.add(pg.row("Repaints pushed", f"{d.get('dbus_signals', 0):,}",
-                                "only when a displayed value changed enough to matter"))
-            widget_g.add(pg.row("Method calls served", f"{d.get('dbus_calls', 0):,}"))
-
-            ui_g.add(pg.row("Memory", human_bytes(_self_rss()),
-                            "this window; the daemon keeps running when it closes"))
-            ui_g.add(pg.row("IPC clients attached", str(d.get("ipc_clients", 0))))
-        run_async(work, done)
-
     # -- charts and timelines ---------------------------------------------
+
+    #: How long a fetched series or timeline is reused. Pages are rebuilt every
+    #: REFRESH_MS, and each rebuild used to create an empty chart and query an
+    #: hour of history for it: the plot blinked on every tick and the daemon
+    #: answered five times more history requests than the picture could show.
+    HISTORY_TTL_S = 10.0
+
+    def _cached(self, key, fetch, apply):
+        """Show the last reply for `key` at once; refresh it in the background.
+
+        `apply(result)` runs on the main thread, immediately if a reply is
+        cached and again when a fresh one arrives.
+        """
+        hit = self._charts.get(key)
+        if hit is not None:
+            apply(hit[1])
+            if hit[2] or time.monotonic() - hit[0] < self.HISTORY_TTL_S:
+                return
+            # [fetched_at, result, refresh_in_flight]
+            hit[2] = True
+
+        def done(res, err):
+            if self._closed:
+                return
+            if err or res is None:
+                if hit is not None:
+                    hit[2] = False
+                return
+            self._charts[key] = [time.monotonic(), res, False]
+            if hit is None:
+                apply(res)
+        run_async(fetch, done)
 
     def chart(self, subsystem: str, name: str, instance: str, title: str, unit: str,
               band_metric: Optional[str] = None) -> Gtk.Widget:
-        g = Adw.PreferencesGroup(title=title)
+        g = Adw.PreferencesGroup(title=GLib.markup_escape_text(title))
         spark = Sparkline(height=110)
         spark.set_margin_top(8)
         spark.set_margin_bottom(8)
@@ -2090,37 +2447,35 @@ class MainWindow(Adw.ApplicationWindow):
                                     instance=instance, since_ms=until - 3_600_000,
                                     until_ms=until, max_points=240)
 
-        def done(res, err):
-            if err or not res:
-                return
+        def show(res):
             pts = [p[1] for p in res.get("points", [])]
             spark.set_points(pts)
             if pts:
-                caption.set_text(
-                    f"last hour · now {pts[-1]:,.1f} {unit} · min {min(pts):,.1f} · max {max(pts):,.1f} "
-                    f"· {len(pts)} points at "
-                    + ({0: "full resolution", 60000: "1-minute", 300000: "5-minute", 900000: "15-minute"}
-                       .get(res.get("bucket", 0), "aggregated")))
+                text = (f"last hour · now {pts[-1]:,.1f} {unit} · min {min(pts):,.1f} · "
+                        f"max {max(pts):,.1f} · {len(pts)} points at "
+                        + ({0: "full resolution", 60000: "1-minute", 300000: "5-minute",
+                            900000: "15-minute"}.get(res.get("bucket", 0), "aggregated")))
             else:
-                caption.set_text("no history yet — the daemon has just started")
-        run_async(work, done)
+                text = "no history yet — the daemon has just started"
+            caption.set_text(text)
+            # The plot itself is a picture; this is what a screen reader gets.
+            spark.update_property([Gtk.AccessibleProperty.LABEL], [f"{title}: {text}"])
+        self._cached(("history", subsystem, name, instance), work, show)
         return g
 
     def event_timeline(self, subsystem: str, title: str) -> Gtk.Widget:
-        g = Adw.PreferencesGroup(title=title)
+        g = Adw.PreferencesGroup(title=GLib.markup_escape_text(title))
 
         def work():
             return self.client.call("events", subsystem=subsystem, limit=40).get("events", [])
 
-        def done(res, err):
-            if err or res is None:
-                return
+        def show(res):
             if not res:
                 g.add(Adw.ActionRow(title="No events recorded for this subsystem"))
                 return
             for e in res:
                 g.add(severity_row(e["severity"], f"{clock_hm(e['ts'])}   {e['summary']}", e["kind"]))
-        run_async(work, done)
+        self._cached(("events", subsystem), work, show)
         return g
 
     # -- alert actions -----------------------------------------------------
@@ -2152,6 +2507,9 @@ class MainWindow(Adw.ApplicationWindow):
         if instance:
             add(f"Ignore “{instance}”", lambda: self._suppress("instance", instance, None, "device or service ignored"))
         add("Change threshold…", lambda: self._threshold_dialog(rule))
+        # A plain Gtk.Popover full of buttons has no arrow-key navigation of its
+        # own, so say what the button is and let Tab walk the choices.
+        btn.set_tooltip_text("Mute, snooze, ignore or change the threshold")
         pop.set_child(box)
         btn.set_popover(pop)
         return btn
@@ -2169,7 +2527,7 @@ class MainWindow(Adw.ApplicationWindow):
                 self.toasts.add_toast(Adw.Toast(title=f"Could not apply: {err}"))
             else:
                 self.toasts.add_toast(Adw.Toast(title=f"{reason.capitalize()}: {pattern}"))
-                self.refresh_events()
+                self._reload_current()
         run_async(work, done)
 
     def _unsuppress(self, sid: int):
@@ -2178,60 +2536,137 @@ class MainWindow(Adw.ApplicationWindow):
 
         def done(_r, err):
             self.toasts.add_toast(Adw.Toast(title="Suppression removed" if not err else f"Failed: {err}"))
-            page = self.current_page()
-            if page:
-                page.update(self.last_snapshot or {})
+            self._reload_current()
         run_async(work, done)
+
+    def _reload_current(self):
+        """Redraw the visible page after an action that changed what it lists."""
+        page = self.current_page()
+        if isinstance(page, AsyncPage):
+            page.reload(force=True)
+        elif isinstance(page, OverviewPage):
+            self.refresh_events()
+        elif page:
+            self._render(page, self.last_snapshot or {}, user=False)
 
     def ignore_service(self, name: str):
         self._suppress("instance", name, None, f"service {name} ignored")
 
-    def _threshold_dialog(self, rule_id: str):
+    def _threshold_dialog(self, rule_id: str, key: Optional[str] = None):
+        """Change a rule's threshold, choosing from the ones the rule really has.
+
+        This used to be two blank text boxes: a key the user had to already know
+        ("celsius"? "pct"? "avail_pct"?) and a number. A mistyped key was
+        accepted and stored and changed nothing, with a toast saying it had
+        worked. The daemon now lists each rule's thresholds with the value in
+        force, so the dialog offers those and nothing else.
+        """
+        def work():
+            return self.client.call("thresholds").get("thresholds", [])
+
+        def done(res, err):
+            if self._closed:
+                return
+            # From an alert we know the alert's rule; from Settings, the exact
+            # threshold. One alert can be governed by a differently-named
+            # setting (bluetooth.disconnected <- bluetooth.disconnect.hold).
+            mine = [t for t in (res or [])
+                    if (t.get("rule_id") == rule_id and t.get("key") == key) or
+                    (key is None and rule_id in (t.get("applies_to"), t.get("rule_id")))]
+            if err or not mine:
+                self.toasts.add_toast(Adw.Toast(
+                    title=(f"Could not read thresholds: {err}. If JamSys was just "
+                           "updated, run: systemctl --user restart jamsysd" if err else
+                           f"“{rule_id}” has no adjustable threshold — it fires on "
+                           "a condition, not a level"), timeout=7))
+                return
+            self._present_threshold_dialog(mine)
+        run_async(work, done)
+
+    def _present_threshold_dialog(self, items: list):
         dlg = Adw.MessageDialog(transient_for=self, heading="Change threshold",
-                                body=f"Set a new threshold for the rule “{rule_id}”.\n"
-                                     "The alert text always quotes the value actually in force.")
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        key = Gtk.Entry(placeholder_text="key, for example: celsius, pct, avail_pct")
-        val = Gtk.Entry(placeholder_text="numeric value")
-        box.append(key)
-        box.append(val)
-        dlg.set_extra_child(box)
+                                body="Takes effect immediately and is remembered. The "
+                                     "alert text always quotes the value actually in force.")
+        group = Adw.PreferencesGroup()
+        spins = []
+        for t in items:
+            lo, hi = t.get("min", 0.0), t.get("max", 1e12)
+            span = hi - lo
+            step = 1.0 if span > 20 else 0.1
+            adj = Gtk.Adjustment(value=t["value"], lower=lo, upper=hi,
+                                 step_increment=step, page_increment=step * 5)
+            unit = t.get("unit", "")
+            row = Adw.SpinRow(title=GLib.markup_escape_text(t.get("label") or t["key"]),
+                              subtitle=GLib.markup_escape_text(
+                                  f"default {t['default']:g} {unit} · allowed "
+                                  f"{lo:g} to {hi:g}".replace("  ", " ")),
+                              adjustment=adj, digits=0 if step == 1.0 and
+                              float(t["value"]).is_integer() else 2)
+            group.add(row)
+            spins.append((t, row))
+        dlg.set_extra_child(group)
         dlg.add_response("cancel", "Cancel")
+        dlg.add_response("reset", "Use defaults")
         dlg.add_response("save", "Save")
         dlg.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_default_response("save")
+        dlg.set_close_response("cancel")
 
         def on_resp(_d, resp):
-            if resp != "save":
+            if resp not in ("save", "reset"):
                 return
-            try:
-                v = float(val.get_text())
-            except ValueError:
-                self.toasts.add_toast(Adw.Toast(title="That is not a number"))
-                return
-            k = key.get_text().strip()
-            if not k:
-                self.toasts.add_toast(Adw.Toast(title="A key is required"))
-                return
-
-            def work():
-                return self.client.call("set_threshold", rule_id=rule_id, key=k, value=v)
-
-            def done(_r, err):
-                self.toasts.add_toast(Adw.Toast(
-                    title=f"Threshold {rule_id}.{k} set to {v}" if not err else f"Failed: {err}"))
-            run_async(work, done)
+            for t, row in spins:
+                want = t["default"] if resp == "reset" else row.get_value()
+                if want != t["value"]:
+                    self._set_threshold(t["rule_id"], t["key"], want)
         dlg.connect("response", on_resp)
         dlg.present()
+
+    def _set_threshold(self, rule_id: str, key: str, value: float):
+        def work():
+            return self.client.call("set_threshold", rule_id=rule_id, key=key, value=value)
+
+        def done(_r, err):
+            if self._closed:
+                return
+            self.toasts.add_toast(Adw.Toast(
+                title=f"Threshold {rule_id}.{key} set to {value:g}" if not err
+                else f"Threshold not changed: {err}", timeout=3 if not err else 6))
+            self._reload_current()
+        run_async(work, done)
 
     def _toggle_collector(self, switch, state, name):
         def work():
             return self.client.call("set_collector", name=name, enabled=bool(state))
 
         def done(_r, err):
+            if self._closed:
+                return
             if err:
                 self.toasts.add_toast(Adw.Toast(title=f"Could not change {name}: {err}"))
+            # Redraw either way: on success the label changes, and on failure the
+            # switch must go back to showing what the daemon is actually doing.
+            self._reload_current()
         run_async(work, done)
         return False
+
+    def _render(self, page, snap: dict, user: bool) -> None:
+        """Draw `page`, and if that fails say so on the page.
+
+        `user` is True for a page switch, which always draws; a background
+        refresh goes through update() so it cannot interrupt an interaction.
+        """
+        try:
+            if user:
+                page.render(snap)
+            else:
+                page.update(snap)
+        except Exception as e:  # noqa: BLE001 — a render bug must not kill the UI
+            print(f"[jamsys-ui] render error on {page.title}: {e!r}", file=sys.stderr)
+            try:
+                page.show_render_error(e)
+            except Exception:  # noqa: BLE001
+                pass
 
     # -- navigation --------------------------------------------------------
 
@@ -2245,8 +2680,10 @@ class MainWindow(Adw.ApplicationWindow):
         t = row.page_title
         self.stack.set_visible_child_name(t)
         self.content_title.set_title(t)
-        if self.last_snapshot:
-            self.pages[t].render(self.last_snapshot)
+        page = self.pages[t]
+        # Async pages fetch for themselves and need no snapshot to start.
+        if self.last_snapshot or isinstance(page, AsyncPage):
+            self._render(page, self.last_snapshot or {}, user=True)
 
     def goto(self, title: str):
         for i in range(len(PAGES)):

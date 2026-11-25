@@ -43,6 +43,21 @@ PRESETS = [
 ]
 
 
+def repo_script(name: str) -> str:
+    """Absolute path to a script in the source checkout, if we can find one.
+
+    A relative `./scripts/...` is useless in a message: it only works from inside
+    the tree, and this text is read from a window that could have been launched
+    from anywhere.
+    """
+    here = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    for base in (os.path.dirname(here), here):
+        cand = os.path.join(base, "scripts", name)
+        if os.path.isfile(cand):
+            return cand
+    return f"/path/to/jamsys/scripts/{name}"
+
+
 def _executable(p: str) -> bool:
     """Present *and* runnable.
 
@@ -89,7 +104,8 @@ class ChargeLimitControl:
         h = power_helper_path()
         if not h:
             self.last_error = (
-                "jamsys-power is not installed -- run scripts/install-privileged.sh"
+                "jamsys-power is not installed -- run: sudo "
+                + repo_script("install-privileged.sh")
             )
             return False
         argv = ["pkexec", h, "charge-limit", str(percent)]
