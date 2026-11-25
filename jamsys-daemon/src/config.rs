@@ -15,6 +15,7 @@ pub struct Config {
     pub alerts: Alerts,
     pub network: Network,
     pub storage: Storage,
+    pub security: Security,
     /// Per-collector on/off. Missing key means enabled.
     pub collectors: BTreeMap<String, bool>,
     /// Journal message globs that must never produce an alert.
@@ -177,6 +178,15 @@ impl Default for Storage {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Security {
+    /// Network-facing listeners the user has said are meant to be there, as
+    /// `name:proto/port` (the key shown on the Security page). Anything else that
+    /// starts listening after the first run raises an alert.
+    pub accepted_listeners: Vec<String>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -186,6 +196,7 @@ impl Default for Config {
             alerts: Alerts::default(),
             network: Network::default(),
             storage: Storage::default(),
+            security: Security::default(),
             collectors: BTreeMap::new(),
             journal_ignore: default_journal_ignore(),
             service_ignore: Vec::new(),
@@ -265,6 +276,7 @@ pub const THRESHOLDS: &[ThresholdSpec] = &[
     spec("net.errors", "pct", "net.errors", 1.0, 0.01, 100.0, "%", "Packet error rate"),
     spec("bluetooth.disconnect.hold", "seconds", "bluetooth.disconnected", 120.0, 0.0, 3600.0, "s", "Bluetooth disconnect notice stays open for"),
     spec("suspend.drain", "pct_per_hour", "suspend.drain", 2.0, 0.1, 50.0, "% per hour", "Battery drain while asleep"),
+    spec("security.login_failures", "count", "security.login_failures", 5.0, 2.0, 1000.0, "in 10 min", "Failed sign-in attempts"),
     spec("bluetooth.flap.count", "disconnects", "bluetooth.flapping", 3.0, 2.0, 50.0, "in 15 min", "Bluetooth disconnects that count as flapping"),
 ];
 

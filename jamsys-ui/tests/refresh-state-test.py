@@ -272,5 +272,60 @@ release.set()
 pump(lambda: len(order) == 2)
 check("the superseded value is skipped and the last one sent", order == [1, 0], str(order))
 
+print("\nthe Security page")
+from jamsys_ui.app import SecurityPage  # noqa: E402
+
+accepted = []
+secwin = StubWin()
+secwin.accept_listener = accepted.append
+sp2 = SecurityPage(secwin)
+sp2.render({"snapshot": {}})
+check("an older daemon is explained, not drawn as 'all clear'",
+      any("systemctl --user restart jamsysd" in t for t in labels(sp2.body)))
+
+SEC = {"firewall": {"state": "disabled", "tool": "ufw", "detail": "ufw is switched off & unread"},
+       "exposed_tcp": 1, "auth_failures_10m": 2, "auth_failures_1h": 7, "auth_log_watched": True,
+       "recent_failures": [{"ts_ms": 1_700_000_000_000, "service": "sshd", "user": "root",
+                            "source": "203.0.113.9"}],
+       "listeners": [
+           {"proto": "tcp", "port": 8000, "exposure": "all", "addresses": ["0.0.0.0"],
+            "owner": "ronin", "process": "python3 <b>", "pid": 4242,
+            "key": "python3:tcp/8000", "expected": False},
+           {"proto": "tcp", "port": 22, "exposure": "all", "addresses": ["0.0.0.0", "::"],
+            "owner": "root", "process": None, "pid": None, "key": "root:tcp/22", "expected": True},
+           {"proto": "tcp", "port": 631, "exposure": "loopback", "addresses": ["127.0.0.1"],
+            "owner": "root", "process": None, "pid": None, "key": "root:tcp/631", "expected": True},
+           {"proto": "udp", "port": 5353, "exposure": "all", "addresses": ["0.0.0.0"],
+            "owner": "avahi", "process": None, "pid": None, "key": "avahi:udp/5353", "expected": True}]}
+snap = {"snapshot": {"security": SEC}}
+sp2.update(snap)
+text = labels(sp2.body)
+check("a disabled firewall is named with the command that enables it",
+      "ufw is switched off" in text and "sudo ufw enable" in text, str(text)[:200])
+check("its detail survives an ampersand", "ufw is switched off & unread" in text)
+check("a listener is shown by port and program, markup and all",
+      "Port 8000 — python3 <b>" in text, str([t for t in text if "8000" in t]))
+check("a root-owned one admits its name is unknown",
+      any("runs as root; its name needs root to read" in t for t in text))
+check("failed sign-ins show the count and the remote source",
+      "7" in text and any("from 203.0.113.9" in t for t in text))
+buttons = [w for w in appmod._walk(sp2.body)
+           if isinstance(w, Gtk.Button) and w.get_label() == "Accept"]
+check("only the new, network-facing listener can be accepted", len(buttons) == 1,
+      f"{len(buttons)} Accept buttons")
+buttons[0].emit("clicked")
+check("and accepting sends its key", accepted == ["python3:tcp/8000"], str(accepted))
+first = buttons[0]
+sp2.update({"snapshot": {"security": dict(SEC)}})
+check("an unchanged reading leaves the button in place", first.get_root() is None
+      and first.get_parent() is not None)
+SEC2 = dict(SEC, auth_failures_10m=3)
+sp2.update({"snapshot": {"security": SEC2}})
+check("a changed one redraws", "3" in labels(sp2.body) and first.get_parent() is None)
+SEC3 = dict(SEC, auth_log_watched=False)
+sp2.update({"snapshot": {"security": SEC3}})
+check("an unwatched sign-in log says so instead of showing zero",
+      "Not being counted" in labels(sp2.body))
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

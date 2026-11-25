@@ -19,6 +19,7 @@ pub fn register_all(reg: &mut Registry, cfg: &Config) {
     reg.add(Box::new(collectors::process::ProcCollector::new()), cfg);
     reg.add(Box::new(collectors::inventory::InventoryCollector::new()), cfg);
     reg.add(Box::new(collectors::keyboard::KeyboardCollector::new()), cfg);
+    reg.add(Box::new(collectors::security::SecurityCollector::new()), cfg);
 }
 
 /// Per-tier deadline bookkeeping.
@@ -105,6 +106,8 @@ pub struct Daemon {
     /// worth trying to bring back after it is lost.
     journal_wanted: bool,
     dbus_wanted: bool,
+    auth_journal: Option<JournalStream>,
+    auth_wanted: bool,
     dedup: journal::Deduper,
     snap: Snapshot,
     cpu_recent: f64,
@@ -221,6 +224,25 @@ impl Daemon {
             }
         }
 
+        // A second follower for sign-in failures. They are logged at
+        // informational priority, which the main follower deliberately excludes,
+        // so this one is restricted to the handful of processes that
+        // authenticate people instead of being opened up to everything.
+        let auth_journal = if cfg.enabled("security") {
+            match JournalStream::spawn_matching(6, collectors::security::AUTH_JOURNAL_MATCHES) {
+                Ok(j) => {
+                    el.add(j.fd(), TOK_AUTH_JOURNAL).ok();
+                    Some(j)
+                }
+                Err(e) => {
+                    log_warn!("sign-in log unavailable ({e}); failed logins will not be counted");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let auth_wanted = auth_journal.is_some();
         let journal_wanted = journal.is_some();
         let dbus_wanted = dbus.is_some();
         let rules = RuleEngine::new(&cfg);
@@ -256,6 +278,8 @@ impl Daemon {
             cfg_unparsed,
             journal_wanted,
             dbus_wanted,
+            auth_journal,
+            auth_wanted,
             dedup: journal::Deduper::new(300_000),
             snap: Snapshot::default(),
             cpu_recent: 0.0,
@@ -312,6 +336,7 @@ impl Daemon {
                         }
                     }
                     TOK_JOURNAL => self.handle_journal(),
+                    TOK_AUTH_JOURNAL => self.handle_auth_journal(),
                     TOK_NETLINK_ROUTE => self.handle_netlink_route(),
                     TOK_NETLINK_UEVENT => self.handle_netlink_uevent(),
                     TOK_DBUS => self.handle_dbus(),
@@ -365,6 +390,7 @@ impl Daemon {
 
         // Suspend detection first, so collectors see the resume flag on this tick.
         let resumed = self.suspend.poll();
+        self.snap.security.auth_log_watched = self.auth_journal.is_some();
         let mut ctx = Ctx::new(self.cfg.clone());
         ctx.snap = self.snap.clone();
 
@@ -639,6 +665,31 @@ impl Daemon {
         }
     }
 
+    /// Sign-in failures. Only collectors see these lines: they are not errors
+    /// of the machine, so they never go through journal classification.
+    fn handle_auth_journal(&mut self) {
+        let (entries, ended) = match self.auth_journal.as_mut() {
+            Some(j) => (j.read_entries(), j.at_eof()),
+            None => return,
+        };
+        if ended {
+            if let Some(j) = self.auth_journal.take() {
+                let _ = self.el.remove(j.fd());
+            }
+            log_warn!("sign-in log follower exited; it will be restarted");
+        }
+        if entries.is_empty() {
+            return;
+        }
+        let mut ctx = Ctx::new(self.cfg.clone());
+        ctx.snap = self.snap.clone();
+        for e in entries {
+            self.reg.dispatch_event(&ExternalEvent::AuthLog(e), &mut ctx);
+        }
+        self.flush_ctx_events(&mut ctx);
+        self.snap = ctx.snap;
+    }
+
     fn handle_journal(&mut self) {
         let (entries, ended) = match self.journal.as_mut() {
             Some(j) => (j.read_entries(), j.at_eof()),
@@ -775,6 +826,12 @@ impl Daemon {
                     log_info!("journal follower restarted");
                 }
                 Err(e) => log_warn!("journal follower could not be restarted: {e}"),
+            }
+        }
+        if self.auth_wanted && self.auth_journal.is_none() {
+            if let Ok(nj) = JournalStream::spawn_matching(6, collectors::security::AUTH_JOURNAL_MATCHES) {
+                self.el.add(nj.fd(), TOK_AUTH_JOURNAL).ok();
+                self.auth_journal = Some(nj);
             }
         }
         if self.dbus_wanted && self.dbus.is_none() {
@@ -1117,6 +1174,39 @@ impl Daemon {
                     "unit": t.unit, "label": t.label,
                 })).collect::<Vec<_>>()
             })),
+            // Tell the monitor a network-facing listener is meant to be there.
+            // The key must be one that is listening right now: this is "yes, that
+            // one", not a way to pre-approve arbitrary names.
+            "accept_listener" | "unaccept_listener" => {
+                let key = s("key");
+                let accept = r.op == "accept_listener";
+                let mut cfg = (*self.cfg).clone();
+                let list = &mut cfg.security.accepted_listeners;
+                if accept {
+                    if !self.snap.security.listeners.iter().any(|l| l.key == key) {
+                        return Response::err(r.id, "not_found",
+                            format!("nothing called {key} is listening right now"));
+                    }
+                    if !list.contains(&key) {
+                        list.push(key.clone());
+                    }
+                } else {
+                    list.retain(|k| k != &key);
+                }
+                if let Err(e) = self.save_config(&cfg) {
+                    return Response::err(r.id, "write_failed", e);
+                }
+                self.cfg = Arc::new(cfg);
+                // Reflect it now rather than at the next slow tick.
+                let accepted = self.cfg.security.accepted_listeners.clone();
+                let sec = &mut self.snap.security;
+                for l in sec.listeners.iter_mut().filter(|l| l.key == key) {
+                    l.expected = accept;
+                }
+                sec.unexpected = sec.listeners.iter()
+                    .filter(|l| l.proto == "tcp" && l.exposed() && !l.expected).cloned().collect();
+                Response::ok(r.id, serde_json::json!({"key": key, "accepted": accepted}))
+            }
             "set_collector" => {
                 let name = s("name");
                 let Some(en) = p.get("enabled").and_then(|v| v.as_bool()) else {
@@ -1204,6 +1294,7 @@ fn subsystem_for_rule(rule: &str) -> &'static str {
         "net" => "Network",
         "service" | "audio" => "Services",
         "device" | "bt" => "Devices",
+        "security" => "Security",
         "journal" => "Events",
         _ => "Overview",
     }

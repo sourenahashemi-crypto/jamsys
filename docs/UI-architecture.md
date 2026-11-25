@@ -474,6 +474,7 @@ of rows, each expandable to the full explanation.
 | **Thermals** | every discovered sensor with its label, fan RPM, throttle events, critical points |
 | **Storage** | real filesystems only (loop/snap collapsed into one row), inodes, IO throughput, `io_ticks` utilisation, NVMe SMART when available, ext4 error counters |
 | **Network** | per interface: state, IPs, throughput, errors, drops; Wi-Fi signal/bitrate; default route; reachability trio (gateway / DNS / internet); **event timeline** |
+| **Security** | whether a firewall is switched on, failed sign-ins (10 min / 1 h, most recent with source), and every listening socket grouped by who can reach it: the network, this machine only, UDP. A new network-facing listener carries **Accept**. Ends with a list of what the page cannot see |
 | **Devices** | Bluetooth adapter + connections, audio (PipeWire/WirePlumber/default sink+source), USB tree, webcam + IR camera presence, expected-device list |
 | **Services** | failed units, restart counts, per-unit ignore toggle |
 | **Processes** | sortable table: PID, name, CPU %, RSS, IO, GPU; abnormal rows flagged with the reason |
@@ -626,7 +627,7 @@ destroyed under the pointer and the scroll position snapped back to the top,
 so the page appeared to jump and a list could be neither scrolled nor picked
 from.
 
-`Page.update()` is the guard, in the base class so all sixteen pages get it:
+`Page.update()` is the guard, in the base class so every page gets it:
 
 - it skips the rebuild entirely while a `Gtk.Popover` is open anywhere beneath
   the page, or while a text entry has focus;

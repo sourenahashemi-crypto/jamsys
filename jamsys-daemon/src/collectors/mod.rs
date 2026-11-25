@@ -17,6 +17,7 @@ pub mod network;
 pub mod power;
 pub mod privileged;
 pub mod process;
+pub mod security;
 pub mod services;
 pub mod storage;
 pub mod thermal;
@@ -45,6 +46,7 @@ pub struct Snapshot {
     pub services: services::ServiceState,
     pub process: process::ProcState,
     pub keyboard: keyboard::KeyboardState,
+    pub security: security::SecurityState,
     /// True when the machine is quiet enough for idle baselines to apply.
     pub idle: bool,
     /// Idle / interactive / high load. Baselines are partitioned by this so a compile
@@ -139,6 +141,11 @@ pub enum ExternalEvent {
     /// A collector's own event fd became readable. Carries the collector name so
     /// only the owner reacts; every other collector ignores it.
     CollectorReadable { name: &'static str },
+    /// A line from the processes that authenticate people (sshd, sudo, PAM,
+    /// polkit). Separate from `Journal` because it comes from its own follower
+    /// at informational priority, and must not be counted twice when the same
+    /// line also reaches the main one.
+    AuthLog(crate::journal::JournalEntry),
     /// The machine woke up; payload is how long it slept.
     Resumed { slept_ms: i64 },
 }

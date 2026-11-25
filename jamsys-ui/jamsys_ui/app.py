@@ -1170,6 +1170,162 @@ class ServicesPage(Page):
             self.body.append(rg)
 
 
+class SecurityPage(Page):
+    """What this machine exposes to the network, and who has been failing to get in.
+
+    Detection only. JamSys cannot block anything and does not try to: the page says
+    what is listening, whether a firewall is on, and how many sign-ins have failed,
+    and for each of those what was actually checked and what could not be.
+    """
+
+    title, icon = "Security", "security-high-symbolic"
+
+    EXPOSURE = {"all": "all network interfaces", "address": "one network address",
+                "loopback": "this machine only"}
+
+    def __init__(self, win):
+        super().__init__(win)
+        self._shown = None
+
+    def update(self, snap):
+        # Rebuilt only when something on it changed: it has buttons, and a button
+        # replaced between press and release loses the click.
+        sec = (snap.get("snapshot") or {}).get("security")
+        if self._shown is not None and sec == self._shown[0] \
+                and int(time.time() // 60) == self._shown[1]:
+            return
+        super().update(snap)
+
+    def render(self, snap):
+        sec = (snap.get("snapshot") or {}).get("security")
+        self._shown = (sec, int(time.time() // 60))
+        self.clear()
+        if sec is None:
+            self.body.append(self.group(
+                "Security",
+                "The running daemon predates this page. Restart it to pick up the "
+                "installed version:  systemctl --user restart jamsysd"))
+            return
+
+        self._firewall(sec.get("firewall") or {}, sec.get("exposed_tcp", 0))
+        self._sign_ins(sec)
+        listeners = sec.get("listeners") or []
+        tcp = [l for l in listeners if l.get("proto") == "tcp"]
+        self._listeners(
+            "Reachable from the network",
+            "Programs accepting TCP connections from other devices. Anything that "
+            "appears here after JamSys first ran raises an alert until you accept it.",
+            [l for l in tcp if l.get("exposure") != "loopback"],
+            "Nothing is accepting connections from the network.", judge=True)
+        self._listeners(
+            "This machine only",
+            "Listening on the loopback address: other programs on this computer can "
+            "connect, other devices cannot.",
+            [l for l in tcp if l.get("exposure") == "loopback"],
+            "Nothing is listening locally.")
+        self._listeners(
+            "UDP",
+            "Sockets waiting for datagrams (name lookup, discovery, calls). Listed for "
+            "reference and not judged: applications open and close these constantly.",
+            [l for l in listeners if l.get("proto") == "udp"],
+            "No UDP sockets are waiting.")
+
+        g = self.group(
+            "What this page cannot see",
+            "It is built from what an unprivileged program may read, and no more.")
+        g.add(self.row("Firewall rules", "", "Only whether a firewall is switched on. "
+                       "The rules need root:  sudo ufw status verbose"))
+        g.add(self.row("Other users' programs", "", "A service running as root is shown "
+                       "by its account, not its name. To name it:  sudo ss -ltnp"))
+        g.add(self.row("Short-lived connections", "", "Sockets are sampled about once a "
+                       "minute; something that listens for a few seconds can be missed."))
+        g.add(self.row("Traffic contents", "", "Never inspected, by design."))
+        self.body.append(g)
+
+    # -- sections -----------------------------------------------------------
+
+    def _firewall(self, fw, exposed):
+        state = fw.get("state", "unknown")
+        g = self.group("Firewall")
+        title = {"enabled": f"{fw.get('tool', 'A firewall')} is on",
+                 "disabled": f"{fw.get('tool', 'The firewall')} is switched off",
+                 }.get(state, "Could not tell whether a firewall is on")
+        row = Adw.ActionRow(title=GLib.markup_escape_text(title),
+                            subtitle=GLib.markup_escape_text(fw.get("detail", "")))
+        icon, css = {"enabled": ("emblem-ok-symbolic", "sv-healthy"),
+                     "disabled": ("dialog-warning-symbolic", "sv-attention"),
+                     }.get(state, ("dialog-question-symbolic", "sv-unknown"))
+        ic = Gtk.Image.new_from_icon_name(icon)
+        ic.add_css_class(css)
+        row.add_prefix(ic)
+        g.add(row)
+        if state == "disabled":
+            g.add(self.row(
+                "To turn it on", "sudo ufw enable",
+                (f"{exposed} program(s) below are reachable from the network right now. "
+                 if exposed else "Nothing is reachable from the network right now. ")
+                + "Outgoing connections are not affected."))
+        self.body.append(g)
+
+    def _sign_ins(self, sec):
+        short, long_ = sec.get("auth_failures_10m", 0), sec.get("auth_failures_1h", 0)
+        g = self.group(
+            "Failed sign-ins",
+            "Wrong passwords for sudo, the login and lock screens, su, polkit prompts "
+            "and SSH, as the system logs them.")
+        if not sec.get("auth_log_watched"):
+            g.add(self.row("Not being counted", "",
+                           "The sign-in log could not be followed. Reading it needs "
+                           "membership of the adm or systemd-journal group."))
+            self.body.append(g)
+            return
+        g.add(self.row("Last ten minutes", str(short),
+                       "an alert is raised at the threshold set in Settings"))
+        g.add(self.row("Last hour", str(long_)))
+        now = time.time() * 1000
+        for f in (sec.get("recent_failures") or [])[:10]:
+            who = f.get("service", "?")
+            if f.get("user"):
+                who += f" as {f['user']}"
+            g.add(severity_row(
+                2 if f.get("source") else 1, who,
+                f"{clock_hm(f.get('ts_ms'))} · {human_ago(f.get('ts_ms'), now)} · "
+                + (f"from {f['source']}" if f.get("source") else "at this computer")))
+        self.body.append(g)
+
+    def _listeners(self, title, description, items, empty, judge=False):
+        g = self.group(title, description)
+        if not items:
+            g.add(Adw.ActionRow(title=empty))
+        for l in items:
+            name = l.get("process") or l.get("owner") or "?"
+            sub = (f"{str(l.get('proto', '')).upper()} · "
+                   f"{self.EXPOSURE.get(l.get('exposure'), l.get('exposure'))} "
+                   f"({', '.join(l.get('addresses') or [])})")
+            if l.get("process"):
+                sub += f" · pid {l.get('pid')} · runs as {l.get('owner')}"
+            else:
+                sub += f" · runs as {l.get('owner')}; its name needs root to read"
+            row = Adw.ActionRow(
+                title=GLib.markup_escape_text(f"Port {l.get('port')} — {name}"),
+                subtitle=GLib.markup_escape_text(sub))
+            new = judge and l.get("expected") is False
+            ic = Gtk.Image.new_from_icon_name(
+                "dialog-warning-symbolic" if new else "network-server-symbolic")
+            ic.add_css_class("sv-attention" if new else "dim-label")
+            row.add_prefix(ic)
+            if new:
+                tag = Gtk.Label(label="New")
+                tag.add_css_class("sv-attention")
+                row.add_suffix(tag)
+                b = Gtk.Button(label="Accept", valign=Gtk.Align.CENTER,
+                               tooltip_text="This is meant to be here: stop alerting about it")
+                b.connect("clicked", lambda _b, k=l.get("key"): self.win.accept_listener(k))
+                row.add_suffix(b)
+            g.add(row)
+        self.body.append(g)
+
+
 class ProcessPage(Page):
     title, icon = "Processes", "utilities-system-monitor-symbolic"
 
@@ -2157,7 +2313,7 @@ class SettingsPage(AsyncPage):
 # ---------------------------------------------------------------------------
 
 PAGES = [OverviewPage, CpuPage, MemoryPage, GpuPage, PowerPage, ThermalPage,
-         StoragePage, NetworkPage, DevicesPage, ServicesPage, ProcessPage,
+         StoragePage, NetworkPage, SecurityPage, DevicesPage, ServicesPage, ProcessPage,
          HardwarePage, ReportPage, EventsPage, CoveragePage, DiagnosticsPage,
          SettingsPage]
 
@@ -2548,6 +2704,21 @@ class MainWindow(Adw.ApplicationWindow):
             self.refresh_events()
         elif page:
             self._render(page, self.last_snapshot or {}, user=False)
+
+    def accept_listener(self, key: str):
+        def work():
+            return self.client.call("accept_listener", key=key)
+
+        def done(_r, err):
+            if self._closed:
+                return
+            self.toasts.add_toast(Adw.Toast(
+                title=f"Accepted {key}" if not err else f"Could not accept {key}: {err}",
+                timeout=3 if not err else 6))
+            # The daemon updates its snapshot at once; fetch it rather than
+            # waiting out the tick with the button still showing.
+            self.refresh()
+        run_async(work, done)
 
     def ignore_service(self, name: str):
         self._suppress("instance", name, None, f"service {name} ignored")

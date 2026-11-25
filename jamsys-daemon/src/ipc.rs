@@ -798,7 +798,7 @@ mod tests {
 
     #[test]
     fn one_oversized_line_is_still_refused() {
-        let dir = tmpdir("oversize");
+        let dir = tmpdir("oversize-line");
         let mut srv = IpcServer::bind(&dir).unwrap();
         let mut c = UnixStream::connect(dir.join("sock")).unwrap();
         let tok = srv.accept().0[0].0;

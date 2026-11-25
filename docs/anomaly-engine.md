@@ -45,6 +45,9 @@ considers "normal", because some things are never normal.
 | `bt.controller_error` | Bluetooth controller error in journal | WARNING |
 | `audio.service_down` | PipeWire or WirePlumber not active | WARNING |
 | `device.missing` | a learned internal device disappears | WARNING |
+| `security.new_listener` | a TCP listener reachable from the network that was not present at first run and has not been accepted. No dwell; stays open while it is there | WARNING |
+| `security.login_failures` | ≥ 5 failed sign-ins in 10 minutes | NOTICE if all local, WARNING if any came over the network |
+| `security.firewall_off` | `ufw` is switched off **and** at least one TCP listener is network-facing, for 300 s | NOTICE |
 | `suspend.failed` | suspend aborted, or resume with device errors | WARNING |
 | `suspend.drain` | > 2 %/h battery drain while suspended | NOTICE |
 

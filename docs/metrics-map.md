@@ -155,6 +155,31 @@ that collector and nothing else.
 | Hotplug add/remove | `NETLINK_KOBJECT_UEVENT` group 1 | netlink socket | — | **event** | — | libudev-format messages skipped, not mis-parsed |
 | Expected-device list | learned over 10 consecutive slow ticks | in-memory set | — | derived | — | One-off plug-ins never become "expected" |
 
+## Security — collector `security`, slow tier
+
+Detection only. Nothing is blocked and no packet is read; see
+[privilege-model.md](privilege-model.md).
+
+| Reading | Source | Privilege | Notes |
+|---|---|---|---|
+| Listening TCP sockets | `/proc/net/tcp`, `/proc/net/tcp6`, state `0A` | none | local address, port, owning uid, inode |
+| Waiting UDP sockets | `/proc/net/udp`, `/proc/net/udp6`, no remote end | none | listed, never alerted on |
+| Exposure | the bound address | none | loopback / all interfaces / one address; `::ffff:127.0.0.1` counts as loopback |
+| Owning account | uid → `/etc/passwd` | none | |
+| Owning process | `/proc/<pid>/fd` → `socket:[inode]` | **own processes only** | another user's descriptors need root, so a root service is shown by account. Scanned only when a new inode appears |
+| Firewall on/off | `ENABLED=` in `/etc/ufw/ufw.conf`; `/run/firewalld.pid` | none | **the rules are root-only and are not read.** With neither tool present the state is `unknown`, never "off" |
+| Failed sign-ins | a second `journalctl --follow` restricted to sshd, sudo, su, login, polkitd, gdm | `adm` or `systemd-journal` | informational priority, which the main follower excludes. sshd is counted from its own lines and every other service from `pam_unix`, so one attempt is one count |
+
+The baseline of expected network-facing listeners is learned once, at first run, into
+`~/.local/share/jamsys/known-listeners.json`, and extended only by the user accepting
+a listener (`[security] accepted_listeners` in `config.toml`). It is deliberately not
+re-learned on restart. Ports from 32768 up are treated as one identity per program,
+since applications pick a different one each launch.
+
+Not seen: firewall rules; which process owns another user's socket; a socket that
+opens and closes between two samples (60 s, or 180 s while idle on battery);
+outbound connections per process; anything about traffic contents.
+
 ## Services and journal
 
 | Metric | Source | Interface | Priv | Mode | Freq | Failure |

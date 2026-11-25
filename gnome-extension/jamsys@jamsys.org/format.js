@@ -47,6 +47,7 @@ export function shortAlert(s) {
     case 'Network': return `${sub} ${s.net_label}`;
     // These have no single number of their own, so the count is the measurement.
     case 'Services':
+    case 'Security':
     case 'Devices':
     case 'Storage':
     case 'Thermals': {

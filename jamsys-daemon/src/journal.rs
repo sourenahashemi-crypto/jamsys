@@ -201,11 +201,19 @@ pub struct JournalStream {
 impl JournalStream {
     /// `priority` is the syslog level ceiling (4 = warning and above).
     pub fn spawn(priority: u8) -> std::io::Result<JournalStream> {
+        Self::spawn_matching(priority, &[])
+    }
+
+    /// Follow only entries matching `matches` (journalctl `FIELD=value` terms;
+    /// repeating a field means "any of"). The terms are compile-time constants,
+    /// never anything read from a file or a client.
+    pub fn spawn_matching(priority: u8, matches: &[&str]) -> std::io::Result<JournalStream> {
         // Fixed argument vector, no shell. `-n 0` means "start from now": the daemon
         // must not replay the whole boot's warnings and notify about all of them.
         let mut child = Command::new("journalctl")
             .args(["--follow", "--output=json", "--no-pager", "--lines=0", "--priority"])
             .arg(priority.to_string())
+            .args(matches)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .stdin(Stdio::null())

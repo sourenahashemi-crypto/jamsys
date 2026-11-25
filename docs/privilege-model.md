@@ -135,6 +135,14 @@ line closes that connection only.
   `systemctl --user reload jamsysd`). Earlier versions of this document gave the
   key as `[collectors] reachability`; that section only names collectors, so the
   setting was accepted and did nothing.
+* **Security monitoring reads tables, not traffic.** The Security page is built from
+  the kernel's socket tables (`/proc/net/tcp` and friends: addresses, ports, owners),
+  one line of `ufw`'s configuration, and the sign-in failures the system already
+  logs. It opens no socket, captures nothing, sends nothing, and gains no privilege.
+  It follows that it cannot block anything either: JamSys is not a firewall, and the
+  page recommends the system's own (`sudo ufw enable`) rather than imitating one.
+  A sign-in failure records the service, the account name tried and the remote
+  address as logged; passwords are never in the journal and never seen.
 * Everything is stored under `~/.local/share/jamsys/`. Deleting that directory deletes
   all history.
 

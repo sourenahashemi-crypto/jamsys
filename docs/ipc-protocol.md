@@ -62,6 +62,8 @@ window out of its own daemon.
 | `unsuppress` | `{id}` | remove a suppression |
 | `thresholds` | — | every adjustable threshold: `{rule_id, key, applies_to, label, unit, default, min, max, value}` |
 | `set_threshold` | `{rule_id, key, value}` | override a threshold. `not_found` for a key no rule reads, `out_of_range` outside `min..max`; setting the default removes the override |
+| `accept_listener` | `{key}` | mark a network-facing listener as expected. The key must be listening now (`not_found` otherwise); stored in `[security] accepted_listeners` |
+| `unaccept_listener` | `{key}` | undo that |
 | `set_collector` | `{name, enabled}` | enable/disable a collector at runtime; the reply's `persisted` says whether it was also written to `config.toml` |
 | `subscribe` | `{topics: ["alert","event","tick"]}` | begin push frames |
 | `stats` | — | daemon self-metrics (CPU, RSS, wakeups, DB size) |

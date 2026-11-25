@@ -15,6 +15,7 @@ pub const TOK_JOURNAL: u64 = 4;
 pub const TOK_NETLINK_ROUTE: u64 = 5;
 pub const TOK_NETLINK_UEVENT: u64 = 6;
 pub const TOK_DBUS: u64 = 7;
+pub const TOK_AUTH_JOURNAL: u64 = 8;
 /// IPC client connections are allocated tokens from here upwards.
 /// Collector-owned event fds occupy 100..1000, one per registered collector.
 pub const TOK_COLLECTOR_BASE: u64 = 100;

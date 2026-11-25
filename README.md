@@ -120,7 +120,9 @@ change log.
 ## What it is not
 
 No Docker. No Prometheus, Grafana or Elasticsearch. No Electron. No cloud, no account,
-no telemetry, no update check. **No packet capture** — network monitoring reads counters,
+no telemetry, no update check. A Security page lists what is listening on the network,
+whether `ufw` is switched on and how many sign-ins have failed — it detects and
+explains, it does not block (JamSys is not a firewall). **No packet capture** — network monitoring reads counters,
 never payloads. Nothing leaves the machine. Everything lives in
 `~/.local/share/jamsys/`; delete that directory and all history is gone.
 

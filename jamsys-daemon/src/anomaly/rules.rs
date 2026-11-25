@@ -72,6 +72,7 @@ impl RuleEngine {
         self.service_rules(snap, cfg, now_ms, &mut out);
         self.device_rules(snap, cfg, now_ms, &mut out);
         self.bluetooth_rules(snap, cfg, now_ms, &mut out);
+        self.security_rules(snap, cfg, now_ms, &mut out);
         self.learned_rules(snap, cfg, now_ms, &mut out);
         Evaluation { alerts: out, firing: self.firing.clone() }
     }
@@ -644,6 +645,90 @@ impl RuleEngine {
         }
     }
 
+    fn security_rules(&mut self, s: &Snapshot, cfg: &Config, now: i64, out: &mut Vec<Alert>) {
+        let sec = &s.security;
+
+        // Something new is accepting connections from the network. No dwell: the
+        // moment a listener appears is the moment worth knowing about, and it
+        // stays reported for as long as it is there and unaccepted.
+        for l in &sec.unexpected {
+            let reach = if l.exposure == "all" { "every network interface" } else { "a network address" };
+            let mut e = Explanation::new(format!(
+                "{} is listening on {} port {}, reachable on {reach}.",
+                l.name(), l.proto.to_uppercase(), l.port))
+                .expected("only the services that were listening when JamSys first ran, or that you have accepted since")
+                .evidence("Bound to", l.addresses.join(", "))
+                .evidence("Owner", match (&l.process, l.pid) {
+                    (Some(p), Some(pid)) => format!("{p} (pid {pid}), running as {}", l.owner),
+                    _ => format!("a process running as {} — its name needs root to read", l.owner),
+                })
+                .evidence("Firewall", sec.firewall.detail.clone())
+                .action("If you started this (a dev server, file sharing, a game), accept it on the Security page")
+                .action(format!("To see exactly what it is:  sudo ss -ltnp 'sport = :{}'", l.port));
+            if sec.firewall.state != "enabled" {
+                e = e.action("Nothing is filtering incoming connections; other devices on this network can reach it");
+            }
+            self.fire(out, Alert::new("security.new_listener", &l.key, Severity::Warning,
+                format!("{} started accepting network connections on port {}", l.name(), l.port), e));
+        }
+
+        // Repeated failed sign-ins. A count over a window, so it clears itself as
+        // the failures age out.
+        let limit = cfg.threshold("security.login_failures", "count", 5.0);
+        if f64::from(sec.auth_failures_10m) >= limit {
+            let mut by: std::collections::BTreeMap<String, u32> = Default::default();
+            for f in &sec.recent_failures {
+                let who = if f.source.is_empty() { f.service.clone() }
+                          else { format!("{} from {}", f.service, f.source) };
+                *by.entry(who).or_insert(0) += 1;
+            }
+            let remote = sec.recent_failures.iter().any(|f| !f.source.is_empty());
+            let users: std::collections::BTreeSet<&str> =
+                sec.recent_failures.iter().map(|f| f.user.as_str()).filter(|u| !u.is_empty()).collect();
+            let mut e = Explanation::new(format!(
+                "{} sign-in attempts failed in the last ten minutes.", sec.auth_failures_10m))
+                .expected(format!("fewer than {limit:.0} in ten minutes"))
+                .evidence("In the last hour", sec.auth_failures_1h.to_string())
+                .evidence("Most recent, by source",
+                          by.iter().map(|(k, v)| format!("{k} ×{v}")).collect::<Vec<_>>().join(", "))
+                .evidence("Accounts tried", users.into_iter().collect::<Vec<_>>().join(", "));
+            e = if remote {
+                e.cause("Attempts are arriving over the network, which is what password guessing looks like")
+                 .action("If you do not need remote login, turn it off:  sudo systemctl disable --now ssh")
+                 .action("If you do, allow keys only: set PasswordAuthentication no in /etc/ssh/sshd_config")
+            } else {
+                e.action("If this was you mistyping a password, nothing needs doing")
+                 .action("If it was not, someone at this keyboard or a local program is trying passwords")
+            };
+            self.fire(out, Alert::new("security.login_failures", "",
+                if remote { Severity::Warning } else { Severity::Notice },
+                "Repeated failed sign-in attempts", e));
+        }
+
+        // Services reachable from the network with no firewall in front of them.
+        // Only when both are true: a disabled firewall with nothing listening is a
+        // closed door either way.
+        let exposed = sec.firewall.state == "disabled" && sec.exposed_tcp > 0;
+        if let Some(held) = self.dwell.update("security.firewall_off", exposed, now, 300) {
+            let names: Vec<String> = sec.listeners.iter()
+                .filter(|l| l.proto == "tcp" && l.exposed())
+                .map(|l| format!("{} ({})", l.port, l.name()))
+                .collect();
+            self.fire(out, Alert::new("security.firewall_off", "", Severity::Notice,
+                "No firewall is on, and this machine is accepting network connections",
+                Explanation::new(format!(
+                    "{} service(s) accept connections from the network and {} is switched off.",
+                    sec.exposed_tcp, sec.firewall.tool))
+                    .expected("a firewall that refuses incoming connections you have not allowed")
+                    .since(held)
+                    .evidence("Reachable ports", names.join(", "))
+                    .evidence("Checked", sec.firewall.detail.clone())
+                    .action("Turn it on (outgoing traffic is unaffected):  sudo ufw enable")
+                    .action("Then allow only what you mean to share, e.g.:  sudo ufw allow 22/tcp")
+                    .action("On a network you fully trust this may be acceptable; ignore the rule if so")));
+        }
+    }
+
     fn learned_rules(&mut self, s: &Snapshot, cfg: &Config, now: i64, out: &mut Vec<Alert>) {
         // Abnormal idle power — the worked example from the specification.
         if s.power.has_battery && s.idle && s.power.power_w > 0.0 {
@@ -879,6 +964,99 @@ mod tests {
             t += 30_000;
         }
         e.evaluate(s, c, start + secs * 1000).alerts
+    }
+
+    // ---- Security ---------------------------------------------------
+
+    use crate::collectors::security::{AuthFailure, FirewallState, Listener};
+
+    fn listener(name: &str, port: u16, exposure: &str, expected: bool) -> Listener {
+        Listener {
+            proto: "tcp".into(), port, exposure: exposure.into(),
+            addresses: vec![if exposure == "loopback" { "127.0.0.1" } else { "0.0.0.0" }.into()],
+            owner: name.into(), key: format!("{name}:tcp/{port}"), expected,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_unaccepted_network_listener_alerts_at_once_and_names_it() {
+        let mut e = RuleEngine::new(&cfg());
+        let mut s = snap();
+        let l = listener("python3", 8000, "all", false);
+        s.security.listeners = vec![l.clone()];
+        s.security.unexpected = vec![l];
+        s.security.exposed_tcp = 1;
+        let a = e.evaluate(&s, &cfg(), 0).alerts;
+        let hit = a.iter().find(|x| x.rule_id == "security.new_listener")
+            .expect("no dwell: the moment it appears is the moment to say so");
+        assert_eq!(hit.fingerprint, "security.new_listener:python3:tcp/8000");
+        let text = hit.explanation.render();
+        assert!(text.contains("8000") && text.contains("python3"), "{text}");
+        assert!(text.contains("Security page"), "it must say how to accept it:\n{text}");
+
+        // Accepted (or gone) and it stops being reported.
+        s.security.unexpected.clear();
+        assert!(!e.evaluate(&s, &cfg(), 2000).alerts.iter().any(|x| x.rule_id == "security.new_listener"));
+    }
+
+    #[test]
+    fn failed_sign_ins_alert_at_the_threshold_and_remote_ones_are_worse() {
+        let mut e = RuleEngine::new(&cfg());
+        let mut s = snap();
+        let local = AuthFailure { service: "sudo".into(), user: "ronin".into(), ..Default::default() };
+        s.security.auth_failures_10m = 4;
+        s.security.recent_failures = vec![local.clone(); 4];
+        assert!(!e.evaluate(&s, &cfg(), 0).alerts.iter().any(|x| x.rule_id == "security.login_failures"),
+                "four mistyped passwords are not an incident");
+
+        s.security.auth_failures_10m = 5;
+        s.security.recent_failures = vec![local; 5];
+        let a = e.evaluate(&s, &cfg(), 2000).alerts;
+        let hit = a.iter().find(|x| x.rule_id == "security.login_failures").unwrap();
+        assert_eq!(hit.severity, Severity::Notice, "local failures are probably the owner");
+        assert!(hit.explanation.render().contains("mistyping"));
+
+        let remote = AuthFailure { service: "sshd".into(), user: "root".into(),
+                                   source: "203.0.113.9".into(), ..Default::default() };
+        s.security.recent_failures = vec![remote; 5];
+        let a = e.evaluate(&s, &cfg(), 4000).alerts;
+        let hit = a.iter().find(|x| x.rule_id == "security.login_failures").unwrap();
+        assert_eq!(hit.severity, Severity::Warning);
+        let text = hit.explanation.render();
+        assert!(text.contains("203.0.113.9") && text.contains("root"), "{text}");
+
+        // The threshold is the user's to move.
+        let mut c = cfg();
+        c.alerts.thresholds.insert("security.login_failures.count".into(), 50.0);
+        assert!(!e.evaluate(&s, &c, 6000).alerts.iter().any(|x| x.rule_id == "security.login_failures"));
+    }
+
+    #[test]
+    fn a_disabled_firewall_matters_only_when_something_is_reachable() {
+        let off = FirewallState { state: "disabled".into(), tool: "ufw".into(), detail: "d".into() };
+        let mut e = RuleEngine::new(&cfg());
+        let mut s = snap();
+        s.security.firewall = off.clone();
+        s.security.listeners = vec![listener("cupsd", 631, "loopback", true)];
+        assert!(!fire_until(&mut e, &s, &cfg(), 0, 301).iter().any(|x| x.rule_id == "security.firewall_off"),
+                "nothing listening on the network: a closed door either way");
+
+        let mut e = RuleEngine::new(&cfg());
+        s.security.listeners = vec![listener("root", 22, "all", true)];
+        s.security.exposed_tcp = 1;
+        assert!(!e.evaluate(&s, &cfg(), 0).alerts.iter().any(|x| x.rule_id == "security.firewall_off"),
+                "not on the first sample");
+        let a = fire_until(&mut e, &s, &cfg(), 0, 301);
+        let hit = a.iter().find(|x| x.rule_id == "security.firewall_off").expect("should fire");
+        assert!(hit.explanation.render().contains("sudo ufw enable"));
+
+        // Unknown is not "off": without evidence there is no accusation.
+        let mut e = RuleEngine::new(&cfg());
+        s.security.firewall = FirewallState { state: "unknown".into(), ..Default::default() };
+        assert!(!fire_until(&mut e, &s, &cfg(), 0, 301).iter().any(|x| x.rule_id == "security.firewall_off"));
+        s.security.firewall.state = "enabled".into();
+        assert!(!fire_until(&mut e, &s, &cfg(), 0, 301).iter().any(|x| x.rule_id == "security.firewall_off"));
     }
 
     // ---- Bluetooth --------------------------------------------------
