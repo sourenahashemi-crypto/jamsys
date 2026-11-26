@@ -185,6 +185,8 @@ pub struct Security {
     /// `name:proto/port` (the key shown on the Security page). Anything else that
     /// starts listening after the first run raises an alert.
     pub accepted_listeners: Vec<String>,
+    /// USB keyboards accepted the same way, as `usb-keyboard:vendor:product`.
+    pub accepted_devices: Vec<String>,
 }
 
 impl Default for Config {

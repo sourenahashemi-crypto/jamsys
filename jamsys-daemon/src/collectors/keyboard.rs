@@ -199,8 +199,6 @@ mod tests {
 
     #[test]
     fn a_machine_without_the_led_is_unsupported_not_an_error() {
-        let mut c = KeyboardCollector::new();
-        c.present = false;
         // probe() on a non-ASUS machine returns Unsupported, which is not a failure.
         let s = Support::Unsupported { reason: "x".into() };
         assert!(!s.is_usable());

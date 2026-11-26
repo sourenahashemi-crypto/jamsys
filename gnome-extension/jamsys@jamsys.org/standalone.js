@@ -519,7 +519,6 @@ app.connect('activate', () => {
 
     win.connect('map', () => {
         const ok = stackingAvailable();
-        for (const a of [ontopAction, stickyAction]) a?.set_enabled(ok);
         ontopAction?.set_state(GLib.Variant.new_boolean(ontop && ok));
         stickyAction?.set_state(GLib.Variant.new_boolean(sticky && ok));
         // Mutter can ignore state set at the instant of mapping, so ask once the
@@ -722,6 +721,17 @@ function applyInputShape() {
         const region = new Cairo.Region();
         for (const r of bareHitRegions(w, h))
             region.unionRectangle({x: r.x, y: r.y, width: r.w, height: r.h});
+        // The close button, from where it actually is. The region used to take
+        // it from the position the button was first designed at; the real
+        // widget is pinned to the corner, and at ordinary sizes the two barely
+        // overlapped -- so with click-through on, the one control that gets you
+        // out was outside the area that accepts clicks.
+        const [found, box] = closeBtn?.compute_bounds(area) ?? [false, null];
+        if (found) {
+            region.unionRectangle({
+                x: Math.floor(box.get_x()), y: Math.floor(box.get_y()),
+                width: Math.ceil(box.get_width()), height: Math.ceil(box.get_height())});
+        }
         surface.set_input_region(region);
     } catch (e) {
         // Shaping is a refinement, never a requirement.
@@ -828,8 +838,9 @@ function buildMenu() {
             a.set_state(GLib.Variant.new_boolean(get()));
             scheduleSave(name);
         });
-        // Greyed out rather than silently doing nothing on a native Wayland surface.
-        a.set_enabled(stackingAvailable());
+        // Left enabled even where it cannot work (a native Wayland surface): a
+        // greyed-out item explains nothing, and a disabled action never runs the
+        // handler above, so the dialog that says *why* could not be reached.
         win.add_action(a);
         return a;
     };

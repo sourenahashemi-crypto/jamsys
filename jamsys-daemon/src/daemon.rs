@@ -499,6 +499,10 @@ impl Daemon {
             // frame every couple of seconds — the UI would raise a toast each time for
             // a condition the user already knows about.
             let notified = self.alerts.raise(a.clone(), &self.store, &self.cfg);
+            if a.rule_id == "mem.oom" {
+                // Fires on the tick the kill counter moves, and never again.
+                self.alerts.hold(&a.fingerprint, 30 * 60_000);
+            }
             if !notified {
                 continue;
             }
@@ -809,6 +813,9 @@ impl Daemon {
                         .action(journal_action(&kind)),
                 );
                 let notified = self.alerts.raise(a.clone(), &self.store, &self.cfg);
+                // One line in the journal, not a condition that keeps being true.
+                self.alerts.hold(&a.fingerprint,
+                                 if a.severity >= Severity::Critical { 30 * 60_000 } else { 10 * 60_000 });
                 if notified {
                     let p = serde_json::json!({
                         "rule_id": a.rule_id, "fingerprint": a.fingerprint,
@@ -952,6 +959,10 @@ impl Daemon {
             }
         }
         self.flush_ctx_events(&mut ctx);
+        // What a collector learned from the event belongs in the snapshot. It
+        // was being dropped here, so a hotplug could log an event but could not
+        // change what the rules saw until the next scheduled sample.
+        self.snap = ctx.snap;
     }
 
     fn flush_ctx_events(&mut self, ctx: &mut Ctx) {
@@ -1231,11 +1242,19 @@ impl Daemon {
                 let key = s("key");
                 let accept = r.op == "accept_listener";
                 let mut cfg = (*self.cfg).clone();
-                let list = &mut cfg.security.accepted_listeners;
+                // The same operation accepts a USB keyboard; its key says which.
+                let device = key.starts_with("usb-keyboard:");
+                let list = if device { &mut cfg.security.accepted_devices }
+                           else { &mut cfg.security.accepted_listeners };
                 if accept {
-                    if !self.snap.security.listeners.iter().any(|l| l.key == key) {
+                    let present = if device {
+                        self.snap.security.keyboards.iter().any(|k| k.key == key)
+                    } else {
+                        self.snap.security.listeners.iter().any(|l| l.key == key)
+                    };
+                    if !present {
                         return Response::err(r.id, "not_found",
-                            format!("nothing called {key} is listening right now"));
+                            format!("nothing called {key} is present right now"));
                     }
                     if !list.contains(&key) {
                         list.push(key.clone());
@@ -1248,8 +1267,14 @@ impl Daemon {
                 }
                 self.cfg = Arc::new(cfg);
                 // Reflect it now rather than at the next slow tick.
-                let accepted = self.cfg.security.accepted_listeners.clone();
+                let mut accepted = self.cfg.security.accepted_listeners.clone();
+                accepted.extend(self.cfg.security.accepted_devices.iter().cloned());
                 let sec = &mut self.snap.security;
+                for k in sec.keyboards.iter_mut().filter(|k| k.key == key) {
+                    k.expected = accept;
+                }
+                sec.unexpected_keyboards =
+                    sec.keyboards.iter().filter(|k| !k.expected).cloned().collect();
                 for l in sec.listeners.iter_mut().filter(|l| l.key == key) {
                     l.expected = accept;
                 }

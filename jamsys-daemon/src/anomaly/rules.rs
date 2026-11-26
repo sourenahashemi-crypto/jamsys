@@ -674,6 +674,38 @@ impl RuleEngine {
                 format!("{} started accepting network connections on port {}", l.name(), l.port), e));
         }
 
+        // A keyboard nobody has seen before. The attack this catches is a device
+        // that looks like a memory stick or a charging cable and types commands
+        // the moment it is plugged in.
+        for k in &sec.unexpected_keyboards {
+            self.fire(out, Alert::new("security.new_keyboard", &k.key, Severity::Warning,
+                format!("A new USB keyboard was connected: {}", k.name),
+                Explanation::new(format!(
+                    "{} has connected as a keyboard and can type into this computer.", k.name))
+                    .expected("only keyboards that were connected when JamSys first ran, or that you have accepted since")
+                    .evidence("Device", k.key.trim_start_matches("usb-keyboard:").to_string())
+                    .action("If you just plugged in a keyboard, or a receiver for one, accept it on the Security page")
+                    .action("If what you plugged in is not supposed to be a keyboard (a USB stick, a cable, a gadget), unplug it now")
+                    .action("Then check what was typed: look for a terminal or window you did not open")));
+        }
+
+        // The router's hardware address changing under a live connection.
+        if let Some(ch) = &sec.gateway_change {
+            self.fire(out, Alert::new("security.gateway_changed", "", Severity::Warning,
+                "The router's address changed while you stayed connected",
+                Explanation::new(format!(
+                    "The device answering as your router ({}) changed from {} to {} without the connection dropping.",
+                    ch.ip, ch.old_mac, ch.new_mac))
+                    .expected("the same hardware address for as long as the connection is up")
+                    .evidence("Router address now", sec.gateway_mac.clone())
+                    .cause("On a shared network this is what interception looks like: another device \
+                            claiming to be the router so that your traffic passes through it. It also \
+                            happens innocently when a router fails over or is replaced")
+                    .action("On public or shared Wi-Fi: disconnect, or use a VPN before doing anything private")
+                    .action("At home: check whether your router restarted or you have a mesh system that hands over")
+                    .action("To see the current mapping:  ip neigh show")));
+        }
+
         // Repeated failed sign-ins. A count over a window, so it clears itself as
         // the failures age out.
         let limit = cfg.threshold("security.login_failures", "count", 5.0);
@@ -1011,6 +1043,32 @@ mod tests {
         // Accepted (or gone) and it stops being reported.
         s.security.unexpected.clear();
         assert!(!e.evaluate(&s, &cfg(), 2000).alerts.iter().any(|x| x.rule_id == "security.new_listener"));
+    }
+
+    #[test]
+    fn a_new_keyboard_and_a_changed_router_each_raise_a_warning() {
+        use crate::collectors::security::{GatewayChange, UsbKeyboard};
+        let mut e = RuleEngine::new(&cfg());
+        let mut s = snap();
+        assert!(!e.evaluate(&s, &cfg(), 0).alerts.iter().any(|a| a.rule_id.starts_with("security.")));
+
+        s.security.unexpected_keyboards = vec![UsbKeyboard {
+            key: "usb-keyboard:1b4f:9206".into(), name: "Totally A Flash Drive".into(), expected: false }];
+        let a = e.evaluate(&s, &cfg(), 2000).alerts;
+        let k = a.iter().find(|x| x.rule_id == "security.new_keyboard").expect("fires at once");
+        assert_eq!(k.severity, Severity::Warning);
+        assert_eq!(k.fingerprint, "security.new_keyboard:usb-keyboard:1b4f:9206");
+        let text = k.explanation.render();
+        assert!(text.contains("Totally A Flash Drive") && text.contains("unplug it now"), "{text}");
+
+        s.security.unexpected_keyboards.clear();
+        s.security.gateway_change = Some(GatewayChange {
+            ts_ms: 0, ip: "192.168.1.1".into(), old_mac: "aa:aa".into(), new_mac: "cc:cc".into() });
+        let a = e.evaluate(&s, &cfg(), 4000).alerts;
+        let g = a.iter().find(|x| x.rule_id == "security.gateway_changed").unwrap();
+        let text = g.explanation.render();
+        assert!(text.contains("aa:aa") && text.contains("cc:cc") && text.contains("VPN"), "{text}");
+        assert!(text.contains("fails over"), "it must say there is an innocent explanation too");
     }
 
     #[test]

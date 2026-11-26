@@ -717,11 +717,16 @@ class OverviewPage(Page):
             return
         checks = sec.get("checks") or []
         failing = [c for c in checks if c.get("status") == "warn"]
-        new = len(sec.get("unexpected") or [])
+        new = (len(sec.get("unexpected") or []) + len(sec.get("unexpected_keyboards") or [])
+               + (1 if sec.get("gateway_change") else 0))
         fails = sec.get("auth_failures_10m", 0)
         fw = (sec.get("firewall") or {}).get("state", "unknown")
         status, word = "healthy", "Normal"
-        if new:
+        if sec.get("gateway_change"):
+            status, word = "attention", "Router changed"
+        elif sec.get("unexpected_keyboards"):
+            status, word = "attention", "New keyboard"
+        elif new:
             status, word = "attention", "New listener"
         elif failing:
             status, word = "attention", "Worth fixing"
@@ -1242,6 +1247,8 @@ class SecurityPage(Page):
         self._checkup(sec)
         self._firewall(sec.get("firewall") or {}, sec.get("exposed_tcp", 0))
         self._sign_ins(sec)
+        self._network(sec)
+        self._keyboards(sec)
         listeners = sec.get("listeners") or []
         tcp = [l for l in listeners if l.get("proto") == "tcp"]
         self._listeners(
@@ -1415,6 +1422,60 @@ class SecurityPage(Page):
                 2 if f.get("source") else 1, who,
                 f"{clock_hm(f.get('ts_ms'))} · {human_ago(f.get('ts_ms'), now)} · "
                 + (f"from {f['source']}" if f.get("source") else "at this computer")))
+        self.body.append(g)
+
+    def _network(self, sec):
+        """Who this machine is trusting to carry and to name things for it."""
+        if not sec.get("gateway_ip") and not sec.get("dns_servers"):
+            return
+        g = self.group(
+            "This network",
+            "The router carries everything you send; the DNS servers decide where names "
+            "lead. A change in either while the connection stays up is how traffic gets "
+            "redirected, so both are watched.")
+        ch = sec.get("gateway_change")
+        if ch:
+            g.add(severity_row(
+                2, "The router's hardware address changed while you stayed connected",
+                f"{clock_hm(ch.get('ts_ms'))} · {ch.get('old_mac')} → {ch.get('new_mac')}. "
+                "On shared Wi-Fi this can mean interception; at home, a router restart "
+                "or mesh hand-over. See the alert for what to do."))
+        if sec.get("gateway_ip"):
+            g.add(self.row("Router", sec.get("gateway_mac") or "address not known yet",
+                           f"{sec['gateway_ip']} · hardware address as this machine sees it"))
+        if sec.get("dns_servers"):
+            g.add(self.row("DNS servers", ", ".join(sec["dns_servers"]),
+                           "a change on the same connection is recorded under Events"))
+        self.body.append(g)
+
+    def _keyboards(self, sec):
+        boards = sec.get("keyboards") or []
+        if not boards:
+            return
+        g = self.group(
+            "USB keyboards",
+            "Anything that plugs in and announces itself as a keyboard can type commands. "
+            "A new one raises an alert until you accept it, because some devices that look "
+            "like memory sticks or cables are keyboards in disguise.")
+        for k in boards:
+            new = k.get("expected") is False
+            row = Adw.ActionRow(
+                title=GLib.markup_escape_text(k.get("name", "?")),
+                subtitle=GLib.markup_escape_text(
+                    str(k.get("key", "")).replace("usb-keyboard:", "USB id ")))
+            ic = Gtk.Image.new_from_icon_name(
+                "dialog-warning-symbolic" if new else "input-keyboard-symbolic")
+            ic.add_css_class("sv-attention" if new else "dim-label")
+            row.add_prefix(ic)
+            if new:
+                tag = Gtk.Label(label="New")
+                tag.add_css_class("sv-attention")
+                row.add_suffix(tag)
+                b = Gtk.Button(label="Accept", valign=Gtk.Align.CENTER,
+                               tooltip_text="This is my keyboard: stop alerting about it")
+                b.connect("clicked", lambda _b, key=k.get("key"): self.win.accept_listener(key))
+                row.add_suffix(b)
+            g.add(row)
         self.body.append(g)
 
     def _listeners(self, title, description, items, empty, judge=False):

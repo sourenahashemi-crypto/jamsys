@@ -415,5 +415,38 @@ pp.render({"snapshot": {"process": procs, "gpu": {"display_driver": "Intel", "nv
 check("on Intel graphics there is no such note",
       not any("does not publish it" in t for t in labels(pp.body)))
 
+print("\nrouter, DNS and USB keyboards on the Security page")
+kacc = []
+kwin = StubWin()
+kwin.accept_listener = kacc.append
+kp = SecurityPage(kwin)
+NET = dict(SEC, checks=[], gateway_ip="192.168.12.1", gateway_mac="64:7b:1e:f2:58:c1",
+           dns_servers=["192.168.12.1", "fd96::1"],
+           gateway_change={"ts_ms": 1_700_000_000_000, "ip": "192.168.12.1",
+                           "old_mac": "64:7b:1e:f2:58:c1", "new_mac": "de:ad:be:ef:00:01"},
+           keyboards=[{"key": "usb-keyboard:046d:c31c", "name": "Logitech Keyboard", "expected": True},
+                      {"key": "usb-keyboard:1b4f:9206", "name": "Totally A <Flash> Drive", "expected": False}],
+           unexpected_keyboards=[{"key": "usb-keyboard:1b4f:9206", "name": "x", "expected": False}])
+kp.update({"snapshot": {"security": NET}})
+kt = labels(kp.body)
+check("the router and its hardware address are shown", "64:7b:1e:f2:58:c1" in kt)
+check("so are the DNS servers", "192.168.12.1, fd96::1" in kt)
+check("a changed router address is called out with both addresses",
+      any("de:ad:be:ef:00:01" in t for t in kt))
+check("a keyboard's name survives markup characters", "Totally A <Flash> Drive" in kt)
+kb = [w for w in appmod._walk(kp.body) if isinstance(w, Gtk.Button) and w.get_label() == "Accept"]
+check("only the new keyboard (and the new listener) can be accepted", len(kb) == 2, f"{len(kb)}")
+for b in kb:
+    b.emit("clicked")
+check("accepting the keyboard sends its key", "usb-keyboard:1b4f:9206" in kacc, str(kacc))
+ov3 = OverviewPage(StubWin())
+ov3._security_card({"security": NET})
+check("the Overview card leads with the changed router",
+      "Router changed" in labels(ov3.cards["security"]), str(labels(ov3.cards["security"])))
+plain = dict(SEC, checks=[])
+kp.update({"snapshot": {"security": plain}})
+check("with no router or keyboard data those sections are absent",
+      "USB keyboards" not in labels(kp.body) and "This network" not in labels(kp.body))
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

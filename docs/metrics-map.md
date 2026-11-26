@@ -170,6 +170,10 @@ Detection only. Nothing is blocked and no packet is read; see
 | Firewall on/off | `ENABLED=` in `/etc/ufw/ufw.conf`; `/run/firewalld.pid` | none | **the rules are root-only and are not read.** With neither tool present the state is `unknown`, never "off" |
 | Failed sign-ins | a second `journalctl --follow` restricted to sshd, sudo, su, login, polkitd, gdm | `adm` or `systemd-journal` | informational priority, which the main follower excludes. sshd is counted from its own lines and every other service from `pam_unix`, so one attempt is one count |
 
+| Router hardware address | `/proc/net/arp` entry for the default gateway | none | compared only across samples where the interface's `carrier_changes` count is unchanged: a different router after reconnecting is a different network, the same link answering from a different address is not |
+| DNS servers | `/run/systemd/resolve/resolv.conf`, else `/etc/resolv.conf` | none | a change on the same link is an event, not an alert: a VPN connecting does it legitimately |
+| USB keyboards | `/sys/bus/usb/devices/*:*` with interface class `03`, protocol `01` | none | re-read at once on a USB `add` uevent, not at the next sample. Baseline in `known-keyboards.json`, learned once like the listeners; accepted ones in `[security] accepted_devices` |
+
 **The checkup.** A short list of settings, each `ok`, `warn` (with the one command
 that fixes it), `note` (worth knowing, not simply fixable) or `unknown`. A check
 whose source file is absent is left out or marked unknown, never assumed.
@@ -181,6 +185,10 @@ whose source file is absent is left out or marked unknown, never assumed.
 | Automatic security updates | `APT::Periodic::Unattended-Upgrade` in `/etc/apt/apt.conf.d/*` | set to `0` |
 | Updates waiting | `/var/lib/update-notifier/updates-available` | any is a security update. The "ESM Apps" advertisement in that file is not counted |
 | Restart needed | `/run/reboot-required` | present |
+| Automatic login | `AutomaticLoginEnable` / `TimedLoginEnable` in `/etc/gdm3/custom.conf` | enabled |
+| Extra root accounts | `/etc/passwd` | any account other than `root` has uid 0 |
+| SSH server | `sshd_config.d/*.conf` then `sshd_config`, first occurrence wins as in sshd. Only if sshd is installed | passwords accepted (the default), or root may sign in with one |
+| SSH private keys | permission bits of `~/.ssh/id_*`. **The files are never opened** | readable by group or others |
 | Disk encryption | device mounted at `/`, followed through device-mapper `slaves` for a `CRYPT-` uuid | never: unencrypted is a `note`, since it can only be chosen at install time |
 | Secure Boot | byte 5 of the `SecureBoot-*` EFI variable | never: off is a `note`, changed in firmware setup |
 

@@ -70,6 +70,8 @@ pub struct Nvml {
     clock: Option<FnClock>,
     driver_version: Option<FnDriverVersion>,
     procs: Option<FnProcs>,
+    /// Same shape as `procs`, for processes rendering rather than computing.
+    gprocs: Option<FnProcs>,
     fan: Option<FnFanSpeed>,
     /// Resolved but not yet used. Kept so that adding multi-GPU disambiguation by PCI
     /// address later needs no change to the loader.
@@ -135,6 +137,8 @@ impl Nvml {
                 driver_version: dlsym_opt(h, "nvmlSystemGetDriverVersion"),
                 procs: dlsym_opt(h, "nvmlDeviceGetComputeRunningProcesses_v3")
                     .or_else(|| dlsym_opt(h, "nvmlDeviceGetComputeRunningProcesses_v2")),
+                gprocs: dlsym_opt(h, "nvmlDeviceGetGraphicsRunningProcesses_v3")
+                    .or_else(|| dlsym_opt(h, "nvmlDeviceGetGraphicsRunningProcesses_v2")),
                 fan: dlsym_opt(h, "nvmlDeviceGetFanSpeed"),
                 pci_info: dlsym_opt(h, "nvmlDeviceGetPciInfo_v3"),
             });
@@ -287,8 +291,27 @@ impl Device<'_> {
     }
 
     /// PIDs with GPU memory allocated, and how much.
+    /// Every process using the card, with its video memory.
+    ///
+    /// Compute *and* graphics clients. Only the compute list used to be read, so
+    /// a card busy drawing a game or the desktop -- which is what a laptop GPU
+    /// mostly does -- looked as if nothing was using it, and "awake with nothing
+    /// using it" could be claimed while a compositor was rendering on it.
     pub fn processes(&self) -> Vec<(u32, u64)> {
-        let Some(f) = self.n.procs else { return Vec::new() };
+        let mut all: Vec<(u32, u64)> = Vec::new();
+        for f in [self.n.procs, self.n.gprocs].into_iter().flatten() {
+            for (pid, mem) in self.process_list(f) {
+                match all.iter_mut().find(|(p, _)| *p == pid) {
+                    // In both lists: one process, counted once.
+                    Some(e) => e.1 = e.1.max(mem),
+                    None => all.push((pid, mem)),
+                }
+            }
+        }
+        all
+    }
+
+    fn process_list(&self, f: FnProcs) -> Vec<(u32, u64)> {
         let mut count: c_uint = 64;
         let mut buf = vec![
             ProcessInfo { pid: 0, used_gpu_memory: 0, gpu_instance_id: 0, compute_instance_id: 0 };

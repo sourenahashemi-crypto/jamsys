@@ -219,6 +219,10 @@ an unprivileged program can honestly observe, and says what it could not.
 | Failed sign-in counting | Working for sudo; **sshd unverified** | On the installed daemon, six wrong passwords given to `sudo` were counted as exactly six (each attempt writes three journal lines) and raised `security.login_failures` within seconds, as a Notice naming the account; it resolved by itself as the window emptied. sshd is not installed here, so its patterns have only met documented formats, never a real line |
 | Security checkup | Working | Seven checks read from world-readable files. On this machine: automatic updates on, no updates waiting (the "22 ESM Apps" advertisement is correctly not counted), no restart pending, Secure Boot on, system disk **not** encrypted (reported as a note, not a failure) |
 | Turning the firewall on or off from the window | **Unverified live** | `pkexec /usr/sbin/ufw --force enable` / `disable`, fixed argument vectors. The button and its wiring are tested with the command stubbed; the real command was not run, because it needs the administrator password |
+| Router address change (ARP spoofing) | Working, **alert unverified live** | Reads the gateway's hardware address (here `64:7b:1e:…` for 192.168.12.1) and compares it only across samples where the link did not drop. The detection is tested against a constructed ARP table; provoking it for real would mean poisoning this network |
+| DNS server change | Working, event unverified live | Reads the servers in use (the router and its IPv6 address here). A change on the same link is recorded as an event |
+| New USB keyboard | **Unverified on hardware** | Tested against a constructed `/sys/bus/usb` tree, including a mouse and a memory stick that must not match. No USB keyboard is attached to this machine, so the real path has never seen one |
+| More checkup items | Working where present | Automatic login (off here), extra uid-0 accounts (none), SSH server settings (sshd not installed, so the check is absent), SSH private-key permissions (`id_ed25519` is 0600; the file is never opened) |
 | Process name for another user's socket | Unsupported | Needs root. Shown by account (`root`), and the page says so |
 | Outbound connections per process | Not implemented | |
 | Blocking, or reading firewall rules | Unsupported by design | Would require the daemon or a helper to hold root and accept addresses and ports, which the privilege rules exclude |
@@ -307,9 +311,15 @@ extension's are installed on disk but not loaded until the next login.
 | Localisation | The interface is English only. Nothing is marked for translation and the window has not been checked under a right-to-left locale. This is a feature of its own, not a fix |
 | The Shell extension, live | Still unseen: it needs a logout to load |
 | `security.firewall_off` and the sshd patterns | Unit-tested only; see §4a |
-| NVML graphics processes | `gpu.idle_awake` still counts compute processes only. The display check above covers the case that occurs here |
-| Alerts raised from a single journal line | They resolve after the 120 s hysteresis like any other, which also withdraws a critical notification ("GPU has fallen off the bus") after two minutes. Arguably they should hold |
-| Close-button hit region under click-through | Derived from a design position that no longer matches the real button at ordinary sizes. Click-through is off by default and unusable on Mutter anyway |
+| Screen-lock and screen-reader checks | Whether the screen locks itself lives in the user's dconf database, which the daemon does not read; nothing has been exercised with a screen reader |
+
+Closed since: NVIDIA graphics clients are now counted alongside compute ones;
+alerts raised from a single journal line or an OOM kill are held open (30 minutes
+if critical, 10 otherwise) instead of resolving after two; the click-through region
+is built from the close button's real position; and the stacking toggles under a
+native Wayland surface open the dialog that explains them instead of being greyed
+out with no reason given. The last two are not covered by a test: they need a
+mapped window.
 
 ## 6. Resource usage
 

@@ -136,6 +136,65 @@ pub fn parse_updates_available(text: &str) -> Option<(u32, Option<u32>)> {
     Some((all, sec.or(if all == 0 { Some(0) } else { None })))
 }
 
+/// A USB device that presents itself as a keyboard.
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+pub struct UsbKeyboard {
+    /// `usb-keyboard:vendor:product`.
+    pub key: String,
+    pub name: String,
+    /// False for one that was neither present at first run nor accepted since.
+    pub expected: bool,
+}
+
+/// The router's hardware address changed while the link stayed up.
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+pub struct GatewayChange {
+    pub ts_ms: i64,
+    pub ip: String,
+    pub old_mac: String,
+    pub new_mac: String,
+}
+
+/// Hardware address the kernel has for `ip`, from `/proc/net/arp`. Only
+/// completed entries (flag 0x2): an incomplete one has no address to compare.
+pub fn arp_lookup(table: &str, ip: &str) -> Option<String> {
+    table.lines().skip(1).find_map(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        let complete = f.get(2).and_then(|x| u32::from_str_radix(x.trim_start_matches("0x"), 16).ok())
+            .is_some_and(|flags| flags & 0x2 != 0);
+        (f.len() >= 4 && f[0] == ip && complete && f[3] != "00:00:00:00:00:00")
+            .then(|| f[3].to_ascii_lowercase())
+    })
+}
+
+/// `nameserver` lines of a resolv.conf, in order.
+pub fn parse_nameservers(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|l| l.trim().strip_prefix("nameserver"))
+        .map(|v| v.trim().to_string())
+        .filter(|v| v.parse::<IpAddr>().is_ok() || v.split('%').next().is_some_and(|a| a.parse::<IpAddr>().is_ok()))
+        .collect()
+}
+
+/// Is `key = true` set (uncommented) in a GDM `custom.conf`?
+pub fn gdm_flag(text: &str, key: &str) -> bool {
+    text.lines().map(str::trim).filter(|l| !l.starts_with('#')).any(|l| {
+        l.split_once('=').is_some_and(|(k, v)|
+            k.trim().eq_ignore_ascii_case(key) && v.trim().eq_ignore_ascii_case("true"))
+    })
+}
+
+/// The value sshd would use for `key`: the first occurrence wins, as in sshd
+/// itself. `texts` must be in the order sshd reads them.
+pub fn sshd_setting(texts: &[String], key: &str) -> Option<String> {
+    texts.iter().flat_map(|t| t.lines()).map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .find_map(|l| {
+            let mut it = l.split_whitespace();
+            (it.next()?.eq_ignore_ascii_case(key)).then(|| it.next().unwrap_or("").to_ascii_lowercase())
+        })
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct SecurityState {
     pub listeners: Vec<Listener>,
@@ -156,6 +215,15 @@ pub struct SecurityState {
     pub checks: Vec<Check>,
     /// How many of `checks` are "warn".
     pub checks_failing: usize,
+    /// The default gateway and the hardware address answering for it.
+    pub gateway_ip: String,
+    pub gateway_mac: String,
+    /// Set for half an hour after that address changed with the link still up.
+    pub gateway_change: Option<GatewayChange>,
+    /// The DNS servers actually in use (upstream of systemd-resolved).
+    pub dns_servers: Vec<String>,
+    pub keyboards: Vec<UsbKeyboard>,
+    pub unexpected_keyboards: Vec<UsbKeyboard>,
 }
 
 /// One row of `/proc/net/{tcp,udp}{,6}`.
@@ -439,6 +507,13 @@ pub struct SecurityCollector {
     settings_at: i64,
     /// Ask the kernel over sock_diag rather than reading /proc/net/tcp.
     use_diag: bool,
+    home: PathBuf,
+    keyboard_file: PathBuf,
+    keyboard_baseline: Option<BTreeSet<String>>,
+    /// (interface, its carrier_changes count, gateway ip, gateway mac) last seen.
+    link: Option<(String, u64, String, String)>,
+    gateway_change: Option<GatewayChange>,
+    last_dns: Option<(u64, Vec<String>)>,
 }
 
 impl SecurityCollector {
@@ -461,6 +536,12 @@ impl SecurityCollector {
             settings: Vec::new(),
             settings_at: 0,
             use_diag: true,
+            home: std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| "/nonexistent".into()),
+            keyboard_file: crate::config::data_dir().join("known-keyboards.json"),
+            keyboard_baseline: None,
+            link: None,
+            gateway_change: None,
+            last_dns: None,
         }
     }
 
@@ -475,6 +556,8 @@ impl SecurityCollector {
             sys_root: root.join("sys"),
             var: root.join("var"),
             baseline_file: root.join("known-listeners.json"),
+            keyboard_file: root.join("known-keyboards.json"),
+            home: root.join("home"),
             use_diag: false,
             ..Self::new()
         }
@@ -743,6 +826,78 @@ impl SecurityCollector {
             });
         }
 
+        // Automatic login: whoever opens the lid is signed in.
+        for conf in ["gdm3/custom.conf", "gdm/custom.conf"] {
+            if let Some(t) = read_str(self.etc.join(conf)) {
+                out.push(if gdm_flag(&t, "AutomaticLoginEnable") || gdm_flag(&t, "TimedLoginEnable") {
+                    check("auto_login", "warn", "This computer signs in without a password",
+                        "Automatic login is on, so anyone who switches it on is in your account. \
+                         Turn it off in Settings → System → Users → Automatic Login.", "")
+                } else {
+                    check("auto_login", "ok", "A password is needed to sign in",
+                          "Automatic login is off.", "")
+                });
+                break;
+            }
+        }
+
+        // An account with uid 0 is root under another name.
+        if let Some(t) = read_str(self.etc.join("passwd")) {
+            let roots: Vec<&str> = t.lines()
+                .filter_map(|l| { let f: Vec<&str> = l.split(':').collect();
+                                  (f.get(2) == Some(&"0")).then(|| f[0]) })
+                .filter(|n| *n != "root").collect();
+            if !roots.is_empty() {
+                out.push(check("root_accounts", "warn",
+                    format!("{} extra account(s) have full administrator rights", roots.len()),
+                    format!("{} share(s) root's user id. Unless you created this on purpose, it \
+                             is a classic sign of a compromised system.", roots.join(", ")),
+                    "getent passwd 0"));
+            }
+        }
+
+        // SSH server, only if one is installed.
+        let ssh = self.etc.join("ssh");
+        if ssh.join("sshd_config").exists() {
+            // sshd reads the Include at the top of the stock file first.
+            let mut drop_ins = list_dir(ssh.join("sshd_config.d"));
+            drop_ins.retain(|f| f.ends_with(".conf"));
+            let mut texts: Vec<String> = drop_ins.iter()
+                .filter_map(|f| read_str(ssh.join("sshd_config.d").join(f))).collect();
+            texts.extend(read_str(ssh.join("sshd_config")));
+            let passwords = sshd_setting(&texts, "PasswordAuthentication").as_deref() != Some("no");
+            let root_pw = sshd_setting(&texts, "PermitRootLogin").as_deref() == Some("yes");
+            out.push(if root_pw {
+                check("ssh_server", "warn", "SSH lets root sign in with a password",
+                    "The one account every attacker tries, guessable from the network.",
+                    "echo 'PermitRootLogin no' | sudo tee /etc/ssh/sshd_config.d/00-no-root.conf && sudo systemctl reload ssh")
+            } else if passwords {
+                check("ssh_server", "warn", "SSH accepts passwords",
+                    "Anyone who can reach this machine can try to guess one. Keys cannot be \
+                     guessed; once yours is in ~/.ssh/authorized_keys, turn passwords off.",
+                    "echo 'PasswordAuthentication no' | sudo tee /etc/ssh/sshd_config.d/00-keys-only.conf && sudo systemctl reload ssh")
+            } else {
+                check("ssh_server", "ok", "SSH accepts keys only",
+                      "Password sign-in is off in sshd's configuration.", "")
+            });
+        }
+
+        // Private keys other accounts can read. Permissions only: the keys
+        // themselves are never opened.
+        let dir = self.home.join(".ssh");
+        let loose: Vec<String> = list_dir(&dir).into_iter()
+            .filter(|f| f.starts_with("id_") && !f.ends_with(".pub"))
+            .filter(|f| {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::metadata(dir.join(f)).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o077 != 0)
+            }).collect();
+        if !loose.is_empty() {
+            out.push(check("ssh_keys", "warn", "An SSH private key is readable by other accounts",
+                format!("{} in ~/.ssh can be read by users other than you. (The key itself was \
+                         not opened; only its permissions were checked.)", loose.join(", ")),
+                &format!("chmod 600 {}", loose.iter().map(|f| format!("~/.ssh/{f}")).collect::<Vec<_>>().join(" "))));
+        }
+
         let efi = self.sys_root.join("firmware/efi/efivars");
         if let Some(var) = list_dir(&efi).into_iter().find(|n| n.starts_with("SecureBoot-")) {
             // Four attribute bytes, then the value.
@@ -762,31 +917,118 @@ impl SecurityCollector {
         if self.baseline.is_some() {
             return;
         }
-        if let Some(text) = read_str(&self.baseline_file) {
-            if let Ok(v) = serde_json::from_str::<Vec<String>>(&text) {
-                self.baseline = Some(v.into_iter().collect());
-                return;
-            }
-            crate::log_warn!("{} is unreadable; learning the listeners again",
-                             self.baseline_file.display());
-        }
-        // First run: what is here now is what "normal" means.
-        let learned: BTreeSet<String> = current.iter()
+        let now: BTreeSet<String> = current.iter()
             .filter(|l| l.proto == "tcp" && l.exposed())
             .map(|l| l.key.clone())
             .collect();
-        if let Some(dir) = self.baseline_file.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let body = serde_json::to_string_pretty(&learned.iter().collect::<Vec<_>>()).unwrap_or_default();
-        let tmp = self.baseline_file.with_extension("json.tmp");
-        if std::fs::write(&tmp, body).and_then(|_| std::fs::rename(&tmp, &self.baseline_file)).is_err() {
-            crate::log_warn!("could not save {}; new listeners will be judged against \
-                              this session only", self.baseline_file.display());
-        }
-        crate::log_info!("learned {} network-facing listener(s) as the baseline", learned.len());
-        self.baseline = Some(learned);
+        self.baseline = Some(learn_once(&self.baseline_file, now, "network-facing listener"));
     }
+
+    /// USB devices currently presenting a keyboard interface (HID boot keyboard:
+    /// interface class 03, protocol 01).
+    fn usb_keyboards(&self) -> Vec<UsbKeyboard> {
+        let root = self.sys_root.join("bus/usb/devices");
+        let mut out: BTreeMap<String, UsbKeyboard> = BTreeMap::new();
+        for entry in list_dir(&root) {
+            // Interfaces are "<device>:<config>.<interface>".
+            let Some((dev, _)) = entry.split_once(':') else { continue };
+            let iface = root.join(&entry);
+            if read_str(iface.join("bInterfaceClass")).as_deref() != Some("03")
+                || read_str(iface.join("bInterfaceProtocol")).as_deref() != Some("01") {
+                continue;
+            }
+            let d = root.join(dev);
+            let (Some(v), Some(p)) = (read_str(d.join("idVendor")), read_str(d.join("idProduct"))) else { continue };
+            let name = [read_str(d.join("manufacturer")), read_str(d.join("product"))]
+                .into_iter().flatten().collect::<Vec<_>>().join(" ");
+            let key = format!("usb-keyboard:{v}:{p}");
+            out.entry(key.clone()).or_insert(UsbKeyboard {
+                key,
+                name: if name.is_empty() { format!("USB device {v}:{p}") } else { name },
+                expected: true,
+            });
+        }
+        out.into_values().collect()
+    }
+
+    /// Watch the router's hardware address and the DNS servers for a change
+    /// that happens *while the link stays up*.
+    ///
+    /// Both legitimately differ from one network to the next, so a bare change
+    /// means nothing. What distinguishes "joined another network" from "someone
+    /// on this network is answering for the router" is whether the interface
+    /// dropped in between, and the kernel counts that: `carrier_changes`.
+    fn watch_network(&mut self, ctx: &mut Ctx, st: &mut SecurityState) {
+        let net = &ctx.snap.network;
+        let (Some(ip), Some(iface)) = (net.default_route.clone(), net.default_iface.clone()) else {
+            self.link = None;
+            self.last_dns = None;
+            return;
+        };
+        let carrier = read_str(self.sys_root.join("class/net").join(&iface).join("carrier_changes"))
+            .and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        let mac = read_str(self.proc_net.join("arp")).and_then(|t| arp_lookup(&t, &ip));
+        st.gateway_ip = ip.clone();
+        st.gateway_mac = mac.clone().unwrap_or_default();
+
+        if let Some(mac) = mac {
+            if let Some((p_iface, p_carrier, p_ip, p_mac)) = &self.link {
+                if *p_iface == iface && *p_carrier == carrier && *p_ip == ip && *p_mac != mac {
+                    let ch = GatewayChange { ts_ms: ctx.ts_ms, ip: ip.clone(),
+                                             old_mac: p_mac.clone(), new_mac: mac.clone() };
+                    ctx.event(Event::new("security", "gateway_changed", format!(
+                        "The router at {ip} changed hardware address ({} → {}) without the \
+                         connection dropping", ch.old_mac, ch.new_mac), Severity::Warning));
+                    self.gateway_change = Some(ch);
+                }
+            }
+            self.link = Some((iface, carrier, ip, mac));
+        }
+        // Reported for half an hour, then left to the event log.
+        if self.gateway_change.as_ref().is_some_and(|c| !(0..1_800_000).contains(&(ctx.ts_ms - c.ts_ms))) {
+            self.gateway_change = None;
+        }
+        st.gateway_change = self.gateway_change.clone();
+
+        let dns = read_str(self.run.join("systemd/resolve/resolv.conf"))
+            .or_else(|| read_str(self.etc.join("resolv.conf")))
+            .map(|t| parse_nameservers(&t)).unwrap_or_default();
+        if let Some((p_carrier, prev)) = &self.last_dns {
+            if *p_carrier == carrier && *prev != dns && !prev.is_empty() && !dns.is_empty() {
+                ctx.event(Event::new("security", "dns_changed", format!(
+                    "DNS servers changed from {} to {} on the same connection (a VPN \
+                     connecting does this; so does something redirecting your lookups)",
+                    prev.join(", "), dns.join(", ")), Severity::Notice));
+            }
+        }
+        self.last_dns = Some((carrier, dns.clone()));
+        st.dns_servers = dns;
+    }
+}
+
+/// Read a baseline from `path`, or -- the first time only -- make `current` the
+/// baseline and save it. Never grows on its own afterwards.
+fn learn_once(path: &std::path::Path, current: BTreeSet<String>, what: &str) -> BTreeSet<String> {
+    if let Some(text) = read_str(path) {
+        if let Ok(v) = serde_json::from_str::<Vec<String>>(&text) {
+            return v.into_iter().collect();
+        }
+        crate::log_warn!("{} is unreadable; learning it again", path.display());
+    } else if path.exists() {
+        // Present but empty: an empty baseline, not a first run.
+        return BTreeSet::new();
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let body = serde_json::to_string_pretty(&current.iter().collect::<Vec<_>>()).unwrap_or_default();
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, body).and_then(|_| std::fs::rename(&tmp, path)).is_err() {
+        crate::log_warn!("could not save {}; it will be judged against this session only",
+                         path.display());
+    }
+    crate::log_info!("learned {} {what}(s) as the baseline", current.len());
+    current
 }
 
 impl Default for SecurityCollector {
@@ -872,7 +1114,18 @@ impl Collector for SecurityCollector {
                 listeners.iter().filter(|l| l.proto == "tcp" && l.exposed()).collect();
             self.checks(&firewall, &exposed, unexpected.len(), ctx.ts_ms)
         };
-        let st = SecurityState {
+        let mut keyboards = self.usb_keyboards();
+        if self.keyboard_baseline.is_none() {
+            let now: BTreeSet<String> = keyboards.iter().map(|k| k.key.clone()).collect();
+            self.keyboard_baseline = Some(learn_once(&self.keyboard_file, now, "USB keyboard"));
+        }
+        for k in keyboards.iter_mut() {
+            k.expected = self.keyboard_baseline.as_ref().is_some_and(|b| b.contains(&k.key))
+                || ctx.config.security.accepted_devices.iter().any(|a| a == &k.key);
+        }
+        let mut st = SecurityState {
+            unexpected_keyboards: keyboards.iter().filter(|k| !k.expected).cloned().collect(),
+            keyboards,
             exposed_tcp: listeners.iter().filter(|l| l.proto == "tcp" && l.exposed()).count(),
             unexpected,
             checks_failing: checks.iter().filter(|c| c.status == "warn").count(),
@@ -884,7 +1137,9 @@ impl Collector for SecurityCollector {
             auth_log_watched: ctx.snap.security.auth_log_watched,
             baseline_ready: self.baseline.is_some(),
             listeners,
+            ..Default::default()
         };
+        self.watch_network(ctx, &mut st);
         ctx.g("security", "exposed_tcp_listeners", "", st.exposed_tcp as f64);
         ctx.g("security", "auth_failures_10m", "", short as f64);
         ctx.snap.security = st;
@@ -892,6 +1147,28 @@ impl Collector for SecurityCollector {
     }
 
     fn on_event(&mut self, ev: &ExternalEvent, ctx: &mut Ctx) -> CResult<()> {
+        // A USB device arriving: look at once rather than up to a sampling
+        // interval later. A device that types does its work in seconds.
+        if let ExternalEvent::Uevent { action, subsystem, .. } = ev {
+            if subsystem == "usb" && action == "add" && self.keyboard_baseline.is_some() {
+                let before: BTreeSet<String> =
+                    ctx.snap.security.keyboards.iter().map(|k| k.key.clone()).collect();
+                let mut now = self.usb_keyboards();
+                for k in now.iter_mut() {
+                    k.expected = self.keyboard_baseline.as_ref().is_some_and(|b| b.contains(&k.key))
+                        || ctx.config.security.accepted_devices.iter().any(|a| a == &k.key);
+                    if !before.contains(&k.key) {
+                        ctx.event(Event::new("security", "keyboard_connected",
+                            format!("USB keyboard connected: {}", k.name),
+                            if k.expected { Severity::Info } else { Severity::Warning }));
+                    }
+                }
+                ctx.snap.security.unexpected_keyboards =
+                    now.iter().filter(|k| !k.expected).cloned().collect();
+                ctx.snap.security.keyboards = now;
+            }
+            return Ok(());
+        }
         let ExternalEvent::AuthLog(entry) = ev else { return Ok(()) };
         self.auth_seen = true;
         let Some(mut f) = classify_auth(entry) else { return Ok(()) };
@@ -1262,6 +1539,179 @@ mod tests {
             procfs.sort_by_key(key);
             assert_eq!(diag, procfs, "{file}");
         }
+    }
+
+    #[test]
+    fn small_config_parsers_read_what_the_programs_would() {
+        let arp = "IP address       HW type     Flags       HW address            Mask     Device\n\
+                   192.168.12.1     0x1         0x2         64:7B:1E:F2:58:C1     *        wlp108s0\n\
+                   192.168.12.9     0x1         0x0         00:00:00:00:00:00     *        wlp108s0\n";
+        assert_eq!(arp_lookup(arp, "192.168.12.1").as_deref(), Some("64:7b:1e:f2:58:c1"));
+        assert_eq!(arp_lookup(arp, "192.168.12.9"), None, "an incomplete entry has no address");
+        assert_eq!(arp_lookup(arp, "10.0.0.1"), None);
+
+        assert_eq!(parse_nameservers("# c\nnameserver 192.168.12.1\nnameserver fd96::1\nsearch lan\nnameserver junk\n"),
+                   vec!["192.168.12.1", "fd96::1"]);
+
+        // Verbatim shape of this machine's file: everything commented out.
+        assert!(!gdm_flag("[daemon]\n#  AutomaticLoginEnable = true\n#  AutomaticLogin = user1\n", "AutomaticLoginEnable"));
+        assert!(gdm_flag("[daemon]\nAutomaticLoginEnable=True\nAutomaticLogin=ronin\n", "AutomaticLoginEnable"));
+        assert!(!gdm_flag("AutomaticLoginEnable=false\n", "AutomaticLoginEnable"));
+
+        let t = |s: &str| vec![s.to_string()];
+        assert_eq!(sshd_setting(&t("#PasswordAuthentication yes\nPasswordAuthentication no\n"), "passwordauthentication").as_deref(), Some("no"));
+        assert_eq!(sshd_setting(&[ "PasswordAuthentication no\n".into(), "PasswordAuthentication yes\n".into() ],
+                                "PasswordAuthentication").as_deref(), Some("no"), "first occurrence wins, as in sshd");
+        assert_eq!(sshd_setting(&t("Port 22\n"), "PasswordAuthentication"), None);
+    }
+
+    #[test]
+    fn a_router_that_changes_address_mid_connection_is_reported() {
+        let d = tree("arp");
+        let net = d.join("sys/class/net/wlan0");
+        std::fs::create_dir_all(&net).unwrap();
+        std::fs::write(net.join("carrier_changes"), "4\n").unwrap();
+        let arp = |mac: &str| std::fs::write(d.join("proc/net/arp"), format!(
+            "IP address HW type Flags HW address Mask Device\n192.168.1.1 0x1 0x2 {mac} * wlan0\n")).unwrap();
+        arp("aa:aa:aa:aa:aa:aa");
+        let mut c = SecurityCollector::with_roots(&d);
+        let mut x = ctx();
+        x.snap.network.default_route = Some("192.168.1.1".into());
+        x.snap.network.default_iface = Some("wlan0".into());
+        c.collect(&mut x).unwrap();
+        assert_eq!(x.snap.security.gateway_mac, "aa:aa:aa:aa:aa:aa");
+        assert!(x.snap.security.gateway_change.is_none());
+
+        // Joining another network: the link dropped in between. Not suspicious.
+        std::fs::write(net.join("carrier_changes"), "6\n").unwrap();
+        arp("bb:bb:bb:bb:bb:bb");
+        c.collect(&mut x).unwrap();
+        assert!(x.snap.security.gateway_change.is_none(),
+                "a different router after reconnecting is a different network");
+
+        // Same link, same router address, different hardware answering for it.
+        arp("cc:cc:cc:cc:cc:cc");
+        c.collect(&mut x).unwrap();
+        let ch = x.snap.security.gateway_change.clone().expect("this is what ARP spoofing looks like");
+        assert_eq!((ch.old_mac.as_str(), ch.new_mac.as_str()), ("bb:bb:bb:bb:bb:bb", "cc:cc:cc:cc:cc:cc"));
+        assert!(x.events.iter().any(|e| e.kind == "gateway_changed" && e.severity == Severity::Warning));
+
+        // It stays reported for a while, then lapses.
+        x.ts_ms += 10 * 60_000;
+        c.collect(&mut x).unwrap();
+        assert!(x.snap.security.gateway_change.is_some());
+        x.ts_ms += 25 * 60_000;
+        c.collect(&mut x).unwrap();
+        assert!(x.snap.security.gateway_change.is_none());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_dns_change_on_the_same_connection_is_an_event() {
+        let d = tree("dns");
+        let net = d.join("sys/class/net/wlan0");
+        std::fs::create_dir_all(&net).unwrap();
+        std::fs::write(net.join("carrier_changes"), "2\n").unwrap();
+        std::fs::create_dir_all(d.join("run/systemd/resolve")).unwrap();
+        let dns = |a: &str| std::fs::write(d.join("run/systemd/resolve/resolv.conf"), format!("nameserver {a}\n")).unwrap();
+        dns("192.168.1.1");
+        let mut c = SecurityCollector::with_roots(&d);
+        let mut x = ctx();
+        x.snap.network.default_route = Some("192.168.1.1".into());
+        x.snap.network.default_iface = Some("wlan0".into());
+        c.collect(&mut x).unwrap();
+        assert_eq!(x.snap.security.dns_servers, vec!["192.168.1.1"]);
+        c.collect(&mut x).unwrap();
+        assert!(!x.events.iter().any(|e| e.kind == "dns_changed"));
+        dns("203.0.113.53");
+        c.collect(&mut x).unwrap();
+        assert!(x.events.iter().any(|e| e.kind == "dns_changed" && e.summary.contains("203.0.113.53")));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_new_usb_keyboard_is_noticed_at_once_and_can_be_accepted() {
+        let d = tree("kbd");
+        let usb = d.join("sys/bus/usb/devices");
+        let plug = |dev: &str, vid: &str, pid: &str, name: &str, class: &str, proto: &str| {
+            std::fs::create_dir_all(usb.join(dev)).unwrap();
+            std::fs::write(usb.join(dev).join("idVendor"), vid).unwrap();
+            std::fs::write(usb.join(dev).join("idProduct"), pid).unwrap();
+            std::fs::write(usb.join(dev).join("product"), name).unwrap();
+            let i = usb.join(format!("{dev}:1.0"));
+            std::fs::create_dir_all(&i).unwrap();
+            std::fs::write(i.join("bInterfaceClass"), class).unwrap();
+            std::fs::write(i.join("bInterfaceProtocol"), proto).unwrap();
+        };
+        plug("1-1", "046d", "c31c", "Logitech Keyboard", "03", "01");
+        plug("1-2", "0781", "5567", "Cruzer Blade", "08", "50");      // a real USB stick
+        plug("1-3", "046d", "c077", "Mouse", "03", "02");             // HID, but a mouse
+        let mut c = SecurityCollector::with_roots(&d);
+        let mut x = ctx();
+        c.collect(&mut x).unwrap();
+        assert_eq!(x.snap.security.keyboards.len(), 1, "only the keyboard interface counts");
+        assert!(x.snap.security.unexpected_keyboards.is_empty(), "present at first run: expected");
+
+        // Something that looks like a USB stick but announces a keyboard.
+        plug("1-4", "1b4f", "9206", "Totally A Flash Drive", "03", "01");
+        c.on_event(&ExternalEvent::Uevent { action: "add".into(), subsystem: "usb".into(),
+                                            devpath: "/devices/x".into() }, &mut x).unwrap();
+        assert_eq!(x.snap.security.unexpected_keyboards.len(), 1, "seen on the hotplug event, not a tick later");
+        assert_eq!(x.snap.security.unexpected_keyboards[0].key, "usb-keyboard:1b4f:9206");
+        assert!(x.events.iter().any(|e| e.kind == "keyboard_connected" && e.severity == Severity::Warning));
+
+        // A restart must not adopt it; accepting it does.
+        let mut again = SecurityCollector::with_roots(&d);
+        let mut y = ctx();
+        again.collect(&mut y).unwrap();
+        assert_eq!(y.snap.security.unexpected_keyboards.len(), 1);
+        let mut cfg = crate::config::Config::default();
+        cfg.security.accepted_devices.push("usb-keyboard:1b4f:9206".into());
+        let mut z = Ctx::new(Arc::new(cfg));
+        again.collect(&mut z).unwrap();
+        assert!(z.snap.security.unexpected_keyboards.is_empty());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn sign_in_and_account_settings_are_checked() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tree("accounts");
+        let by = |x: &Ctx, id: &str| x.snap.security.checks.iter().find(|c| c.id == id).cloned();
+        std::fs::create_dir_all(d.join("etc/gdm3")).unwrap();
+        std::fs::write(d.join("etc/gdm3/custom.conf"), "[daemon]\n# AutomaticLoginEnable = true\n").unwrap();
+        let mut c = SecurityCollector::with_roots(&d);
+        let mut x = ctx();
+        c.collect(&mut x).unwrap();
+        assert_eq!(by(&x, "auto_login").unwrap().status, "ok");
+        assert!(by(&x, "root_accounts").is_none() && by(&x, "ssh_server").is_none()
+                && by(&x, "ssh_keys").is_none(), "nothing wrong, nothing installed: nothing listed");
+
+        std::fs::write(d.join("etc/gdm3/custom.conf"), "[daemon]\nAutomaticLoginEnable = true\n").unwrap();
+        std::fs::write(d.join("etc/passwd"), "root:x:0:0::/root:/bin/sh\ntoor:x:0:0::/root:/bin/sh\n").unwrap();
+        std::fs::create_dir_all(d.join("etc/ssh/sshd_config.d")).unwrap();
+        std::fs::write(d.join("etc/ssh/sshd_config"), "Include /etc/ssh/sshd_config.d/*.conf\n#PasswordAuthentication yes\n").unwrap();
+        std::fs::create_dir_all(d.join("home/.ssh")).unwrap();
+        std::fs::write(d.join("home/.ssh/id_ed25519"), "k").unwrap();
+        std::fs::set_permissions(d.join("home/.ssh/id_ed25519"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(d.join("home/.ssh/id_ed25519.pub"), "p").unwrap();
+        x.ts_ms += 61_000;
+        c.collect(&mut x).unwrap();
+        assert_eq!(by(&x, "auto_login").unwrap().status, "warn");
+        assert!(by(&x, "root_accounts").unwrap().detail.contains("toor"));
+        let ssh = by(&x, "ssh_server").unwrap();
+        assert_eq!(ssh.status, "warn");
+        assert!(ssh.title.contains("accepts passwords"), "the default is yes: {}", ssh.title);
+        let keys = by(&x, "ssh_keys").unwrap();
+        assert!(keys.fix.contains("chmod 600 ~/.ssh/id_ed25519") && !keys.fix.contains(".pub"));
+
+        std::fs::write(d.join("etc/ssh/sshd_config.d/00-keys-only.conf"), "PasswordAuthentication no\n").unwrap();
+        std::fs::set_permissions(d.join("home/.ssh/id_ed25519"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        x.ts_ms += 61_000;
+        c.collect(&mut x).unwrap();
+        assert_eq!(by(&x, "ssh_server").unwrap().status, "ok");
+        assert!(by(&x, "ssh_keys").is_none());
+        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]

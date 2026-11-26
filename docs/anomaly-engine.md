@@ -46,6 +46,8 @@ considers "normal", because some things are never normal.
 | `audio.service_down` | PipeWire or WirePlumber not active | WARNING |
 | `device.missing` | a learned internal device disappears | WARNING |
 | `security.new_listener` | a TCP listener reachable from the network that was not present at first run and has not been accepted. No dwell; stays open while it is there | WARNING |
+| `security.new_keyboard` | a USB device presenting a keyboard interface that was not present at first run and has not been accepted. No dwell | WARNING |
+| `security.gateway_changed` | the default gateway's hardware address changed while the link stayed up; reported for 30 minutes | WARNING |
 | `security.login_failures` | ≥ 5 failed sign-ins in 10 minutes | NOTICE if all local, WARNING if any came over the network |
 | `security.firewall_off` | `ufw` is switched off **and** at least one TCP listener is network-facing, for 300 s | NOTICE |
 | `suspend.failed` | suspend aborted, or resume with device errors | WARNING |
@@ -62,6 +64,14 @@ A value outside its range, or a key no rule reads, is refused.
 `net.iface_down`, `net.flapping` and `service.flapping`. No code raises them. The ext4
 error counters, interface transitions and unit restart counts are collected and shown,
 but nothing alerts on them.
+
+### Alerts from a single event
+
+A kernel line or an OOM kill is one event, not a condition that stays true, so
+nothing keeps firing for it. Left to the ordinary 120 s hysteresis such an alert
+resolved — and its notification was withdrawn — two minutes after it appeared,
+critical ones included. They are now held open: 30 minutes for a critical journal
+alert and for `mem.oom`, 10 minutes otherwise. Dismissing one by hand is not held.
 
 ### What "sustained" means
 

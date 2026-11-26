@@ -58,6 +58,8 @@ pub struct AlertManager {
     notifier: Option<crate::dbus::Connection>,
     /// Open alerts whose notification was not delivered and is still due.
     owed: std::collections::HashSet<String>,
+    /// fingerprint -> monotonic ms before which it must not resolve.
+    held_until: HashMap<String, i64>,
     /// fingerprint -> (monotonic ms, severity) of the last notification really
     /// shown. Survives resolution, which `notified` does not.
     recent: HashMap<String, (i64, Severity)>,
@@ -84,6 +86,7 @@ impl AlertManager {
             buckets,
             notified: HashMap::new(),
             owed: Default::default(),
+            held_until: HashMap::new(),
             recent: HashMap::new(),
             #[cfg(test)]
             fake_ids: None,
@@ -235,6 +238,10 @@ impl AlertManager {
             return;
         }
         let now = crate::clock::mono_ms();
+        if self.held_until.get(fingerprint).is_some_and(|until| now < *until) {
+            return;
+        }
+        self.held_until.remove(fingerprint);
         let since = *self.clearing.entry(fingerprint.to_string()).or_insert(now);
         if (now - since) / 1000 < MIN_RESOLVE_HOLD_S {
             return;
@@ -245,10 +252,24 @@ impl AlertManager {
         let _ = store.resolve_alert(fingerprint);
     }
 
+    /// Keep an alert open for at least `ms` from now, whatever its rule says.
+    ///
+    /// For alerts raised by a single event rather than a condition that stays
+    /// true: a kernel line ("GPU has fallen off the bus"), an OOM kill. Nothing
+    /// keeps firing for those, so two minutes later the ordinary hysteresis
+    /// resolved them and withdrew the notification -- a critical one included --
+    /// often before anyone had looked at the screen.
+    pub fn hold(&mut self, fingerprint: &str, ms: i64) {
+        let until = crate::clock::mono_ms() + ms;
+        let e = self.held_until.entry(fingerprint.to_string()).or_insert(until);
+        *e = (*e).max(until);
+    }
+
     /// Immediate resolution, for conditions that are genuinely edge-triggered
     /// (an interface coming back up, a unit recovering).
     pub fn clear_now(&mut self, fingerprint: &str, store: &Store) {
         if self.open.remove(fingerprint).is_some() {
+            self.held_until.remove(fingerprint);
             self.clearing.remove(fingerprint);
             self.withdraw(fingerprint);
             let _ = store.resolve_alert(fingerprint);
@@ -392,6 +413,28 @@ mod tests {
         assert!(m.raise(alert("a.two", "", Severity::Warning), &store, &cfg),
                 "it used to stay silent for as long as it was open");
         assert_eq!(m.total_suppressed, 1, "a retry is not counted as another suppression");
+    }
+
+    #[test]
+    fn an_alert_from_a_single_event_stays_long_enough_to_be_seen() {
+        let (store, cfg) = setup();
+        let mut m = AlertManager::new(&cfg, &store);
+        m.raise(alert("journal.gpu_off_bus", "", Severity::Critical), &store, &cfg);
+        m.hold("journal.gpu_off_bus", 30 * 60_000);
+        // The ordinary hysteresis has long passed...
+        m.clearing.insert("journal.gpu_off_bus".into(), crate::clock::mono_ms() - 600_000);
+        m.clear("journal.gpu_off_bus", &store);
+        assert!(m.is_open("journal.gpu_off_bus"), "a one-off critical event must not vanish in two minutes");
+        // ...and once the hold is over it resolves like any other.
+        *m.held_until.get_mut("journal.gpu_off_bus").unwrap() = crate::clock::mono_ms() - 1;
+        m.clearing.insert("journal.gpu_off_bus".into(), crate::clock::mono_ms() - 600_000);
+        m.clear("journal.gpu_off_bus", &store);
+        assert!(!m.is_open("journal.gpu_off_bus"));
+        // The user dismissing it is not held back.
+        m.raise(alert("journal.oom", "", Severity::Critical), &store, &cfg);
+        m.hold("journal.oom", 30 * 60_000);
+        m.clear_now("journal.oom", &store);
+        assert!(!m.is_open("journal.oom"));
     }
 
     #[test]
