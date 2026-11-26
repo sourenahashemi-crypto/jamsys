@@ -1456,6 +1456,8 @@ class ProcessPage(Page):
     def __init__(self, win):
         super().__init__(win)
         self._sample = {}
+        self._vram = {}
+        self._gpu_time_note = ""
         # Keep controls outside the rebuilt results so typing, selection and
         # keyboard focus survive incoming snapshots.
         tools = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -1481,7 +1483,24 @@ class ProcessPage(Page):
         self._render_results()
 
     def render(self, snap):
-        self._sample = (snap.get("snapshot") or {}).get("process") or {}
+        s = snap.get("snapshot") or {}
+        self._sample = s.get("process") or {}
+        gpu = s.get("gpu") or {}
+        nv = gpu.get("nvidia") or {}
+        # NVML reports video memory per process, as [pid, bytes] pairs.
+        self._vram = {}
+        for row in nv.get("processes") or []:
+            if isinstance(row, (list, tuple)) and len(row) == 2:
+                self._vram[row[0]] = row[1]
+        # GPU *time* per process comes from DRM fdinfo, which the Intel driver
+        # fills in and NVIDIA's does not. When the NVIDIA card is the one drawing
+        # the desktop there is simply no such figure -- and every row used to
+        # show nothing, which read as "nothing is using the GPU".
+        self._gpu_time_note = (
+            " GPU time per process is not shown: the NVIDIA card is drawing the "
+            "desktop and its driver does not publish it. NVIDIA video memory is "
+            "shown where the driver reports it."
+            if gpu.get("display_driver") == "NVIDIA" or nv.get("drives_display") else "")
         self._render_results()
 
     def _render_results(self):
@@ -1496,7 +1515,7 @@ class ProcessPage(Page):
         g = self.group("Top processes",
                        f"{len(rows)} shown · {total if total is not None else '?'} total. "
                        "Combined top CPU and memory samples; this is not the full process list. "
-                       "CPU is per core and can exceed 100%.")
+                       "CPU is per core and can exceed 100%." + self._gpu_time_note)
         self.results.append(g)
         if not rows:
             g.add(self.row("No matching processes" if self.search.get_text().strip()
@@ -1510,6 +1529,8 @@ class ProcessPage(Page):
                 sub += f" · I/O ↓{human_bps(q.get('read_bps', 0))} ↑{human_bps(q.get('write_bps', 0))}"
             if q.get("gpu_ns_per_s"):
                 sub += f" · GPU {q['gpu_ns_per_s']/1e9:.2f} engine-s/s"
+            if self._vram.get(q.get("pid")):
+                sub += f" · NVIDIA memory {human_bytes(self._vram[q['pid']])}"
             row = self.row(str(q.get("name", "?")),
                            human_bytes(q.get("rss_bytes", 0)) if sort == "memory"
                            else f"{q.get('cpu_pct', 0):.1f}%", sub)

@@ -3,7 +3,7 @@
  *
  * Run:  gjs -m gnome-extension/tests/format-test.js
  */
-import {labelFor, normalLine, shortAlert, styleFor, pct, deg, watt}
+import {describe, labelFor, normalLine, shortAlert, styleFor, pct, deg, watt}
     from '../jamsys@jamsys.org/format.js';
 
 let failures = 0;
@@ -118,6 +118,17 @@ ok(normalLine({...healthy, dgpu: 'resuming'}, {'show-gpu': true}, false) === 'GP
    'a GPU that is waking up has not been measured yet');
 eq(shortAlert({alert_subsystem: 'CPU', cpu_pct: 99, cpu_temp_c: 0}), 'CPU 99%',
    'no temperature sensor leaves the degrees out rather than printing 0°');
+
+print('\nwhat a screen reader is told');
+ok(describe(null).includes('waiting'), 'no data says so');
+ok(describe(healthy).startsWith('JamSys. Everything is normal.') && describe(healthy).includes('CPU 7%'),
+   'a healthy machine is described with its readings');
+const long = 'x'.repeat(120);
+ok(describe({...healthy, health: 'critical', alert_title: long, alert_detail: 'because'})
+       .includes(`Critical: ${long}. because`),
+   'an alert is given in full, not cut to fit a pill');
+ok(!describe({}).includes('NaN') && !describe({}).includes('undefined'),
+   'an empty state has no NaN or undefined in it');
 
 print(`\n${failures === 0 ? 'ALL PASS' : failures + ' FAILURE(S)'}`);
 imports.system.exit(failures === 0 ? 0 : 1);

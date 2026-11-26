@@ -295,6 +295,32 @@ pub struct Deduper {
     window_ms: i64,
 }
 
+/// The key a journal line is de-duplicated under: its text with every run of
+/// digits collapsed.
+///
+/// Keyed on the raw text, "Buffer I/O error on dev sda, logical block 1234"
+/// and "... block 1235" were different lines, so a failing disk (thousands of
+/// them, each with its own block number) went through one insert, one broadcast
+/// and one alert update apiece. They are the same event repeating.
+pub fn dedup_key(kind: &str, message: &str) -> String {
+    let mut out = String::with_capacity(kind.len() + message.len().min(200) + 1);
+    out.push_str(kind);
+    out.push(':');
+    let mut in_digits = false;
+    for c in message.chars().take(200) {
+        if c.is_ascii_digit() {
+            if !in_digits {
+                out.push('#');
+            }
+            in_digits = true;
+        } else {
+            in_digits = false;
+            out.push(c);
+        }
+    }
+    out
+}
+
 impl Deduper {
     pub fn new(window_ms: i64) -> Self {
         Deduper { seen: std::collections::HashMap::new(), window_ms }
@@ -338,6 +364,21 @@ impl Deduper {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lines_that_differ_only_in_numbers_are_one_event() {
+        let a = dedup_key("io_error", "Buffer I/O error on dev sda1, logical block 1234, async page read");
+        let b = dedup_key("io_error", "Buffer I/O error on dev sda1, logical block 998877, async page read");
+        assert_eq!(a, b);
+        assert_ne!(a, dedup_key("io_error", "Buffer I/O error on dev sdb1, logical block 1234, async page read")
+                       .replace("sdb", "sda") + "x", "sanity");
+        assert_ne!(dedup_key("io_error", "disk failed"), dedup_key("oom", "disk failed"),
+                   "the kind is part of the identity");
+        assert_ne!(dedup_key("k", "wlan0 down"), dedup_key("k", "eth0 down"));
+        let mut d = Deduper::new(60_000);
+        assert_eq!(d.admit(&a, 0), Some(0));
+        assert_eq!(d.admit(&b, 1000), None, "the second block number is a repeat");
+    }
 
     #[test]
     fn parses_a_real_journald_json_line() {

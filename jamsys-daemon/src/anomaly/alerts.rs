@@ -43,6 +43,9 @@ impl Bucket {
     }
 }
 
+/// How soon an undelivered notification is tried again.
+const OWED_RETRY_MS: i64 = 30_000;
+
 pub struct AlertManager {
     buckets: HashMap<Severity, Bucket>,
     /// fingerprint -> (last notify monotonic ms, notification id, severity notified at)
@@ -53,6 +56,14 @@ pub struct AlertManager {
     clearing: HashMap<String, i64>,
     suppressions: Vec<Suppression>,
     notifier: Option<crate::dbus::Connection>,
+    /// Open alerts whose notification was not delivered and is still due.
+    owed: std::collections::HashSet<String>,
+    /// fingerprint -> (monotonic ms, severity) of the last notification really
+    /// shown. Survives resolution, which `notified` does not.
+    recent: HashMap<String, (i64, Severity)>,
+    /// Test seam: ids to hand back instead of talking to a notification service.
+    #[cfg(test)]
+    fake_ids: Option<Vec<u32>>,
     pub notify_failures: u32,
     pub total_raised: u64,
     pub total_suppressed: u64,
@@ -72,6 +83,10 @@ impl AlertManager {
         let mut m = AlertManager {
             buckets,
             notified: HashMap::new(),
+            owed: Default::default(),
+            recent: HashMap::new(),
+            #[cfg(test)]
+            fake_ids: None,
             open: HashMap::new(),
             clearing: HashMap::new(),
             suppressions: store.load_suppressions().unwrap_or_default(),
@@ -145,34 +160,69 @@ impl AlertManager {
             self.total_raised += 1;
         }
 
+        // An alert the user was never actually shown -- the rate limit was hit,
+        // or the notification service was not there to take it -- is still
+        // owed. It used to be marked as notified and then stay silent for as
+        // long as it was open: the eleventh warning at boot, or a critical one
+        // raised while the shell was restarting, was simply never seen.
+        let owed = self.owed.contains(&a.fingerprint);
+
         // Cooldown: a re-fire inside the window never re-notifies.
         if let Some((last, _, sev)) = self.notified.get(&a.fingerprint) {
             let escalated = a.severity > *sev;
-            if !escalated && now - last < a.severity.cooldown_s() * 1000 {
-                return false;
+            if owed {
+                if !escalated && now - last < OWED_RETRY_MS {
+                    return false;
+                }
+            } else {
+                if !escalated && now - last < a.severity.cooldown_s() * 1000 {
+                    return false;
+                }
+                if !escalated && !is_new {
+                    return false;
+                }
             }
-            if !escalated && !is_new {
+        } else if let Some((last, sev)) = self.recent.get(&a.fingerprint) {
+            // Resolved and raised again. The entry in `notified` went when the
+            // old notification was withdrawn, which is what made the cooldown
+            // dead code: a condition flapping every couple of minutes notified
+            // on every cycle. The time of the last notification outlives it.
+            if a.severity <= *sev && now - last < a.severity.cooldown_s() * 1000 {
+                self.notified.insert(a.fingerprint.clone(), (*last, 0, a.severity));
                 return false;
             }
         }
 
         if !cfg.alerts.desktop_notifications || a.severity < cfg.min_notify() {
             self.notified.insert(a.fingerprint.clone(), (now, 0, a.severity));
+            self.owed.remove(&a.fingerprint);
             return false;
         }
 
         // Rate limit last, so suppression counts reflect what the user would have seen.
         let allowed = self.buckets.get_mut(&a.severity).map(|b| b.take(now)).unwrap_or(true);
         if !allowed {
-            self.total_suppressed += 1;
-            crate::log_warn!("notification rate limit hit for {}", a.severity);
+            if !owed {
+                self.total_suppressed += 1;
+                crate::log_warn!("notification rate limit hit for {}; it will be retried", a.severity);
+            }
             self.notified.insert(a.fingerprint.clone(), (now, 0, a.severity));
+            self.owed.insert(a.fingerprint.clone());
             return false;
         }
 
         let replaces = self.notified.get(&a.fingerprint).map(|(_, id, _)| *id).unwrap_or(0);
         let id = self.send_notification(&a, replaces);
         self.notified.insert(a.fingerprint.clone(), (now, id, a.severity));
+        if id == 0 {
+            // Not delivered. Saying "notified" here told the window an alert had
+            // been shown that had not.
+            self.owed.insert(a.fingerprint.clone());
+            return false;
+        }
+        self.owed.remove(&a.fingerprint);
+        self.recent.insert(a.fingerprint.clone(), (now, a.severity));
+        self.recent.retain(|_, (t, _)| now - *t < 3_600_000);
         // Persist it so a restart can still take this notification down.
         let _ = store.set_notify_id(&a.fingerprint, id);
         true
@@ -219,6 +269,7 @@ impl AlertManager {
     /// notification while the shell went on showing it, so a resolved problem left
     /// a warning behind that nothing would ever clear.
     fn withdraw(&mut self, fingerprint: &str) {
+        self.owed.remove(fingerprint);
         let Some((_, id, _)) = self.notified.remove(fingerprint) else { return };
         if id == 0 {
             return;
@@ -235,6 +286,10 @@ impl AlertManager {
     }
 
     fn send_notification(&mut self, a: &Alert, replaces: u32) -> u32 {
+        #[cfg(test)]
+        if let Some(q) = self.fake_ids.as_mut() {
+            return if q.is_empty() { 0 } else { q.remove(0) };
+        }
         if self.notifier.is_none() {
             self.notifier = crate::dbus::Connection::session().ok();
         }
@@ -285,6 +340,77 @@ mod tests {
         let mut c = Config::default();
         c.alerts.desktop_notifications = false; // no bus in tests
         (s, c)
+    }
+
+    fn notifying() -> (Store, Config) {
+        let (s, mut c) = setup();
+        c.alerts.desktop_notifications = true;
+        (s, c)
+    }
+
+    /// Pretend time has passed for one fingerprint's last attempt.
+    fn age(m: &mut AlertManager, fp: &str, ms: i64) {
+        if let Some(e) = m.notified.get_mut(fp) {
+            e.0 -= ms;
+        }
+        if let Some(e) = m.recent.get_mut(fp) {
+            e.0 -= ms;
+        }
+        for b in m.buckets.values_mut() {
+            b.last_ms -= ms;
+        }
+    }
+
+    #[test]
+    fn a_notification_that_could_not_be_sent_is_tried_again() {
+        let (store, cfg) = notifying();
+        let mut m = AlertManager::new(&cfg, &store);
+        m.fake_ids = Some(vec![]);          // the service is not there
+        let a = alert("gpu.xid", "", Severity::Critical);
+        assert!(!m.raise(a.clone(), &store, &cfg), "nothing was shown, so nothing is claimed");
+        assert!(!m.raise(a.clone(), &store, &cfg), "and it is not hammered every tick");
+
+        m.fake_ids = Some(vec![77]);        // the service is back
+        age(&mut m, "gpu.xid", OWED_RETRY_MS + 1);
+        assert!(m.raise(a.clone(), &store, &cfg), "the open alert is finally shown");
+        assert_eq!(m.notified["gpu.xid"].1, 77);
+        age(&mut m, "gpu.xid", 10 * 60_000);
+        assert!(!m.raise(a, &store, &cfg), "and once shown, not shown again");
+    }
+
+    #[test]
+    fn an_alert_dropped_by_the_rate_limit_is_shown_once_there_is_room() {
+        let (store, mut cfg) = notifying();
+        cfg.alerts.burst = 1;
+        cfg.alerts.refill_s = 60;
+        let mut m = AlertManager::new(&cfg, &store);
+        m.fake_ids = Some(vec![1, 2]);
+        assert!(m.raise(alert("a.one", "", Severity::Warning), &store, &cfg));
+        assert!(!m.raise(alert("a.two", "", Severity::Warning), &store, &cfg), "rate limited");
+        assert_eq!(m.total_suppressed, 1);
+        age(&mut m, "a.two", 61_000);
+        assert!(m.raise(alert("a.two", "", Severity::Warning), &store, &cfg),
+                "it used to stay silent for as long as it was open");
+        assert_eq!(m.total_suppressed, 1, "a retry is not counted as another suppression");
+    }
+
+    #[test]
+    fn a_flapping_condition_respects_the_cooldown() {
+        let (store, cfg) = notifying();
+        let mut m = AlertManager::new(&cfg, &store);
+        m.fake_ids = Some(vec![1, 2, 3]);
+        let a = alert("net.flap", "", Severity::Warning);
+        assert!(m.raise(a.clone(), &store, &cfg));
+        m.clear_now("net.flap", &store);
+        assert!(!m.notified.contains_key("net.flap"));
+        assert!(!m.raise(a.clone(), &store, &cfg),
+                "raised again inside the cooldown: no second notification");
+        m.clear_now("net.flap", &store);
+        age(&mut m, "net.flap", Severity::Warning.cooldown_s() * 1000 + 1);
+        assert!(m.raise(a.clone(), &store, &cfg), "after the cooldown it is news again");
+        // An escalation is always news.
+        m.clear_now("net.flap", &store);
+        assert!(m.raise(alert("net.flap", "", Severity::Critical), &store, &cfg));
     }
 
     #[test]

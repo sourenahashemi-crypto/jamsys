@@ -524,9 +524,9 @@ CREATE TABLE IF NOT EXISTS threshold_override (
         Ok(n > 0)
     }
 
-    pub fn ack_alert(&self, id: i64) -> rusqlite::Result<()> {
-        self.conn.execute("UPDATE alert SET acked_ts=?1 WHERE id=?2", params![now_ms(), id])?;
-        Ok(())
+    /// Returns how many rows were marked: zero means there is no such alert.
+    pub fn ack_alert(&self, id: i64) -> rusqlite::Result<usize> {
+        self.conn.execute("UPDATE alert SET acked_ts=?1 WHERE id=?2", params![now_ms(), id])
     }
 
     pub fn open_alert_count(&self) -> rusqlite::Result<(i64, i64)> {
@@ -577,9 +577,9 @@ CREATE TABLE IF NOT EXISTS threshold_override (
         Ok(self.conn.last_insert_rowid())
     }
 
-    pub fn remove_suppression(&self, id: i64) -> rusqlite::Result<()> {
-        self.conn.execute("DELETE FROM suppression WHERE id=?1", params![id])?;
-        Ok(())
+    /// Returns how many rows were removed: zero means there was no such entry.
+    pub fn remove_suppression(&self, id: i64) -> rusqlite::Result<usize> {
+        self.conn.execute("DELETE FROM suppression WHERE id=?1", params![id])
     }
 
     pub fn load_suppressions(&self) -> rusqlite::Result<Vec<Suppression>> {

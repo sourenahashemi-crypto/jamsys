@@ -129,6 +129,31 @@ pub trait Collector: Send {
     }
 }
 
+/// Forget what a collector last reported.
+///
+/// The snapshot is carried from tick to tick, so a collector that stops running
+/// (disabled, or quarantined after repeated failures) leaves its final readings
+/// in place, and the rules go on judging them as if they were current. Unknown
+/// must look unknown.
+pub fn clear_section(name: &str, snap: &mut Snapshot) {
+    match name {
+        "cpu" => snap.cpu = Default::default(),
+        "memory" => snap.memory = Default::default(),
+        "thermal" => snap.thermal = Default::default(),
+        "power" => snap.power = Default::default(),
+        "gpu" => snap.gpu = Default::default(),
+        "storage" => snap.storage = Default::default(),
+        "network" => snap.network = Default::default(),
+        "devices" => snap.devices = Default::default(),
+        "bluetooth" => snap.bluetooth = Default::default(),
+        "services" => snap.services = Default::default(),
+        "process" => snap.process = Default::default(),
+        "keyboard" => snap.keyboard = Default::default(),
+        "security" => snap.security = Default::default(),
+        _ => {}
+    }
+}
+
 /// Something that happened outside the sampling schedule.
 #[derive(Clone, Debug)]
 pub enum ExternalEvent {
@@ -303,6 +328,11 @@ impl Registry {
                     Self::maybe_quarantine(e, now_mono);
                 }
             }
+        }
+        // A collector that is not running has no current readings. Leaving its
+        // last ones in the snapshot kept the rules alerting on a frozen picture.
+        for e in self.entries.iter().filter(|e| e.c.tier() == tier && !e.support.is_usable()) {
+            clear_section(e.c.name(), &mut ctx.snap);
         }
     }
 

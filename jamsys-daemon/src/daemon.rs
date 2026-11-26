@@ -245,7 +245,14 @@ impl Daemon {
         let auth_wanted = auth_journal.is_some();
         let journal_wanted = journal.is_some();
         let dbus_wanted = dbus.is_some();
-        let rules = RuleEngine::new(&cfg);
+        let mut rules = RuleEngine::new(&cfg);
+        // What was learned before this start. Without it every restart began the
+        // warm-up again, and on a laptop restarted daily some contexts (idle on
+        // battery, say) never finished it: the learned rules were simply blind.
+        if let Ok(text) = std::fs::read_to_string(baselines_path()) {
+            let n = rules.baselines.restore_json(&text);
+            log_info!("restored {n} learned baseline series");
+        }
         let alerts = jamsys::anomaly::alerts::AlertManager::new(&cfg, &store);
         let now_mono = clock::mono_ms();
 
@@ -381,6 +388,7 @@ impl Daemon {
         log_info!("flushing {} buffered aggregates", self.store.pending_len());
         // flush_final also closes the 10-second bucket still being accumulated.
         let _ = self.store.flush_final();
+        self.save_baselines();
         Ok(())
     }
 
@@ -576,7 +584,13 @@ impl Daemon {
             match a {
                 ServiceAction::AckTopAlert => {
                     if let Ok(rows) = self.store.alerts(true, 50) {
-                        if let Some(top) = rows.iter().max_by_key(|a| a["severity"].as_i64().unwrap_or(0)) {
+                        // The same choice the widget makes when deciding what to
+                        // show (most severe, then most recent). Ordering by
+                        // severity alone acknowledged the *oldest* of several
+                        // equally severe alerts while the widget displayed the
+                        // newest.
+                        if let Some(top) = rows.iter().max_by_key(|a|
+                            (a["severity"].as_i64().unwrap_or(0), a["last_ts"].as_i64().unwrap_or(0))) {
                             if let Some(id) = top["id"].as_i64() {
                                 let _ = self.store.ack_alert(id);
                             }
@@ -610,6 +624,7 @@ impl Daemon {
         }
         self.dedup.gc(clock::now_ms());
         self.rules.dwell.gc(now_mono);
+        self.save_baselines();
         self.record_inventory();
 
         // Respawn the journal follower if journald restarted under us.
@@ -727,10 +742,26 @@ impl Daemon {
                 // Unclassified warnings are still worth recording as events, but they
                 // never become alerts. This is what keeps the journal from being a
                 // firehose of nuisance notifications.
+                // De-duplicated like everything else. They were not, so a service
+                // logging the same error in a loop wrote one row per line into
+                // the event table for the whole retention period.
                 if e.priority <= 3 {
-                    let _ = self.store.insert_event(&Event::new(
-                        "journal", "kernel_error",
-                        e.message.chars().take(300).collect::<String>(), Severity::Notice));
+                    let source = if e.is_kernel { "kernel_error" } else { "service_error" };
+                    let who = if e.is_kernel { "kernel" } else { e.syslog_id.as_str() };
+                    let key = journal::dedup_key(&format!("{source}:{who}"), &e.message);
+                    if let Some(suppressed) = self.dedup.admit(&key, now) {
+                        let mut text = e.message.chars().take(300).collect::<String>();
+                        if !e.is_kernel && !who.is_empty() {
+                            text = format!("{who}: {text}");
+                        }
+                        if suppressed > 0 {
+                            text.push_str(&format!(" (plus {suppressed} similar since the last report)"));
+                        }
+                        // This stream is every unit, not only the kernel; it was
+                        // all labelled kernel_error.
+                        let _ = self.store.insert_event(&Event::new(
+                            "journal", source, text, Severity::Notice));
+                    }
                 }
                 continue;
             };
@@ -743,7 +774,7 @@ impl Daemon {
             };
 
             // Collapse identical repeats.
-            let Some(suppressed) = self.dedup.admit(&format!("{kind}:{}", e.message), now) else {
+            let Some(suppressed) = self.dedup.admit(&journal::dedup_key(&kind, &e.message), now) else {
                 continue;
             };
             let extra = if suppressed > 0 { format!(" (plus {suppressed} identical since the last report)") } else { String::new() };
@@ -840,6 +871,19 @@ impl Daemon {
                     self.dbus = Some(d);
                 }
             }
+        }
+    }
+
+    /// Write the learned baselines beside the database, atomically. Called at
+    /// maintenance and at shutdown, so a crash loses at most one maintenance
+    /// interval of learning.
+    fn save_baselines(&self) {
+        let path = baselines_path();
+        let tmp = path.with_extension("json.tmp");
+        let ok = std::fs::write(&tmp, self.rules.baselines.to_json())
+            .and_then(|_| std::fs::rename(&tmp, &path));
+        if let Err(e) = ok {
+            log_warn!("could not save learned baselines to {}: {e}", path.display());
         }
     }
 
@@ -1069,10 +1113,13 @@ impl Daemon {
                 }
             }
             "ack" => match i("alert_id") {
-                Some(id) => {
-                    let _ = self.store.ack_alert(id);
-                    Response::ok(r.id, serde_json::json!({"acked": id}))
-                }
+                // Success used to be reported whatever happened, including for an
+                // id that does not exist.
+                Some(id) => match self.store.ack_alert(id) {
+                    Ok(0) => Response::err(r.id, "not_found", format!("no alert with id {id}")),
+                    Ok(_) => Response::ok(r.id, serde_json::json!({"acked": id})),
+                    Err(e) => Response::err(r.id, "write_failed", e.to_string()),
+                },
                 None => Response::err(r.id, "bad_request", "alert_id is required"),
             },
             "mute" => {
@@ -1115,11 +1162,14 @@ impl Daemon {
                 }
             }
             "unsuppress" => match i("id") {
-                Some(id) => {
-                    let _ = self.store.remove_suppression(id);
-                    self.alerts.reload_suppressions(&self.store);
-                    Response::ok(r.id, serde_json::json!({"removed": id}))
-                }
+                Some(id) => match self.store.remove_suppression(id) {
+                    Ok(0) => Response::err(r.id, "not_found", format!("no suppression with id {id}")),
+                    Ok(_) => {
+                        self.alerts.reload_suppressions(&self.store);
+                        Response::ok(r.id, serde_json::json!({"removed": id}))
+                    }
+                    Err(e) => Response::err(r.id, "write_failed", e.to_string()),
+                },
                 None => Response::err(r.id, "bad_request", "id is required"),
             },
             "suppressions" => match self.store.load_suppressions() {
@@ -1214,6 +1264,12 @@ impl Daemon {
                 };
                 if !self.reg.set_enabled(&name, en) {
                     return Response::err(r.id, "not_found", format!("no collector named {name}"));
+                }
+                if !en {
+                    // Its last readings would otherwise stay in the snapshot and
+                    // keep the rules firing on them: disabling `storage` while
+                    // `disk.full` was open kept the alert open until a restart.
+                    collectors::clear_section(&name, &mut self.snap);
                 }
                 let mut cfg = (*self.cfg).clone();
                 cfg.collectors.insert(name.clone(), en);
@@ -1392,4 +1448,8 @@ mod drain_tests {
         assert_eq!(suspend_drain_rate(0.0, 50.0, 8 * 3_600_000, true), None, "unknown before");
         assert_eq!(suspend_drain_rate(50.0, 80.0, 8 * 3_600_000, true), None, "charged");
     }
+}
+
+fn baselines_path() -> std::path::PathBuf {
+    config::data_dir().join("baselines.json")
 }

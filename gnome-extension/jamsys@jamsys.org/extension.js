@@ -30,7 +30,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
-import {labelFor, normalLine, styleFor} from './format.js';
+import {describe, labelFor, normalLine, styleFor} from './format.js';
 import {drawCluster, drawClusterBare, drawUnavailable,
         CLUSTER_W, CLUSTER_H, BARE_W, BARE_H} from './gauges.js';
 
@@ -112,6 +112,9 @@ class JamSysCluster extends St.Widget {
         // this the corner widget could only be resized from the preferences
         // dialog, which is not where anyone looks when a gadget is the wrong size.
         this.connect('scroll-event', (_a, event) => this._onScroll(event));
+        // Menu key / Shift+F10 when the cluster has keyboard focus. The menu was
+        // reachable only with a pointer.
+        this.connect('popup-menu', () => this._showMenu());
 
         this._resize();
     }
@@ -161,6 +164,16 @@ class JamSysCluster extends St.Widget {
             this._menu = new PopupMenu.PopupMenu(this, 0.5, St.Side.TOP);
             this._menu.actor.add_style_class_name('jamsys-cluster-menu');
 
+            // The alert in full. The drawn pill is cut to a few dozen characters,
+            // and until now the cluster had nowhere to read the rest -- only the
+            // panel-line menu did.
+            this._alertItem = new PopupMenu.PopupMenuItem('', {reactive: false});
+            this._alertItem.label.clutter_text.line_wrap = true;
+            this._menu.addMenuItem(this._alertItem);
+            this._ackItem = new PopupMenu.PopupMenuItem('Acknowledge this alert');
+            this._ackItem.connect('activate', () => this._ext.ackTopAlert());
+            this._menu.addMenuItem(this._ackItem);
+
             const open = new PopupMenu.PopupMenuItem('Open JamSys');
             open.connect('activate', () => this._ext.openApp(this._state?.alert_subsystem));
             this._menu.addMenuItem(open);
@@ -204,6 +217,11 @@ class JamSysCluster extends St.Widget {
             this._menuManager = new PopupMenu.PopupMenuManager(this);
             this._menuManager.addMenu(this._menu);
         }
+        const alert = this._state?.alert_title || '';
+        this._alertItem.label.text = alert
+            + (alert && this._state?.alert_detail ? `\n${this._state.alert_detail}` : '');
+        this._alertItem.visible = !!alert;
+        this._ackItem.visible = !!alert;
         this._menu.toggle();
     }
 
@@ -266,6 +284,8 @@ class JamSysCluster extends St.Widget {
 
     setState(state) {
         this._state = state;
+        // A drawing has no text for a screen reader to find; say what it shows.
+        this.accessible_name = describe(state);
         this._area.queue_repaint();
     }
 

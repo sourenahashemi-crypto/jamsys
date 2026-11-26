@@ -560,3 +560,41 @@ fn a_switched_off_collector_still_drains_its_own_socket() {
     // SAFETY: closing descriptors this test opened.
     unsafe { libc::close(fds[0]); libc::close(fds[1]); }
 }
+
+#[test]
+fn a_collector_that_stops_running_takes_its_readings_with_it() {
+    // The snapshot is carried from tick to tick. A storage collector switched
+    // off while a disk-full alert was open left its last filesystem list behind,
+    // and the rule went on firing on it until the daemon was restarted.
+    use jamsys::collectors::{clear_section, Registry};
+
+    struct Storage;
+    impl Collector for Storage {
+        fn name(&self) -> &'static str { "storage" }
+        fn tier(&self) -> Tier { Tier::Slow }
+        fn probe(&mut self) -> Support { Support::Full }
+        fn collect(&mut self, ctx: &mut Ctx) -> CResult<()> {
+            ctx.snap.storage.hidden_mounts = 73;
+            ctx.snap.storage.total_write_bps = 5e6;
+            Ok(())
+        }
+    }
+    let cfg = Config::default();
+    let mut r = Registry::new();
+    r.add(Box::new(Storage), &cfg);
+    let mut x = ctx();
+    r.run_tier(Tier::Slow, &mut x, 0);
+    assert_eq!(x.snap.storage.hidden_mounts, 73);
+
+    assert!(r.set_enabled("storage", false));
+    r.run_tier(Tier::Slow, &mut x, 60_000);
+    assert_eq!(x.snap.storage.hidden_mounts, 0, "a disabled collector's readings are gone");
+    assert_eq!(x.snap.storage.total_write_bps, 0.0);
+
+    // And directly, as the IPC handler does it, without waiting for the tier.
+    let mut snap = jamsys::collectors::Snapshot::default();
+    snap.services.bus_available = true;
+    clear_section("services", &mut snap);
+    assert!(!snap.services.bus_available);
+    clear_section("no-such-collector", &mut snap); // harmless
+}

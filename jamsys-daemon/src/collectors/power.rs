@@ -43,7 +43,10 @@ pub struct PowerCollector {
     /// or one with a bogus firmware entry, can be tested without that hardware.
     root: PathBuf,
     bat: Option<PathBuf>,
-    ac: Option<PathBuf>,
+    /// Every supply that can feed the machine (barrel jack, USB-C).
+    ac: Vec<PathBuf>,
+    /// The last charge level actually read, for when a read fails.
+    last_percent: Option<f64>,
     /// Smoothed power, because `power_now` is noisy enough that a raw reading swings
     /// several watts between ticks and would make the UI unreadable.
     ewma_w: Option<f64>,
@@ -61,7 +64,8 @@ impl PowerCollector {
         PowerCollector {
             root: root.into(),
             bat: None,
-            ac: None,
+            ac: Vec::new(),
+            last_percent: None,
             ewma_w: None,
             last_status: String::new(),
         }
@@ -86,7 +90,7 @@ impl Collector for PowerCollector {
 
     fn probe(&mut self) -> Support {
         self.bat = None;
-        self.ac = None;
+        self.ac.clear();
         let root = self.root.clone();
         for e in list_dir(&root) {
             let p = root.join(&e);
@@ -100,24 +104,25 @@ impl Collector for PowerCollector {
                 if present && usable {
                     self.bat = Some(p);
                 }
-            } else if ty == "Mains" && self.ac.is_none() && exists(p.join("online")) {
-                self.ac = Some(p);
+            } else if (ty == "Mains" || ty.starts_with("USB")) && exists(p.join("online")) {
+                self.ac.push(p);
             }
         }
-        match (&self.bat, &self.ac) {
-            (Some(_), Some(_)) => Support::Full,
-            (Some(_), None) => Support::Partial { detail: "no AC adapter sensor".into() },
-            (None, Some(_)) => Support::Partial { detail: "no battery (desktop or VM)".into() },
-            (None, None) => Support::Unsupported { reason: "no power supply sensors".into() },
+        match (&self.bat, !self.ac.is_empty()) {
+            (Some(_), true) => Support::Full,
+            (Some(_), false) => Support::Partial { detail: "no AC adapter sensor".into() },
+            (None, true) => Support::Partial { detail: "no battery (desktop or VM)".into() },
+            (None, false) => Support::Unsupported { reason: "no power supply sensors".into() },
         }
     }
 
     fn collect(&mut self, ctx: &mut Ctx) -> CResult<()> {
         let mut st = PowerState::default();
 
-        if let Some(ac) = &self.ac {
-            st.ac_online = read_i64(ac.join("online")).unwrap_or(0) == 1;
-        }
+        // Any supply that is feeding the machine: the barrel jack ("Mains") or a
+        // USB-C charger ("USB"). Looking only at Mains read a laptop held at its
+        // charge limit on USB-C power as running on battery.
+        st.ac_online = self.ac.iter().any(|ac| read_i64(ac.join("online")).unwrap_or(0) == 1);
 
         if let Some(b) = &self.bat {
             if !b.exists() {
@@ -125,7 +130,15 @@ impl Collector for PowerCollector {
             }
             st.has_battery = true;
             st.status = read_str(b.join("status")).unwrap_or_else(|| "Unknown".into());
-            st.percent = read_checked(b.join("capacity"), 0.0, 100.0).unwrap_or(0.0);
+            // A failed read is not an empty battery. Falling back to zero turned
+            // one EC hiccup after resume into a stored 0% sample and an instant
+            // "battery critically low". Keep the last good value; with none yet,
+            // zero stays, and the rule ignores a zero.
+            let capacity = read_checked(b.join("capacity"), 0.0, 100.0);
+            if let Some(p) = capacity {
+                self.last_percent = Some(p);
+            }
+            st.percent = capacity.or(self.last_percent).unwrap_or(0.0);
             st.cycle_count = read_i64(b.join("cycle_count")).unwrap_or(0);
             let thr = b.join("charge_control_end_threshold");
             st.charge_limit_supported = exists(&thr);
@@ -179,7 +192,9 @@ impl Collector for PowerCollector {
                 }
             }
 
-            ctx.g("power", "percent", "%", st.percent);
+            if capacity.is_some() {
+                ctx.g("power", "percent", "%", st.percent);
+            }
             ctx.g("power", "energy_now_wh", "Wh", st.energy_now_wh);
             ctx.g("power", "on_battery", "", if st.on_battery { 1.0 } else { 0.0 });
 
@@ -241,7 +256,7 @@ mod tests {
     fn a_machine_with_no_battery_is_unsupported_not_broken() {
         let mut c = PowerCollector::new();
         c.bat = None;
-        c.ac = None;
+        c.ac = Vec::new();
         // Direct construction: on a desktop `probe` finds neither and must not error.
         let s = Support::Unsupported { reason: "no power supply sensors".into() };
         assert!(!s.is_usable());

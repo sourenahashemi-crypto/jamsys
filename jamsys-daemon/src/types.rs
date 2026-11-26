@@ -385,25 +385,33 @@ impl Context {
     ///
     /// Six power-and-activity contexts, optionally times four time-of-day buckets.
     pub fn key(&self) -> &'static str {
-        const BASE: [&str; 6] = [
-            "ac:idle", "ac:interactive", "ac:load",
-            "bat:idle", "bat:interactive", "bat:load",
-        ];
-        const TOD: [[&str; 4]; 6] = [
-            ["ac:idle:night", "ac:idle:morning", "ac:idle:afternoon", "ac:idle:evening"],
-            ["ac:interactive:night", "ac:interactive:morning", "ac:interactive:afternoon", "ac:interactive:evening"],
-            ["ac:load:night", "ac:load:morning", "ac:load:afternoon", "ac:load:evening"],
-            ["bat:idle:night", "bat:idle:morning", "bat:idle:afternoon", "bat:idle:evening"],
-            ["bat:interactive:night", "bat:interactive:morning", "bat:interactive:afternoon", "bat:interactive:evening"],
-            ["bat:load:night", "bat:load:morning", "bat:load:afternoon", "bat:load:evening"],
-        ];
         let row = (self.on_battery as usize) * 3 + self.activity.index();
         match self.tod {
-            None => BASE[row],
-            Some(b) => TOD[row][(b as usize).min(3)],
+            None => CONTEXT_BASE[row],
+            Some(b) => CONTEXT_TOD[row][(b as usize).min(3)],
         }
     }
+
+    /// The `'static` key equal to `s`, if `s` is one. Used when reading
+    /// baselines back from disk: an unknown context (from a different version)
+    /// is dropped rather than invented.
+    pub fn static_key(s: &str) -> Option<&'static str> {
+        CONTEXT_BASE.iter().chain(CONTEXT_TOD.iter().flatten()).find(|k| **k == s).copied()
+    }
 }
+
+const CONTEXT_BASE: [&str; 6] = [
+    "ac:idle", "ac:interactive", "ac:load",
+    "bat:idle", "bat:interactive", "bat:load",
+];
+const CONTEXT_TOD: [[&str; 4]; 6] = [
+    ["ac:idle:night", "ac:idle:morning", "ac:idle:afternoon", "ac:idle:evening"],
+    ["ac:interactive:night", "ac:interactive:morning", "ac:interactive:afternoon", "ac:interactive:evening"],
+    ["ac:load:night", "ac:load:morning", "ac:load:afternoon", "ac:load:evening"],
+    ["bat:idle:night", "bat:idle:morning", "bat:idle:afternoon", "bat:idle:evening"],
+    ["bat:interactive:night", "bat:interactive:morning", "bat:interactive:afternoon", "bat:interactive:evening"],
+    ["bat:load:night", "bat:load:morning", "bat:load:afternoon", "bat:load:evening"],
+];
 
 /// Seconds east of UTC for the current local time, from libc's timezone handling.
 fn local_utc_offset_seconds() -> i64 {

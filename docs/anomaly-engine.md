@@ -178,10 +178,12 @@ each is handled explicitly:
 `power.discharge_high`, `mem.growth` and `disk.write_spike` appeared here previously
 and are **not implemented**.
 
-**Baselines do not survive a restart.** `save_baseline`/`load_baselines` exist in the
-store but nothing calls them, so every daemon start begins the warm-up (120 samples
-per context) again. The learned rules are therefore blind for the first part of every
-session. This is a known defect, not a design decision.
+**Baselines survive a restart.** They are written to
+`~/.local/share/jamsys/baselines.json` at each maintenance pass and at shutdown, and
+read back at start, so a learned rule can judge from the first sample of a new
+session. Until 2026-11-25 nothing saved them: every start began the 120-sample
+warm-up again in each context, and on a laptop restarted daily some contexts never
+finished it.
 
 Note `mem.leak` is a **trend** test (Theil–Sen slope over the 30-minute window), not a
 z-score — a leak is defined by monotone growth, not by being far from the median.

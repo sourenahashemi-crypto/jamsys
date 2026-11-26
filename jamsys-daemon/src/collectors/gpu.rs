@@ -314,7 +314,12 @@ impl Collector for GpuCollector {
             }
 
             // The condition users care about: awake, doing nothing, costing watts.
+            // Not when it drives a display: then it cannot suspend however idle
+            // it is, and "awake with nothing using it" would be an accusation
+            // with no remedy. (On this machine the internal panel is wired to
+            // the NVIDIA card in some boot configurations.)
             st.dgpu_awake_idle = awake
+                && !g.drives_display
                 && g.process_count == 0
                 && g.util_pct.map(|u| u < 1.0).unwrap_or(false);
 

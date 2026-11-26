@@ -30,6 +30,7 @@ import Gdk from 'gi://Gdk?version=4.0';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import {CONF_KEYS, confToSave, isClusterCmdline, sanitizeConf, scrollFactor} from './conf.js';
+import {describe} from './format.js';
 
 import {drawCluster, drawClusterBare, drawUnavailable, bareHitRegions,
         CLUSTER_W, CLUSTER_H, BARE_W, BARE_H} from './gauges.js';
@@ -262,7 +263,8 @@ WHILE IT IS OPEN
   scroll              resize
   + / -               resize
   0                   reset to the default size
-  right-click         menu: sizes, opacity, stacking, open, hide
+  right-click, m, Menu key or Shift+F10
+                      menu: sizes, opacity, stacking, open, close
   left-click          nothing — so dragging it never launches anything
   double-click        open the full JamSys window
   click the x         close it (top right; it brightens when you point at it)
@@ -425,6 +427,11 @@ app.connect('activate', () => {
     closeBtn.connect('clicked', () => win.close());
 
     const overlay = new Gtk.Overlay();
+    // The drawing is left-to-right whatever the locale: under a right-to-left
+    // one, `halign: END` put the close button in the top-LEFT corner, away from
+    // where the face, the help text and the click-through region all expect it.
+    overlay.set_direction(Gtk.TextDirection.LTR);
+    closeBtn.update_property([Gtk.AccessibleProperty.LABEL], ['Close the cluster']);
     overlay.set_child(handle);
     overlay.add_overlay(closeBtn);
     win.set_child(overlay);
@@ -468,6 +475,15 @@ app.connect('activate', () => {
         const ctrl = (mods & Gdk.ModifierType.CONTROL_MASK) !== 0;
         const is = (...wanted) => pressed(keyval, code, wanted);
         if (is(Gdk.KEY_Escape)) { win.close(); return true; }
+        // The menu was reachable only with a right click, so size, opacity, the
+        // face and stacking had no keyboard route at all.
+        if (keyval === Gdk.KEY_Menu || is(Gdk.KEY_m)
+            || (keyval === Gdk.KEY_F10 && (mods & Gdk.ModifierType.SHIFT_MASK))) {
+            popover.set_pointing_to(new Gdk.Rectangle({
+                x: area.get_width() / 2, y: area.get_height() / 2, width: 1, height: 1}));
+            popover.popup();
+            return true;
+        }
         if (ctrl && is(Gdk.KEY_q, Gdk.KEY_Q)) { win.close(); return true; }
         if (is(Gdk.KEY_plus, Gdk.KEY_equal, Gdk.KEY_KP_Add)) {
             setScale(scale * 1.12);
@@ -914,6 +930,7 @@ function disconnectDaemon(reportLoss = true) {
     proxy = null;
     state = null;
     area?.queue_draw();
+    describeToAssistive();
     if (wasConnected && reportLoss) {
         // Say it on stderr too. The on-screen face is invisible to anyone
         // running this from a terminal or reading a log, and this used to be
@@ -971,6 +988,17 @@ function apply(json) {
         return;
     }
     area?.queue_draw();
+    describeToAssistive();
+}
+
+/** Give the drawing a name, and the full alert text somewhere to be read. */
+function describeToAssistive() {
+    if (!area)
+        return;
+    const text = describe(state);
+    area.update_property([Gtk.AccessibleProperty.LABEL], [text]);
+    // Only while something is wrong: a tooltip on a healthy gadget is noise.
+    area.set_tooltip_text(state?.alert_title ? text : null);
 }
 
 app.run([]);

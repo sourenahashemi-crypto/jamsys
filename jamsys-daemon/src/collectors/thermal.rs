@@ -30,11 +30,16 @@ pub struct ThermalState {
 pub struct ThermalCollector {
     temps: Vec<HwmonChannel>,
     fans: Vec<HwmonChannel>,
+    /// A channel failed to read on the last pass, so the list may be stale.
+    suspect: bool,
+    runs: u32,
+    last_rediscover_ms: i64,
 }
 
 impl ThermalCollector {
     pub fn new() -> Self {
-        ThermalCollector { temps: Vec::new(), fans: Vec::new() }
+        ThermalCollector { temps: Vec::new(), fans: Vec::new(), suspect: false, runs: 0,
+                           last_rediscover_ms: 0 }
     }
 }
 
@@ -95,6 +100,27 @@ impl Collector for ThermalCollector {
     }
 
     fn collect(&mut self, ctx: &mut Ctx) -> CResult<()> {
+        // A channel is identified by driver and label but *read* through the
+        // hwmonN path found at probe, and N is handed out in registration order.
+        // If one driver reloads it comes back under a new number: its channels
+        // then read nothing until a restart, or -- if another driver took the old
+        // number -- read that driver's values under the wrong name. So when a
+        // read fails, and every so often regardless, check each path still
+        // belongs to the driver it was found under, and look again if not.
+        self.runs = self.runs.wrapping_add(1);
+        if (self.suspect || self.runs % 30 == 0)
+            && !(0..30_000).contains(&(ctx.ts_ms - self.last_rediscover_ms))
+            && (self.suspect || self.temps.iter().chain(&self.fans).any(|c| !c.still_valid()))
+        {
+            self.last_rediscover_ms = ctx.ts_ms;
+            let (temps, fans) = (discover_hwmon(&[HwmonKind::Temp]), discover_hwmon(&[HwmonKind::Fan]));
+            // Keep the old list if discovery finds nothing: the all-gone path
+            // below is what reports a driver that has really left.
+            if !temps.is_empty() || !fans.is_empty() {
+                self.temps = temps;
+                self.fans = fans;
+            }
+        }
         let mut st = ThermalState::default();
         let mut gone = 0usize;
 
@@ -140,6 +166,7 @@ impl Collector for ThermalCollector {
             }
         }
 
+        self.suspect = gone > 0;
         // Every channel disappearing at once means a driver unloaded, not a bad reading.
         if gone > 0 && st.temps.is_empty() && st.fans.is_empty() {
             // Ctx retains the previous tick. Clear it even when the registry will
@@ -210,6 +237,7 @@ mod tests {
                 crit: None, max: None,
             }],
             fans: Vec::new(),
+            suspect: false, runs: 0, last_rediscover_ms: 0,
         };
         let mut x = Ctx::new(Arc::new(Config::default()));
         x.snap.thermal.cpu_package_c = Some(99.0);

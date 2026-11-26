@@ -195,15 +195,39 @@ impl Baselines {
     }
 
     pub fn import(&mut self, metric: &str, context: &str, s: Series) {
-        // Contexts are a closed set; map back to the 'static keys.
-        let ck: &'static str = match context {
-            "bat:idle" => "bat:idle",
-            "bat:active" => "bat:active",
-            "ac:idle" => "ac:idle",
-            "ac:active" => "ac:active",
-            _ => return,
-        };
+        // Contexts are a closed set; map back to the 'static keys. (This used
+        // to list four keys from an older scheme, two of which no longer exist,
+        // so even had anything called it, most of a saved baseline would have
+        // been thrown away.)
+        let Some(ck) = crate::types::Context::static_key(context) else { return };
         self.series.insert((metric.to_string(), ck), s);
+    }
+
+    /// Everything learned, as JSON.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(&self.export()).unwrap_or_else(|_| "[]".into())
+    }
+
+    /// Restore from `to_json` output. Returns how many series were taken.
+    /// Anything unreadable, non-finite or from an unknown context is skipped:
+    /// a damaged file must cost the learning, never the daemon.
+    pub fn restore_json(&mut self, text: &str) -> usize {
+        let Ok(rows) = serde_json::from_str::<Vec<(String, String, Series)>>(text) else {
+            return 0;
+        };
+        let mut taken = 0;
+        for (metric, ctx, mut s) in rows {
+            s.samples.retain(|v| v.is_finite());
+            s.samples.truncate(self.window);
+            if s.samples.is_empty() {
+                continue;
+            }
+            s.recompute();
+            let before = self.series.len();
+            self.import(&metric, &ctx, s);
+            taken += self.series.len() - before;
+        }
+        taken
     }
 }
 
@@ -226,6 +250,38 @@ impl Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_was_learned_survives_being_written_and_read_back() {
+        use crate::types::{Activity, Context};
+        let ctx = Context::new(true, Activity::Idle);
+        let mut b = Baselines::new(64, 20, 3.5);
+        for i in 0..200 {
+            b.observe("power.system_w", ctx, 10.0 + (i % 7) as f64 * 0.3);
+        }
+        let before = b.get("power.system_w", ctx).unwrap().clone();
+        assert!(matches!(b.evaluate("power.system_w", ctx, 30.0), Verdict::Deviating { .. }));
+
+        let mut fresh = Baselines::new(64, 20, 3.5);
+        assert!(matches!(fresh.evaluate("power.system_w", ctx, 30.0), Verdict::NoBaseline),
+                "a restarted daemon used to be here, blind, for the whole warm-up");
+        assert_eq!(fresh.restore_json(&b.to_json()), 1);
+        let after = fresh.get("power.system_w", ctx).unwrap();
+        assert_eq!((after.n, after.median, after.p95), (before.n, before.median, before.p95));
+        assert!(matches!(fresh.evaluate("power.system_w", ctx, 30.0), Verdict::Deviating { .. }),
+                "and can judge at once");
+    }
+
+    #[test]
+    fn a_damaged_baseline_file_costs_the_learning_not_the_daemon() {
+        let mut b = Baselines::new(64, 20, 3.5);
+        assert_eq!(b.restore_json(""), 0);
+        assert_eq!(b.restore_json("{not json"), 0);
+        assert_eq!(b.restore_json(r#"[["cpu.usage_pct","mars:idle",{"samples":[1.0],"n":1,"median":1,"mad":0,"p05":1,"p95":1,"dirty":0}]]"#), 0,
+                   "an unknown context is dropped, not invented");
+        assert_eq!(b.restore_json(r#"[["cpu.usage_pct","ac:idle",{"samples":[],"n":9,"median":1,"mad":0,"p05":1,"p95":1,"dirty":0}]]"#), 0);
+        assert!(b.is_empty());
+    }
 
     fn bat_idle() -> Context {
         Context::simple(true, true)

@@ -195,6 +195,14 @@ pub fn discover_hwmon_in(root: &str, kinds: &[HwmonKind]) -> Vec<HwmonChannel> {
 }
 
 impl HwmonChannel {
+    /// Does the path this channel reads still belong to the driver it was found
+    /// under? False once the hwmon device has gone or been renumbered.
+    pub fn still_valid(&self) -> bool {
+        self.input.parent()
+            .and_then(|dir| read_str(dir.join("name")))
+            .is_some_and(|name| name == self.driver)
+    }
+
     /// Current reading in display units, or `None` if the sensor vanished or lied.
     pub fn read(&self) -> Option<f64> {
         let (lo, hi) = self.kind.range();
@@ -351,6 +359,35 @@ pub fn parse_proc_stat(text: &str) -> (CpuTimes, Vec<CpuTimes>, HashMap<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_renumbered_hwmon_device_is_noticed() {
+        let root = std::env::temp_dir().join(format!("jamsys-hwmon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mk = |n: &str, driver: &str, milli: &str| {
+            let d = root.join(n);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("name"), format!("{driver}\n")).unwrap();
+            std::fs::write(d.join("temp1_input"), milli).unwrap();
+        };
+        mk("hwmon3", "nvme", "40000");
+        let found = discover_hwmon_in(root.to_str().unwrap(), &[HwmonKind::Temp]);
+        let nvme = found.iter().find(|c| c.driver == "nvme").unwrap().clone();
+        assert!(nvme.still_valid());
+
+        // The nvme driver reloads as hwmon7 and another driver takes hwmon3.
+        std::fs::remove_dir_all(root.join("hwmon3")).unwrap();
+        mk("hwmon7", "nvme", "41000");
+        assert!(!nvme.still_valid(), "the old path is gone");
+        mk("hwmon3", "coretemp", "70000");
+        assert_eq!(nvme.read(), Some(70.0), "and now reads another driver's sensor...");
+        assert!(!nvme.still_valid(), "...which is exactly what the check is for");
+
+        let again = discover_hwmon_in(root.to_str().unwrap(), &[HwmonKind::Temp]);
+        let nvme = again.iter().find(|c| c.driver == "nvme").unwrap();
+        assert_eq!(nvme.read(), Some(41.0), "rediscovery finds it under its new number");
+        std::fs::remove_dir_all(&root).ok();
+    }
     use std::io::Write;
 
     fn tmpdir(tag: &str) -> PathBuf {

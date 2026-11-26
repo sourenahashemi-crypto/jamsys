@@ -147,8 +147,12 @@ if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
     systemctl disable --now jamsys-helper.timer 2>/dev/null || true
     systemctl stop jamsys-helper.service 2>/dev/null || true
     # Stop the user service for every logged-in user that is running it.
-    for uid in $(loginctl list-users --no-legend 2>/dev/null | awk '{print $1}'); do
-        runuser -u "#$uid" -- systemctl --user disable --now jamsysd 2>/dev/null || true
+    # `--machine=USER@` reaches that user's own service manager, bus and all.
+    # This used to be `runuser -u "#$uid"`, which is sudo's syntax, not
+    # runuser's: it failed, `|| true` hid it, and the daemon kept running from
+    # a binary the package had just deleted.
+    for user in $(loginctl list-users --no-legend 2>/dev/null | awk '{print $2}'); do
+        systemctl --user --machine="$user@" disable --now jamsysd 2>/dev/null || true
     done
 fi
 exit 0

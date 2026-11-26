@@ -58,6 +58,32 @@ export function shortAlert(s) {
     }
 }
 
+/** One sentence saying what the gadget shows, for a screen reader.
+ *
+ * The cluster is a drawing: without this, an assistive technology found an
+ * unnamed image and nothing else. Abnormal state comes first and in full --
+ * the drawn alert pill is cut to a few dozen characters, and this is also
+ * where a sighted user can read the rest (it doubles as the tooltip).
+ */
+export function describe(s) {
+    if (!s)
+        return 'JamSys: waiting for the monitoring service';
+    const parts = [];
+    if ((s.health === 'attention' || s.health === 'critical') && s.alert_title) {
+        parts.push(`${s.health === 'critical' ? 'Critical' : 'Attention'}: ${s.alert_title}`);
+        if (s.alert_detail)
+            parts.push(s.alert_detail);
+    } else {
+        parts.push('Everything is normal');
+    }
+    const cpu = s.cpu_temp_c > 0 ? `CPU ${pct(s.cpu_pct)} at ${deg(s.cpu_temp_c)}` : `CPU ${pct(s.cpu_pct)}`;
+    parts.push(`${cpu}, memory ${pct(s.mem_pct)}`);
+    if (s.has_battery && Number.isFinite(s.battery_pct))
+        parts.push(`battery ${pct(s.battery_pct)}${s.on_battery ? '' : ', charging or on mains'}`);
+    parts.push(s.net_ok === false ? 'network down' : 'network up');
+    return `JamSys. ${parts.join('. ')}.`;
+}
+
 /** The whole label: abnormal state replaces the readings entirely. */
 export function labelFor(s, show, minimal) {
     const abnormal = s.health === 'attention' || s.health === 'critical';

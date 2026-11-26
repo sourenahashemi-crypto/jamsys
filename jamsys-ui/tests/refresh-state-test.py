@@ -396,5 +396,24 @@ ov2._security_card({})
 check("an older daemon is not shown as all clear",
       "All clear" not in labels(ov2.cards["security"]))
 
+print("\nGPU use per process, when the NVIDIA card draws the desktop")
+from jamsys_ui.app import ProcessPage  # noqa: E402
+
+pp = ProcessPage(StubWin())
+procs = {"total": 2, "top_cpu": [
+    {"pid": 8483, "name": "brave", "cpu_pct": 12.0, "rss_bytes": 5e8, "threads": 30},
+    {"pid": 99, "name": "idle-thing", "cpu_pct": 0.1, "rss_bytes": 1e7, "threads": 1}], "top_mem": []}
+pp.render({"snapshot": {"process": procs, "gpu": {
+    "display_driver": "NVIDIA", "nvidia": {"drives_display": True,
+                                           "processes": [[8483, 100564992]]}}}})
+text = labels(pp.body)
+check("the page says why there is no GPU time", any("does not publish it" in t for t in text))
+check("and shows the video memory the driver does report",
+      any("NVIDIA memory 95.9 MB" in t for t in text), str([t for t in text if "brave" in t or "PID 8483" in t]))
+check("only for the process that has some", sum("NVIDIA memory" in t for t in text) == 1)
+pp.render({"snapshot": {"process": procs, "gpu": {"display_driver": "Intel", "nvidia": {}}}})
+check("on Intel graphics there is no such note",
+      not any("does not publish it" in t for t in labels(pp.body)))
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

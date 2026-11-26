@@ -117,7 +117,62 @@ export function norm(v, min, max) {
     return Math.max(0, Math.min(1, (v - min) / (max - min)));
 }
 
+/* Text that Cairo's own text API cannot draw.
+ *
+ * `cr.showText` is the "toy" API: one font, no fallback, no shaping, no
+ * right-to-left. Anything outside that font -- alert text carries device names,
+ * which can be in any script -- came out as a row of empty boxes. Pango does all of that, so text
+ * containing such characters goes through it; plain instrument lettering stays
+ * on the fast path it has always used.
+ */
+const COMPLEX = /[\u0590-\u1FFF\u2E80-\uD7FF\uF900-\uFDFF\uFE70-\uFEFF]/;
+let pango = null;   // {Pango, PangoCairo}, or false once known to be unavailable
+
+function pangoLayout(cr, s, size, bold) {
+    if (pango === null) {
+        try {
+            pango = {Pango: imports.gi.Pango, PangoCairo: imports.gi.PangoCairo};
+        } catch {
+            pango = false;
+        }
+    }
+    if (!pango)
+        return null;
+    const {Pango, PangoCairo} = pango;
+    const layout = PangoCairo.create_layout(cr);
+    const font = Pango.FontDescription.from_string(`Ubuntu Sans${bold ? ' Bold' : ''}`);
+    font.set_absolute_size(size * Pango.SCALE);
+    layout.set_font_description(font);
+    layout.set_text(s, -1);
+    return layout;
+}
+
+/** Width of `s` as `text()` will draw it. */
+export function textWidth(cr, s, size, bold = false) {
+    if (COMPLEX.test(s)) {
+        const layout = pangoLayout(cr, s, size, bold);
+        if (layout)
+            return layout.get_pixel_size()[0];
+    }
+    cr.selectFontFace('Ubuntu Sans Mono', 0, bold ? 1 : 0);
+    cr.setFontSize(size);
+    return cr.textExtents(s).width;
+}
+
 function text(cr, s, x, y, size, color, {align = 'center', bold = false, alpha = 1} = {}) {
+    if (COMPLEX.test(s)) {
+        const layout = pangoLayout(cr, s, size, bold);
+        if (layout) {
+            const w = layout.get_pixel_size()[0];
+            const tx = align === 'center' ? x - w / 2 : align === 'right' ? x - w : x;
+            rgba(cr, color, alpha);
+            // `y` is a baseline, as for showText; Pango positions by the top.
+            cr.moveTo(tx, y - layout.get_baseline() / pango.Pango.SCALE);
+            pango.PangoCairo.show_layout(cr, layout);
+            cr.newPath();
+            return;
+        }
+    }
     cr.selectFontFace('Ubuntu Sans Mono', 0, bold ? 1 : 0);
     cr.setFontSize(size);
     const e = cr.textExtents(s);
@@ -545,9 +600,7 @@ export function drawCluster(cr, w, h, s, {opacity = 0.92} = {}) {
         cr.stroke();
         const msg = s.alert_title.length > 46 ? s.alert_title.slice(0, 45) + '...' : s.alert_title;
         // Centre the mark and the text as one group.
-        cr.selectFontFace('Ubuntu Sans Mono', 0, 1);
-        cr.setFontSize(9.5);
-        const tw = cr.textExtents(msg.toUpperCase()).width;
+        const tw = textWidth(cr, msg.toUpperCase(), 9.5, true);
         const mx = CLUSTER_W / 2 - (tw + 16) / 2 + 5;
         if (critical) markCross(cr, mx, 16, 10, col);
         else markWarn(cr, mx, 16, 11, col);
@@ -743,9 +796,7 @@ export function drawClusterBare(cr, w, h, s, {opacity = 0.92} = {}) {
         const msg = (s.alert_title.length > 34
             ? s.alert_title.slice(0, 33) + '…'
             : s.alert_title).toUpperCase();
-        cr.selectFontFace('Ubuntu Sans Mono', 0, 1);
-        cr.setFontSize(9);
-        const tw = cr.textExtents(msg).width;
+        const tw = textWidth(cr, msg, 9, true);
         // Leave the close control its own space, whatever the alert says.
         const pw = Math.min(tw + 30, BARE_W - 2 * (BARE_W - BARE_CLOSE.cx + BARE_CLOSE.r + 6));
         const px = BARE_W / 2 - pw / 2;

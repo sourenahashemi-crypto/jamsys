@@ -282,23 +282,34 @@ extension's are installed on disk but not loaded until the next login.
     became permanent, click-through that survived `--quit`, and `--quit` able to signal
     an unrelated process.
 
-**Found and not fixed** — these are real and still present:
+**Fixed on 2026-11-25**, each with a regression test unless noted:
 
-| Defect | Effect |
+| Was | Now |
 |---|---|
-| Learned baselines are never persisted | The learned rules (`power.idle_high`, `thermal.unusual`, `net.traffic_spike`) are blind for the warm-up after every daemon start. On a laptop restarted daily, the battery-idle baseline may never warm up. |
-| A notification that is rate-limited or fails to send is never retried | An alert raised while the notification service is restarting stays open but silent. The documented 180 s / 300 s cooldown is also dead code. |
-| A disabled or quarantined collector leaves its last readings in the snapshot | Disabling `storage` while `disk.full` is open keeps the alert open until the daemon restarts. |
-| Unclassified journal errors are stored with no deduplication | A service logging errors in a loop grows the event table for 90 days. |
-| Reachability probes block the daemon's only thread | Up to 2 s per target (several with a silent gateway) during which IPC and sampling stall. They now run far less often, which reduces but does not remove this. |
-| `gpu.idle_awake` ignores that the dGPU may be driving the panel | Not currently firing here; it would if the compute-process list were empty. |
-| A failed battery `capacity` read becomes 0 % | Could raise `battery.critical` from one bad read. Not observed. |
-| hwmon channels are pinned to the `hwmonN` index found at probe | A driver re-registering under a new index loses its sensors until restart. Not observed. |
-| `AckTopAlert` may acknowledge a different alert from the one the widget shows | Oldest of the top severity versus newest. |
-| `prerm` in the .deb uses `runuser -u "#uid"`, which is sudo syntax | The user daemon keeps running after `apt remove`. Not executed. |
-| The cluster's alert pill cannot draw non-Latin text | A Bluetooth device named in a non-Latin script renders as empty boxes: Cairo's toy text API has no font fallback or shaping. Needs PangoCairo. |
-| Cluster menus are pointer-only and nothing has an accessible name | No keyboard route to opacity, face or stacking on either surface. |
-| No localisation | The interface is English only; nothing is marked for translation and RTL has not been checked. |
+| Learned baselines never persisted | Saved to `~/.local/share/jamsys/baselines.json` at maintenance and shutdown, restored at start. A damaged file costs the learning, not the daemon |
+| An undelivered notification was never retried; the cooldown was dead code | A rate-limited or failed notification stays owed and is retried after 30 s. The time of the last notification survives resolution, so a flapping condition respects the cooldown. "Notified" is no longer reported for one that was not shown |
+| A disabled or quarantined collector left its readings in the snapshot | Its section is cleared, at once on disable and on the next tier run otherwise |
+| Unclassified journal errors stored with no deduplication | De-duplicated like classified ones, keyed on the text with digit runs collapsed (so "block 1234" and "block 1235" are one event), and labelled `service_error` rather than `kernel_error` when they are not from the kernel |
+| Reachability probes blocked the only thread, once per target | All targets are started together and polled: at most one timeout in total, measured under 0.9 s for four silent targets at a 0.4 s timeout. A refusal from the gateway now counts as the gateway being there |
+| `gpu.idle_awake` ignored a dGPU that drives the display | Not raised when it does: it cannot suspend then, so there is nothing to act on |
+| A failed battery `capacity` read became 0 % | The last good value is kept, no sample is stored, and `battery.critical` ignores a zero. A USB-C charger now counts as mains |
+| hwmon channels pinned to the `hwmonN` found at probe | Checked against the driver name when a read fails and periodically; rediscovered on mismatch |
+| `AckTopAlert` could acknowledge a different alert from the one shown | Same ordering as the widget (severity, then most recent). `ack` and `unsuppress` report `not_found` instead of success for an id that does not exist |
+| `prerm` used sudo syntax with `runuser` | `systemctl --user --machine=USER@`. **Not executed**: it needs root and a package removal |
+| The cluster's alert pill could not draw non-Latin text | Text outside the instrument font goes through Pango: shaped, right-to-left, with font fallback. Rendered with a non-Latin title and looked at |
+| Cluster menus were pointer-only; nothing had an accessible name | Menu key / Shift+F10 (and `m` in the window) open the menu; both surfaces describe themselves to assistive technology; the Shell cluster's menu shows the alert in full and can acknowledge it. **Not exercised with a screen reader** |
+| Per-process GPU time was zero for every process | Explained, not fixed, because there is nothing to fix: on this boot the whole desktop renders on the NVIDIA card, whose driver publishes no per-client engine time, and the Intel counters read a true `0 ns`. The Processes page now says so and shows NVIDIA video memory per process, which the driver does report |
+
+**Still not done:**
+
+| Item | State |
+|---|---|
+| Localisation | The interface is English only. Nothing is marked for translation and the window has not been checked under a right-to-left locale. This is a feature of its own, not a fix |
+| The Shell extension, live | Still unseen: it needs a logout to load |
+| `security.firewall_off` and the sshd patterns | Unit-tested only; see §4a |
+| NVML graphics processes | `gpu.idle_awake` still counts compute processes only. The display check above covers the case that occurs here |
+| Alerts raised from a single journal line | They resolve after the 120 s hysteresis like any other, which also withdraws a critical notification ("GPU has fallen off the bus") after two minutes. Arguably they should hold |
+| Close-button hit region under click-through | Derived from a design position that no longer matches the real button at ordinary sizes. Click-through is off by default and unusable on Mutter anyway |
 
 ## 6. Resource usage
 

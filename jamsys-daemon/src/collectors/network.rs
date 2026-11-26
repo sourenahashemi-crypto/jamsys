@@ -9,7 +9,7 @@ use crate::types::*;
 use crate::util::glob_match;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -271,9 +271,125 @@ fn all_addresses() -> HashMap<String, (Vec<String>, Vec<String>)> {
 
 /// A bare TCP connect with **zero bytes sent**. Used only to answer "can this host be
 /// reached"; nothing is transmitted and nothing is read.
-fn tcp_reachable(addr: &str, timeout: Duration) -> Option<bool> {
-    let sa: SocketAddr = addr.parse().ok()?;
-    Some(TcpStream::connect_timeout(&sa, timeout).is_ok())
+/// What one connection attempt showed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Probe {
+    /// The handshake completed.
+    Connected,
+    /// The host answered and refused. It is up; that port is not open.
+    Refused,
+    /// Nothing came back in time, or the network said it could not get there.
+    Unreachable,
+}
+
+/// Try every address at once and wait for all of them together.
+///
+/// These run on the daemon's only thread. One after another with a blocking
+/// connect, a dead uplink cost a full timeout *per target* -- up to four in a
+/// row -- during which nothing else was sampled and no client was answered.
+/// Started together and polled, the whole set costs at most one timeout.
+/// No payload is ever sent: each socket is closed as soon as it resolves.
+pub fn probe_all(targets: &[SocketAddr], timeout: Duration) -> Vec<Probe> {
+    let mut out = vec![Probe::Unreachable; targets.len()];
+    let mut fds: Vec<libc::pollfd> = Vec::new();
+    let mut owner: Vec<usize> = Vec::new();
+    for (i, sa) in targets.iter().enumerate() {
+        let family = if sa.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+        // SAFETY: plain socket creation; closed below on every path.
+        let fd = unsafe { libc::socket(family, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) };
+        if fd < 0 {
+            continue;
+        }
+        let sock = socket2_addr(sa);
+        // SAFETY: `sock` holds a correctly sized sockaddr for `family`.
+        let r = unsafe { libc::connect(fd, &sock.0 as *const _ as *const libc::sockaddr, sock.1) };
+        let err = if r == 0 { 0 } else { std::io::Error::last_os_error().raw_os_error().unwrap_or(0) };
+        if r == 0 {
+            out[i] = Probe::Connected;
+        } else if err == libc::ECONNREFUSED {
+            out[i] = Probe::Refused;
+        } else if err == libc::EINPROGRESS {
+            fds.push(libc::pollfd { fd, events: libc::POLLOUT, revents: 0 });
+            owner.push(i);
+            continue;
+        }
+        // SAFETY: we own fd.
+        unsafe { libc::close(fd) };
+    }
+
+    let deadline = std::time::Instant::now() + timeout;
+    let mut pending = fds.len();
+    while pending > 0 {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        // SAFETY: `fds` is a valid array of the stated length.
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, left.as_millis() as libc::c_int) };
+        if n < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break;
+        }
+        for (slot, p) in fds.iter_mut().enumerate() {
+            if p.fd < 0 || p.revents == 0 {
+                continue;
+            }
+            let mut soerr: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: reading SO_ERROR into a correctly sized int.
+            unsafe {
+                libc::getsockopt(p.fd, libc::SOL_SOCKET, libc::SO_ERROR,
+                                 &mut soerr as *mut _ as *mut libc::c_void, &mut len);
+            }
+            out[owner[slot]] = match soerr {
+                0 => Probe::Connected,
+                libc::ECONNREFUSED => Probe::Refused,
+                _ => Probe::Unreachable,
+            };
+            // SAFETY: we own fd; a negative fd tells poll to skip the slot.
+            unsafe { libc::close(p.fd) };
+            p.fd = -1;
+            pending -= 1;
+        }
+    }
+    for p in fds.iter().filter(|p| p.fd >= 0) {
+        // SAFETY: we own fd.
+        unsafe { libc::close(p.fd) };
+    }
+    out
+}
+
+/// A `sockaddr_storage` and its length for `sa`.
+fn socket2_addr(sa: &SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    // SAFETY: sockaddr_storage is plain data and valid when zeroed.
+    let mut st: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    match sa {
+        SocketAddr::V4(a) => {
+            let s = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: a.port().to_be(),
+                sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes(a.ip().octets()) },
+                sin_zero: [0; 8],
+            };
+            // SAFETY: sockaddr_in fits in sockaddr_storage.
+            unsafe { std::ptr::write(&mut st as *mut _ as *mut libc::sockaddr_in, s) };
+            (st, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t)
+        }
+        SocketAddr::V6(a) => {
+            let s = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: a.port().to_be(),
+                sin6_flowinfo: a.flowinfo(),
+                sin6_addr: libc::in6_addr { s6_addr: a.ip().octets() },
+                sin6_scope_id: a.scope_id(),
+            };
+            // SAFETY: sockaddr_in6 fits in sockaddr_storage.
+            unsafe { std::ptr::write(&mut st as *mut _ as *mut libc::sockaddr_in6, s) };
+            (st, std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t)
+        }
+    }
 }
 
 fn first_nameserver() -> Option<String> {
@@ -445,18 +561,34 @@ impl Collector for NetCollector {
             self.reach_due_ms = ctx.ts_ms + 60_000;
             let to = Duration::from_millis(cfg.network.probe_timeout_ms);
             let mut r = Reachability { checked_ms: ctx.ts_ms, ..Default::default() };
+            // (what it answers, address). Unparseable addresses are simply absent.
+            let mut plan: Vec<(&str, SocketAddr)> = Vec::new();
             if let Some(gw) = &st.default_route {
                 r.gateway = Some(gw.clone());
-                // Port 53 first (most home routers answer), then 80.
-                r.gateway_ok = Some(
-                    tcp_reachable(&format!("{gw}:53"), to).unwrap_or(false)
-                        || tcp_reachable(&format!("{gw}:80"), to).unwrap_or(false),
-                );
+                // Port 53 (most home routers answer) and 80.
+                for port in [53, 80] {
+                    if let Ok(sa) = format!("{gw}:{port}").parse() {
+                        plan.push(("gateway", sa));
+                    }
+                }
             }
-            if let Some(ns) = first_nameserver() {
-                r.dns_ok = tcp_reachable(&format!("{ns}:53"), to);
+            if let Some(sa) = first_nameserver().and_then(|ns| format!("{ns}:53").parse().ok()) {
+                plan.push(("dns", sa));
             }
-            r.internet_ok = tcp_reachable(&cfg.network.internet_probe, to);
+            if let Ok(sa) = cfg.network.internet_probe.parse() {
+                plan.push(("internet", sa));
+            }
+            let got = probe_all(&plan.iter().map(|(_, sa)| *sa).collect::<Vec<_>>(), to);
+            let of = |what: &str| -> Vec<Probe> {
+                plan.iter().zip(&got).filter(|((w, _), _)| *w == what).map(|(_, p)| *p).collect()
+            };
+            if r.gateway.is_some() {
+                // A refusal is an answer: the router is there, it just has
+                // nothing on that port. Only silence means unreachable.
+                r.gateway_ok = Some(of("gateway").iter().any(|p| *p != Probe::Unreachable));
+            }
+            r.dns_ok = of("dns").first().map(|p| *p == Probe::Connected);
+            r.internet_ok = of("internet").first().map(|p| *p == Probe::Connected);
             st.reach = r;
         } else {
             st.reach = ctx.snap.network.reach.clone();
@@ -517,6 +649,33 @@ pub(crate) fn error_rate_pct(packets: f64, errors: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probes_run_together_and_cost_one_timeout_not_one_each() {
+        use std::net::TcpListener;
+        let open = TcpListener::bind("127.0.0.1:0").unwrap();
+        let open_addr = open.local_addr().unwrap();
+        // A port nobody listens on: the kernel refuses at once.
+        let closed_addr = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        // TEST-NET-1 is reserved and never routed: nothing ever answers.
+        let silent: SocketAddr = "192.0.2.1:9".parse().unwrap();
+
+        let start = std::time::Instant::now();
+        let got = probe_all(&[silent, open_addr, silent, closed_addr, silent, silent],
+                            Duration::from_millis(400));
+        let took = start.elapsed();
+        assert_eq!(got[1], Probe::Connected);
+        assert_eq!(got[3], Probe::Refused, "a refusal is an answer, not silence");
+        for i in [0, 2, 4, 5] {
+            assert_eq!(got[i], Probe::Unreachable);
+        }
+        assert!(took < Duration::from_millis(900),
+                "four silent targets must cost one timeout, not four: took {took:?}");
+        assert!(probe_all(&[], Duration::from_millis(50)).is_empty());
+    }
 
     #[test]
     fn a_near_idle_link_has_no_error_rate() {

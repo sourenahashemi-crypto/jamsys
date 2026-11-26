@@ -1,6 +1,7 @@
 #!/usr/bin/env gjs
 // Exercise the window's daemon wiring without creating a window or changing settings.
 import GLib from 'gi://GLib';
+import {describe} from '../jamsys@jamsys.org/format.js';
 
 let failures = 0;
 function ok(condition, message) {
@@ -75,19 +76,23 @@ const glib = {
         },
     },
 };
-const harness = new Function('Gio', 'GLib', 'Proxy', 'printerr', `
+const named = [];
+const harness = new Function('Gio', 'GLib', 'Proxy', 'printerr', 'describe', 'named', `
     const BUS_NAME = 'org.jamsys.Daemon', OBJECT_PATH = '/org/jamsys/Daemon';
     const RECONNECT_S = 10;
     let proxy = null, state = null;
     let daemonWatch = 0, daemonSignal = 0, daemonGeneration = 0, daemonRetry = 0;
-    const area = {queue_draw() {}};
+    const Gtk = {AccessibleProperty: {LABEL: 0}};
+    const area = {queue_draw() {}, set_tooltip_text() {},
+                  update_property(_p, v) { named.push(v[0]); }};
     ${daemonCode}
     return {connectDaemon, stopDaemon, getState: () => state,
             isConnected: () => proxy !== null};
-`)(gio, glib, Proxy, message => messages.push(message));
+`)(gio, glib, Proxy, message => messages.push(message), describe, named);
 harness.connectDaemon();
 proxies[0].reply([JSON.stringify({health: 'healthy', cpu_pct: 77})], null);
 ok(harness.getState()?.cpu_pct === 77, 'the initial reading arrives');
+ok(named.at(-1)?.includes('CPU 77%'), 'and the drawing is given a description of it');
 ok(vanished !== null, 'the window watches for the daemon disappearing');
 vanished?.();
 ok(harness.getState() === null, 'daemon loss clears old readings immediately');

@@ -419,7 +419,9 @@ impl RuleEngine {
                     .evidence("Charge cycles", p.cycle_count.to_string())
                     .action("This is normal wear, not a fault. Expect proportionally shorter runtime.")));
         }
-        if p.on_battery && p.percent <= cfg.threshold("battery.critical", "pct", 5.0) {
+        // Zero is what an unread battery looks like; a machine truly at 0% is off.
+        if p.on_battery && p.percent > 0.0
+            && p.percent <= cfg.threshold("battery.critical", "pct", 5.0) {
             self.fire(out, Alert::new("battery.critical", "", Severity::Critical,
                 "Battery is critically low",
                 Explanation::new(format!("The battery is at {:.0}% and discharging at {:.1} W.", p.percent, p.power_w))
@@ -964,6 +966,17 @@ mod tests {
             t += 30_000;
         }
         e.evaluate(s, c, start + secs * 1000).alerts
+    }
+
+    #[test]
+    fn an_unread_battery_is_not_a_critically_low_one() {
+        let mut e = RuleEngine::new(&cfg());
+        let mut s = snap();
+        // A failed capacity read with no earlier value leaves zero.
+        s.power = PowerState { has_battery: true, on_battery: true, percent: 0.0, ..Default::default() };
+        assert!(!e.evaluate(&s, &cfg(), 0).alerts.iter().any(|a| a.rule_id == "battery.critical"));
+        s.power.percent = 4.0;
+        assert!(e.evaluate(&s, &cfg(), 2000).alerts.iter().any(|a| a.rule_id == "battery.critical"));
     }
 
     // ---- Security ---------------------------------------------------

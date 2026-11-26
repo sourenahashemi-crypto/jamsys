@@ -329,6 +329,28 @@ withCluster(fakeSettings(), c => {
     ok(middle === false, 'and is left alone');
 });
 
+print('\nthe cluster menu carries the alert and a keyboard way in');
+withCluster(fakeSettings(), c => {
+    let acked = 0;
+    c._ext = {openApp() {}, openPreferences() {}, ackTopAlert: () => { acked++; }};
+    c.setState({health: 'healthy', cpu_pct: 5, mem_pct: 20});
+    ok(typeof c.accessible_name === 'string' && c.accessible_name.includes('Everything is normal'),
+       'the drawing has an accessible description', String(c.accessible_name));
+    c.emitEvent('popup-menu');
+    ok(c._menu?.isOpen === true, 'the Menu key opens the menu without a pointer');
+    ok(c._alertItem.visible === false && c._ackItem.visible === false,
+       'with nothing wrong there is no alert row and nothing to acknowledge');
+    c._showMenu();   // close
+    const title = 'A very long alert title that the drawn pill would cut short';
+    c.setState({health: 'attention', alert_title: title, alert_detail: 'the detail'});
+    c._showMenu();
+    ok(c._alertItem.visible && c._alertItem.label.text.startsWith(title)
+       && c._alertItem.label.text.includes('the detail'),
+       'an alert is readable in full from the cluster itself');
+    ok(c._ackItem.visible, 'and can be acknowledged from there');
+    ok(c.accessible_name.includes(title), 'the description names it too');
+});
+
 print('\nhiding, and the way back');
 withCluster(fakeSettings({mode: 'cluster'}), (c, st) => {
     c._ext = {openApp: () => {}, openPreferences: () => {}};
