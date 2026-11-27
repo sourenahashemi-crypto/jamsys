@@ -10,7 +10,7 @@
   against the real Clutter API now match the real return value.
 - An iGPU with no reading showed a dash with a percent sign on a lit dial.
 
-## 1.1.0 — 2026-11-27
+## 1.1.0 — 2026-11-27 (superseded by 1.1.1; its release was withdrawn)
 
 ### Security monitoring (new)
 
