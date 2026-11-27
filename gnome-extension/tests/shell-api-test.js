@@ -386,7 +386,7 @@ withCluster(fakeSettings({position: 'top-right'}), (c, st) => {
     c.set_position(600, 380);
     c._drag.emit('recognize');
     ok(c._dragging === true, 'a pan past the threshold starts a drag');
-    c._drag._delta = {x: 40, y: 20};
+    c._drag._delta = [40, 20];
     c._drag.emit('pan-update');
     ok(c.x === 640 && c.y === 400, 'the gadget follows the pointer', `${c.x},${c.y}`);
     c._drag.emit('end');
@@ -400,7 +400,7 @@ withCluster(fakeSettings({position: 'top-right'}), (c, st) => {
 withCluster(fakeSettings({position: 'top-right'}), (c, st) => {
     c.set_position(600, 380);
     c._drag.emit('recognize');
-    c._drag._delta = {x: 90, y: 90};
+    c._drag._delta = [90, 90];
     c._drag.emit('pan-update');
     c._drag.emit('cancel');
     ok(c.x === 600 && c.y === 380, 'a cancelled drag puts it back');

@@ -38,6 +38,12 @@ export default {
         static PROPS = ['required_button', 'begin_threshold', 'pan_axis',
                         'min_n_points', 'max_n_points'];
         static SIGNALS = ['recognize', 'end', 'cancel', 'may-recognize', 'pan-update'];
-        get_accumulated_delta() { return this._delta ?? {x: 0, y: 0}; }
+        // Shaped like the real return value, a Graphene.Vec2: components only
+        // through methods. The stub used to hand back {x, y}, which is exactly
+        // the mistake the extension made, so the test agreed with the bug.
+        get_accumulated_delta() {
+            const [x, y] = this._delta ?? [0, 0];
+            return {get_x: () => x, get_y: () => y};
+        }
     },
 };

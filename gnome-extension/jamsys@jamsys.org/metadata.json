@@ -5,5 +5,5 @@
   "shell-version": ["48", "49", "50"],
   "settings-schema": "org.gnome.shell.extensions.jamsys",
   "url": "https://github.com/sourenahashemi-crypto/jamsys",
-  "version": 2
+  "version": 3
 }

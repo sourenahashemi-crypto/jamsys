@@ -218,7 +218,7 @@ GPU is already awake, and defers `nvmlInit()` until then too.
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./build/jamsys_1.1.0_amd64.deb
+sudo apt install ./build/jamsys_1.1.1_amd64.deb
 systemctl --user daemon-reload
 systemctl --user enable --now jamsysd
 ```

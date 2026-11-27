@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.1 — 2026-11-27
+
+### Fixed
+
+- The corner widget in GNOME Shell could be resized but not moved: the drag read
+  the pan offset as `.x`/`.y`, which a `Graphene.Vec2` does not have, so every drag
+  moved it by zero. The test stub returned the same wrong shape; it and a check
+  against the real Clutter API now match the real return value.
+- An iGPU with no reading showed a dash with a percent sign on a lit dial.
+
 ## 1.1.0 — 2026-11-27
 
 ### Security monitoring (new)

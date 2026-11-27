@@ -134,9 +134,13 @@ class JamSysCluster extends St.Widget {
     _onDragUpdate(gesture) {
         if (!this._dragging)
             return;
+        // A Graphene.Vec2, whose components are reachable only through
+        // get_x()/get_y(). Reading `.x` gave undefined, the fallback made it 0,
+        // and the widget sat still under every drag while scrolling still
+        // resized it -- exactly what was reported once the extension loaded.
         const d = gesture.get_accumulated_delta();
-        const dx = d?.x ?? d?.[0] ?? 0;
-        const dy = d?.y ?? d?.[1] ?? 0;
+        const dx = d.get_x();
+        const dy = d.get_y();
         this._dragTarget().set_position(Math.round(this._dragFrom[0] + dx),
                                         Math.round(this._dragFrom[1] + dy));
     }

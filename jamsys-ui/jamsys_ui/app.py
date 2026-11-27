@@ -1922,7 +1922,7 @@ class HardwarePage(Page):
                        "Pick one. The helper is the default; the udev rule involves no "
                        "privileged code at all but grants broader access.")
         g.add(self.row("Privileged helper",
-                       "sudo apt install ./jamsys_1.1.0_amd64.deb",
+                       "sudo apt install ./jamsys_1.1.1_amd64.deb",
                        "installs /usr/libexec/jamsys-kbd and its Polkit action"))
         g.add(self.row("No privileged code",
                        "sudo install -m0644 99-jamsys-keyboard.rules /etc/udev/rules.d/",

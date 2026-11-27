@@ -91,6 +91,16 @@ if (Clutter) {
     }
     ok(typeof Clutter.PanGesture.prototype.get_accumulated_delta === 'function',
        'PanGesture.get_accumulated_delta() is real');
+    // And what it gives back: the stub must hand over the same shape, or a
+    // handler reading the wrong field passes against the stub and does nothing
+    // in the Shell (which is how dragging the widget came to move it nowhere).
+    const delta = new Clutter.PanGesture().get_accumulated_delta();
+    ok(typeof delta?.get_x === 'function' && typeof delta?.get_y === 'function',
+       'the delta is read through get_x()/get_y()');
+    ok(delta?.x === undefined, 'and has no .x field to read by mistake');
+    const stubDelta = new stub.PanGesture().get_accumulated_delta();
+    ok(typeof stubDelta.get_x === 'function' && stubDelta.x === undefined,
+       'the stub returns the same shape');
 }
 
 /* -- the schema, compiled and written to ---------------------------------- */
