@@ -50,6 +50,7 @@ function render(name, state, {face = 'cutout', ...opts} = {}) {
 
 const base = {
     health: 'healthy', cpu_pct: 7.4, cpu_temp_c: 52, mem_pct: 18.2, gpu_pct: 0,
+    igpu_pct: 14, igpu_freq_mhz: 700,
     power_w: 11.24, battery_pct: 87, on_battery: true, has_battery: true,
     net_ok: true, net_label: '-56 dBm', dgpu: 'suspended',
     alert_title: '', alert_detail: '', alert_expected: '', alert_subsystem: '',
@@ -67,13 +68,13 @@ if (live) {
     render('live', JSON.parse(json));
 } else {
     const load = {...base, cpu_pct: 94, cpu_temp_c: 88, mem_pct: 71,
-                  gpu_pct: 82, dgpu: 'active', power_w: 48.6, battery_pct: 41};
+                  gpu_pct: 82, dgpu_pct: 82, dgpu_temp_c: 71, dgpu: 'active', power_w: 48.6, battery_pct: 41};
     const warn = {...base, health: 'attention', cpu_pct: 6, power_w: 29.8,
                   alert_title: 'Unusually high power draw while idle',
                   alert_subsystem: 'Power', alert_severity: 1, open_alerts: 1};
     const critical = {...base, health: 'critical', cpu_pct: 99, cpu_temp_c: 97,
                       mem_pct: 94, power_w: 54, battery_pct: 8, net_ok: false,
-                      dgpu: 'active', gpu_pct: 61,
+                      dgpu: 'active', gpu_pct: 61, dgpu_pct: 61, dgpu_temp_c: 78,
                       alert_title: 'CPU is running critically hot',
                       alert_subsystem: 'CPU', alert_severity: 3, open_alerts: 2};
 

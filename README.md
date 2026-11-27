@@ -1,6 +1,21 @@
-# JamSys
+# JamSys — Linux system monitor, hardware health and security checkup
 
-**A lightweight local system-health monitor for Linux laptops.**
+**A lightweight local system-health and security monitor for Linux laptops**, with a
+GNOME Shell instrument-cluster widget, a GTK4 / libadwaita window and a Rust daemon
+that costs about a quarter of a percent of one core.
+
+![Linux](https://img.shields.io/badge/platform-Linux-informational)
+![GNOME 50](https://img.shields.io/badge/GNOME%20Shell-50-blue)
+![Rust](https://img.shields.io/badge/daemon-Rust-orange)
+![GTK4](https://img.shields.io/badge/UI-GTK4%20%2F%20libadwaita-4a86cf)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
+
+CPU, per-core load, memory, temperatures and fans, battery health and charge limit,
+Intel and NVIDIA hybrid graphics (without waking the discrete GPU), NVMe SMART, Wi-Fi
+and network reachability, Bluetooth, systemd services and the kernel journal — plus a
+security checkup: firewall state, open ports, failed logins, router (ARP) spoofing,
+unexpected USB keyboards and update status. Explained alerts with real numbers,
+learned baselines instead of fixed thresholds, no cloud and no telemetry.
 
 One question, answered in one second:
 
@@ -83,7 +98,7 @@ CPU 7% · 52° | RAM 18% | GPU — | 11.2W | NET ✓
 **The investigation** — a GTK4 window with a page per subsystem, opened by clicking the
 cluster.
 
-![The Overview page, with the CPU under load and thermal throttling flagged](docs/screenshots/window-overview.png)
+![The Overview page: one card per subsystem, each with its history and a status word](docs/screenshots/window-overview.png)
 
 Each card carries the current value, the *learned* normal range, a short history and a
 status word — so "44 %" is reported against what this machine usually does, not against
@@ -95,7 +110,7 @@ a number someone picked.
 
 One box per logical CPU, shaded by how busy that CPU is:
 
-![The CPU page: 24 logical CPUs as a heatmap matrix, eight of them pinned](docs/screenshots/window-cpu.png)
+![The CPU page: 24 logical CPUs as a heatmap matrix](docs/screenshots/window-cpu.png)
 
 It answers a shape question — *is one thread pinned while twenty-three idle, or is the
 work spread?* — which is read at a glance, where a row of bars is read one bar at a
@@ -103,6 +118,29 @@ time. The colour is a sequential ramp and never the green/amber/red status palet
 core pinned at 100 % is a machine doing its job, not a machine in trouble. Every box
 prints its own percentage, hovering one names the core and its reading, and the ramp
 inverts in the dark theme so "further from the background" always means "busier".
+
+## Security checkup
+
+The Security page answers a different question: *is this machine set up sensibly,
+and is anything trying to get in?* It opens with a checkup — each line either fine or
+not, with the one command that fixes it — and the firewall can be switched on from
+there.
+
+![The Security page: checkup, firewall and failed sign-ins](docs/screenshots/window-security.png)
+
+| Watches | How, without root |
+|---|---|
+| Firewall on or off (`ufw`, `firewalld`) | ufw's own config file; the rules themselves need root and are never claimed |
+| Programs listening on the network | the kernel's socket tables via `sock_diag`; a new one raises an alert until you accept it |
+| Failed logins (sudo, lock screen, polkit, SSH) | the system journal; five in ten minutes raise an alert, sooner if they come over the network |
+| Router hardware address changing mid-connection | `/proc/net/arp`, compared only while the link stays up — what ARP spoofing looks like |
+| DNS servers changing on the same connection | resolv.conf |
+| A new USB device that announces itself as a keyboard | `/sys/bus/usb`, re-read on hotplug — the "flash drive that types" attack |
+| Automatic login, extra root accounts, SSH password login, loose SSH key permissions | config files and permission bits; keys are never opened |
+| Automatic security updates, updates waiting, restart needed | apt and update-notifier files |
+| Disk encryption, Secure Boot | sysfs and EFI variables |
+
+It detects and explains; it does not block. JamSys is not a firewall, and it says so.
 
 ## What it watches
 
@@ -115,7 +153,13 @@ NVMe temperature and SMART, ext4 error counters) · network (per-interface state
 throughput, errors, Wi-Fi signal, default route, gateway/DNS/internet reachability,
 event timeline) · Bluetooth · audio (PipeWire, WirePlumber, devices) · USB and cameras ·
 systemd units · the kernel journal · suspend and resume · a hardware inventory with a
-change log.
+change log · network exposure, firewall state, failed logins and USB keyboards (see
+above).
+
+The Processes page combines the top CPU and memory samples, with I/O and — where the
+driver publishes it — GPU time or NVIDIA video memory per process:
+
+![The Processes page](docs/screenshots/window-processes.png)
 
 ## What it is not
 
@@ -174,7 +218,7 @@ GPU is already awake, and defers `nvmlInit()` until then too.
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./build/jamsys_1.0.0_amd64.deb
+sudo apt install ./build/jamsys_1.1.0_amd64.deb
 systemctl --user daemon-reload
 systemctl --user enable --now jamsysd
 ```

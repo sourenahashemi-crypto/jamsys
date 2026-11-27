@@ -287,6 +287,9 @@ export function drawGauge(cr, cx, cy, r, o) {
     // recessed digital window drawn *over* the needle — the inset LCD every modern
     // instrument cluster has, and the reason the needle never obscures the number.
     const readSize = Math.max(11, r * 0.34);
+    // A dash is "no reading"; a unit beside it ("— %") reads as a measurement.
+    if (o.readout === '\u2014')
+        o = {...o, unit: ''};
     if (o.readout) {
         const by = cy + r * 0.37;
         cr.selectFontFace('Ubuntu Sans Mono', 0, 1);
@@ -829,7 +832,10 @@ export function drawClusterBare(cr, w, h, s, {opacity = 0.92} = {}) {
     g = dial('igpu');
     drawGauge(cr, g.cx, g.cy, g.r, {
         value: r.igpu.v, min: 0, max: 100, majors: 4, minorsPer: 5,
-        zones: ZONES_LOAD, caption: 'iGPU', readout: r.igpu.text, unit: '%',
+        zones: ZONES_LOAD, caption: 'iGPU', readout: r.igpu.text,
+        // readings() marks an unread iGPU dim; it has to reach the dial, or the
+        // dash is drawn on a lit face with a "%" beside it.
+        unit: r.igpu.dim ? '' : '%', dim: r.igpu.dim,
         sub: r.igpu.sub, subColor: r.igpu.subColor,
     });
     g = dial('dgpu');
